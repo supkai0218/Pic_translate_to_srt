@@ -7,11 +7,28 @@ patch pattern in QwenASR's app.py but with a provider list added.
 """
 from __future__ import annotations
 
+import copy
 import json
+import os
+import re
 from pathlib import Path
+
+from dotenv import load_dotenv, set_key
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = BASE_DIR / "settings.json"
+DOTENV_PATH = BASE_DIR / ".env"
+
+# populate os.environ from .env (no-op if the file is absent)
+load_dotenv(DOTENV_PATH)
+
+API_KEY_PREFIX = "API_KEY_"
+
+
+def _env_var_name_for(name: str) -> str:
+    """Provider name → env-var name, e.g. 'Openrouter' → 'API_KEY_OPENROUTER'."""
+    sanitized = re.sub(r"[^A-Z0-9]", "_", (name or "").upper()).strip("_")
+    return f"{API_KEY_PREFIX}{sanitized}" if sanitized else f"{API_KEY_PREFIX}PROVIDER"
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一個專業的字幕 OCR 與翻譯助手。請辨識圖片畫面中所有可見的文字，"
@@ -34,6 +51,7 @@ _DEFAULTS: dict = {
             "name": "OpenAI",
             "api_url": "https://api.openai.com/v1/chat/completions",
             "api_key": "",
+            "api_key_env": "API_KEY_OPENAI",
             "model": "gpt-4o",
             "is_default": True,
         }
@@ -65,23 +83,60 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _resolve_keys(settings: dict) -> None:
+    """In-memory only: fill each provider's api_key from os.environ using its
+    api_key_env. Never persisted (save_settings strips api_key)."""
+    for p in settings.get("providers", []):
+        env = p.get("api_key_env") or _env_var_name_for(p.get("name", ""))
+        p["api_key"] = os.environ.get(env, "")
+
+
+def _migrate_secrets(settings: dict) -> bool:
+    """Move any plaintext api_key found in settings into .env, leaving
+    settings.json clean. Returns True if anything was migrated. Idempotent."""
+    changed = False
+    for p in settings.get("providers", []):
+        env = p.get("api_key_env") or _env_var_name_for(p.get("name", ""))
+        p.setdefault("api_key_env", env)
+        if env != p.get("api_key_env"):
+            p["api_key_env"] = env
+            changed = True
+        key = (p.get("api_key") or "").strip()
+        if key:  # plaintext secret present → move it to .env
+            set_key(str(DOTENV_PATH), env, key)
+            os.environ[env] = key
+            p["api_key"] = ""
+            changed = True
+    return changed
+
+
 def load_settings() -> dict:
     """Load settings, creating the file with defaults on first run and merging
-    in any new default keys that an older file is missing."""
+    in any new default keys that an older file is missing. Migrates any
+    plaintext api_key into .env and resolves keys in-memory."""
     if not SETTINGS_FILE.exists():
         save_settings(_DEFAULTS)
-        return dict(_DEFAULTS)
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        data = {}
-    return _deep_merge(_DEFAULTS, data)
+        data = dict(_DEFAULTS)
+    else:
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    settings = _deep_merge(_DEFAULTS, data)
+    if _migrate_secrets(settings):
+        save_settings(settings)  # persist the now-cleaned file
+    _resolve_keys(settings)
+    return settings
 
 
 def save_settings(settings: dict) -> None:
+    """Persist settings, always stripping api_key to '' (secrets live in .env)."""
+    clean = copy.deepcopy(settings)
+    for p in clean.get("providers", []):
+        p["api_key"] = ""
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2, ensure_ascii=False)
+        json.dump(clean, f, indent=2, ensure_ascii=False)
 
 
 def patch_setting(key: str, value) -> None:
@@ -112,12 +167,20 @@ def get_default_provider() -> dict | None:
 
 
 def upsert_provider(provider: dict) -> None:
-    """Insert or update a provider keyed by name; persist."""
+    """Insert or update a provider keyed by name; persist. Any api_key is
+    written to .env (never to settings.json)."""
     s = load_settings()
     providers = s.setdefault("providers", [])
     name = provider.get("name", "").strip()
     if not name:
         return
+    env = provider.get("api_key_env") or _env_var_name_for(name)
+    provider["api_key_env"] = env
+    key = (provider.get("api_key") or "").strip()
+    if key:  # a real key was supplied → store in .env only
+        set_key(str(DOTENV_PATH), env, key)
+        os.environ[env] = key
+    provider["api_key"] = ""  # never persist the secret in settings.json
     for i, p in enumerate(providers):
         if p.get("name") == name:
             providers[i] = provider

@@ -10,7 +10,7 @@
 - **語言**：Python 3.10+（使用 `from __future__ import annotations`）
 - **UI 框架**：customtkinter（Tkinter 的現代主題封裝，非 Web/Gradio）
 - **入口**：`python app.py`
-- **目前版本**：v0.02
+- **目前版本**：v0.03
 
 ## 快速啟動
 
@@ -28,15 +28,32 @@
 Pic_translate_to_srt/
 ├── .agent/
 │   └── PROJECT_OVERVIEW.md   ← 本檔
-├── .gitignore                # 忽略 .venv/、__pycache__/、source/、(settings.json 已被註解掉)
-├── requirements.txt
-├── settings.json             # 執行時設定（providers、prompts、duration 等）；首次啟動自動產生
-├── config.py                 # 設定持久化（JSON）、供應商管理、預設值
+├── .gitignore                # 忽略 .venv/、__pycache__/、source/、settings.json、.env
+├── .env                      # 真實 API 金鑰（gitignored，本地用；v0.03 新增）
+├── .env.example              # .env 範本（committed）
+├── requirements.txt          # customtkinter、Pillow、requests、python-dotenv
+├── settings.json             # 執行時設定（gitignored，本地用；首次啟動自動產生）
+├── settings.example.json     # settings.json sanitized 範本（committed）
+├── config.py                 # 設定持久化（JSON）、.env 機密管理、供應商管理、預設值
 ├── srt_utils.py              # SRT 解析/寫檔、時間戳轉換、檔名時間戳解析、翻譯插入邏輯
 ├── llm_engine.py             # OpenAI 相容 vision LLM 客戶端（編碼圖片、API 呼叫）
 ├── app.py                    # GUI 應用（customtkinter）、4 個分頁、執行緒
 └── source/                   # 測試素材（原始 SRT、輸出 SRT、截圖 JPG）；已被 .gitignore 忽略
 ```
+
+## 機密與 .env 處理（v0.03 新增）
+
+API 金鑰**只存在 `.env`**，絕不進 `settings.json`。所有邏輯集中在 `config.py`（`app.py` 透明相容）：
+
+- **env var 命名**：`API_KEY_<供應商名稱正規化>`（大寫、非文數字→`_`），例：`Openrouter` → `API_KEY_OPENROUTER`。每個 provider 在 settings.json 存 `api_key_env`（環境變數名）。
+- **三保證**：
+  1. **載入即解析** — `load_settings()` 用 `_resolve_keys()` 把每個 provider 的 `api_key` 從 `os.environ`（.env 注入）即時填入（僅 in-memory）。
+  2. **自我修復遷移** — `load_settings()` 用 `_migrate_secrets()`：若發現 `api_key` 明文非空，自動 `set_key()` 寫進 `.env` 並清空 settings.json 欄位（幂等）。未來若誤存明文，下次啟動自動搬走。
+  3. **儲存必抹除** — `save_settings()` 寫檔前一律把所有 provider `api_key=""`（deepcopy 後抹除），settings.json 永遠不含明文。
+- **`upsert_provider(provider)`**：決定 `api_key_env`（既有或由 name 生成）；傳入非空 key → `set_key(.env)` + `os.environ[env]=key`；一律設 `provider["api_key"]=""` 再存。未來新增供應商自動走此流程。
+- 模組 import 時 `load_dotenv(DOTENV_PATH)` 注入 os.environ。
+- **git 策略**：`settings.json` 與 `.env` 皆 gitignored；committed 範本為 `settings.example.json` + `.env.example`。新 clone 後執行 app 自動從 `_DEFAULTS` 產生 settings.json，使用者再填 `.env`。
+- **歷史抹除**：v0.03 以 `git filter-branch` 從所有 commit 移除 settings.json（含早期誤入的明文 key）。
 
 ## 模組職責
 
@@ -97,7 +114,7 @@ _insert_and_save()：依 duration_mode 組裝 translations
 
 | key | 預設 | 說明 |
 |---|---|---|
-| `providers` | [OpenAI] | 供應商清單：`{name, api_url, api_key, model, is_default}` |
+| `providers` | [OpenAI] | 供應商清單：`{name, api_url, api_key, api_key_env, model, is_default}`。`api_key` 一律為空（真值在 .env，由 `api_key_env` 命名）；v0.03 新增 `api_key_env` |
 | `default_provider` | "OpenAI" | 預設供應商名稱 |
 | `target_lang` / `target_lang_custom` | "繁體中文" / "" | 目標語言（預設集 + 自訂） |
 | `system_prompt` / `user_prompt` | 見 config.py | OCR+翻譯 prompt；user_prompt 含 `{lang}` 佔位 |
@@ -162,3 +179,4 @@ insert_translations(
 - **v0.0**：初始。截圖 OCR → 翻譯 → SRT 插入（insert/append），`_make_new_entry()` 固定 `ts+2.0` fallback。
 - **v0.01**：新增字幕時間長度三模式（auto/unified/per_subtitle）；Tab4 模式選擇器、Tab1 每列秒數欄位、`_refresh_duration_ui()` 同步。per_subtitle 於 OCR 時快照秒數。
 - **v0.02**：新增 `.agent/PROJECT_OVERVIEW.md`（本檔）。per_subtitle 改為插入時即時讀秒數（新增 `_translation_rows` 平行清單），OCR 後仍可回 Tab1 修改秒數再寫入 SRT。
+- **v0.03**：上傳 GitHub 前隱私處理。api_key 移至 `.env`（python-dotenv），config.py 三保證（載入即解析／自我修復遷移／儲存必抹除）；provider 新增 `api_key_env`；settings.json 與 .env 改 gitignored，新增 `.env.example`/`settings.example.json` 範本；`git filter-branch` 抹除歷史中 settings.json（含早期明文 key）。

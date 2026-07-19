@@ -225,6 +225,12 @@ class App(ctk.CTk):
         add_field(2, "API 金鑰：", self._p_key, show="•")
         add_field(3, "模型名稱：", self._p_model)
 
+        self._key_hint = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            form, textvariable=self._key_hint, font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w"
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=(10, 10), pady=(0, 4))
+
         btns = ctk.CTkFrame(parent, fg_color="transparent")
         btns.pack(fill="x", padx=14, pady=(0, 6))
         ctk.CTkButton(btns, text="新增", width=90, height=30, font=FONT_BODY,
@@ -263,6 +269,8 @@ class App(ctk.CTk):
         self._p_url.set(p.get("api_url", ""))
         self._p_key.set(p.get("api_key", ""))
         self._p_model.set(p.get("model", ""))
+        env = p.get("api_key_env") or ""
+        self._key_hint.set(f"金鑰儲存於 .env：{env}" if env else "金鑰儲存於 .env")
 
     def _on_provider_switch(self, name: str):
         for p in self._settings.get("providers", []):
@@ -284,6 +292,7 @@ class App(ctk.CTk):
         self._p_url.set("https://api.openai.com/v1/chat/completions")
         self._p_key.set("")
         self._p_model.set("gpt-4o")
+        self._key_hint.set("填入名稱與金鑰後儲存，金鑰將寫入 .env（API_KEY_<名稱>）")
 
     def _save_current_provider(self):
         p = self._form_to_provider()

@@ -15,7 +15,7 @@ ENV/
 *.env
 
 # Local configuration with secrets / machine-specific paths
-#settings.json
+settings.json
 
 # IDE/editor cache
 .vscode/
