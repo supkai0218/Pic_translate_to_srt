@@ -106,7 +106,11 @@ class App(ctk.CTk):
         for p in paths:
             ts = srt_utils.parse_filename_timestamp(p)
             label = srt_utils.sec_to_ts(ts) if ts is not None else "（無法解析）"
-            self._image_rows.append({"path": p, "ts": ts, "ts_label": label})
+            self._image_rows.append({
+                "path": p, "ts": ts, "ts_label": label,
+                "duration": self._settings.get("subtitle_duration", 2.0),
+                "dur_entry": None,
+            })
         self._render_image_list()
 
     def _clear_images(self):
@@ -116,15 +120,37 @@ class App(ctk.CTk):
     def _render_image_list(self):
         for w in self._img_scroll.winfo_children():
             w.destroy()
+        mode = self._dur_mode_var.get() if hasattr(self, "_dur_mode_var") else "auto"
+        enable_dur = mode == "per_subtitle"
         for i, row in enumerate(self._image_rows, 1):
             frame = ctk.CTkFrame(self._img_scroll, fg_color=("gray86", "gray17"))
             frame.pack(fill="x", pady=2)
             name = Path(row["path"]).name
             color = ("gray10", "white") if row["ts"] is not None else ("red", "#ff8a80")
             ctk.CTkLabel(frame, text=f"{i}. {name}", font=FONT_MONO,
-                         width=560, anchor="w", text_color=color).pack(side="left", padx=8, pady=4)
+                         width=480, anchor="w", text_color=color).pack(side="left", padx=8, pady=4)
             ctk.CTkLabel(frame, text=row["ts_label"], font=FONT_MONO,
-                         width=140, anchor="w", text_color=color).pack(side="left")
+                         width=130, anchor="w", text_color=color).pack(side="left")
+            # duration entry per row
+            dur = row.get("duration", 2.0)
+            dur_var = ctk.StringVar(value=f"{dur:.1f}")
+            dur_entry = ctk.CTkEntry(frame, textvariable=dur_var, width=60,
+                                     font=FONT_MONO, justify="center",
+                                     state="normal" if enable_dur else "disabled")
+            dur_entry.pack(side="left", padx=(4, 2))
+            ctk.CTkLabel(frame, text="秒", font=FONT_SMALL).pack(side="left")
+            # save reference and bind
+            row["dur_entry"] = dur_entry
+            row["dur_var"] = dur_var
+
+            def _on_dur_focusout(_, idx=i - 1):
+                try:
+                    val = float(self._image_rows[idx]["dur_var"].get().strip())
+                    self._image_rows[idx]["duration"] = max(val, 0.5)
+                except (ValueError, AttributeError, KeyError):
+                    pass
+
+            dur_entry.bind("<FocusOut>", _on_dur_focusout)
 
     def _pick_srt(self):
         initial = self._settings.get("last_srt_path") or self._settings.get("last_image_dir") or os.getcwd()
@@ -408,6 +434,27 @@ class App(ctk.CTk):
                                          command=self._insert_and_save)
         self._insert_btn.pack(side="left", padx=(8, 0))
 
+        # --- duration mode selector ---
+        dur_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        dur_frame.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkLabel(dur_frame, text="字幕時間長度：", font=FONT_BODY).pack(side="left")
+        self._dur_mode_var = ctk.StringVar(
+            value=self._settings.get("duration_mode", "auto"))
+        self._dur_mode_seg = ctk.CTkSegmentedButton(
+            dur_frame, values=["auto", "unified", "per_subtitle"],
+            font=FONT_BODY, height=30,
+            variable=self._dur_mode_var,
+            command=self._on_duration_mode_change)
+        self._dur_mode_seg.pack(side="left", padx=(6, 12))
+        self._dur_entry = ctk.CTkEntry(dur_frame, width=70, font=FONT_BODY,
+                                       justify="center")
+        self._dur_entry.insert(0, str(self._settings.get("subtitle_duration", "2.0")))
+        self._dur_label_sec = ctk.CTkLabel(dur_frame, text="秒", font=FONT_BODY)
+        # initially hide the entry+label; _refresh_duration_ui() fixes state
+        self._dur_label_hint = ctk.CTkLabel(
+            dur_frame, text="", font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w")
+
         self._progress = ctk.CTkProgressBar(parent, width=400)
         self._progress.set(0)
         self._progress.pack(fill="x", padx=14, pady=(0, 8))
@@ -421,6 +468,57 @@ class App(ctk.CTk):
             fill="x", padx=14)
         self._preview_scroll = ctk.CTkScrollableFrame(parent, height=140)
         self._preview_scroll.pack(fill="both", expand=False, padx=14, pady=(0, 10))
+
+        self._refresh_duration_ui()
+
+    # ------------------------------------------------------------------ #
+    #  Duration helpers
+    # ------------------------------------------------------------------ #
+    def _get_duration_value(self) -> float:
+        """Read the unified-duration entry, return a valid float ≥ 0.5."""
+        try:
+            val = float(self._dur_entry.get().strip())
+            return max(val, 0.5)
+        except (ValueError, AttributeError):
+            return 2.0
+
+    def _on_duration_mode_change(self, _: str | None = None):
+        """Called when the user clicks a different duration mode segment."""
+        self._refresh_duration_ui()
+        config.patch_setting("duration_mode", self._dur_mode_var.get())
+        if self._dur_mode_var.get() == "unified":
+            val = self._get_duration_value()
+            config.patch_setting("subtitle_duration", val)
+
+    def _refresh_duration_ui(self):
+        """Show/hide the unified-duration entry and enable/disable per-row entries."""
+        mode = self._dur_mode_var.get()
+
+        if mode == "unified":
+            self._dur_entry.pack(side="left", padx=(0, 4))
+            self._dur_label_sec.pack(side="left")
+            self._dur_label_hint.configure(text="")
+        elif mode == "per_subtitle":
+            self._dur_entry.pack_forget()
+            self._dur_label_sec.pack_forget()
+            self._dur_label_hint.configure(text="請至「截圖與字幕」分頁設定每張截圖的秒數")
+        else:  # auto
+            self._dur_entry.pack_forget()
+            self._dur_label_sec.pack_forget()
+            self._dur_label_hint.configure(text="自動計算到下一個字幕開始時間")
+
+        self._dur_label_hint.pack(side="left", fill="x", expand=True)
+
+        # enable/disable per-row duration entries in Tab 1
+        enable = mode == "per_subtitle"
+        for row in self._image_rows:
+            entry = row.get("dur_entry")
+            if entry:
+                state = "normal" if enable else "disabled"
+                try:
+                    entry.configure(state=state)
+                except Exception:
+                    pass
 
     def _log_line(self, msg: str):
         self.after(0, lambda: self._log.insert("end", msg + "\n"))
@@ -447,6 +545,14 @@ class App(ctk.CTk):
             messagebox.showwarning("無截圖", "請先在「截圖與字幕」選擇含時間軸檔名的截圖。")
             return
         self._save_prompts()  # persist current prompts/lang/mode
+        # persist duration settings
+        dur_mode = self._dur_mode_var.get()
+        config.patch_setting("duration_mode", dur_mode)
+        if dur_mode == "unified":
+            dur_val = self._get_duration_value()
+            self._dur_entry.delete(0, "end")
+            self._dur_entry.insert(0, f"{dur_val:.1f}")
+            config.patch_setting("subtitle_duration", dur_val)
         cfg = ProviderCfg.from_dict(provider)
         sys_prompt = self._sys_box.get("1.0", "end").strip("\n") or config.DEFAULT_SYSTEM_PROMPT
         usr_prompt = self._usr_box.get("1.0", "end").strip("\n") or config.DEFAULT_USER_PROMPT
@@ -476,7 +582,11 @@ class App(ctk.CTk):
                 preview = text.replace("\n", " ⏎ ") if text else "（無文字）"
                 self._log_line(f"    ✅ {preview}")
                 if text:
-                    self._translations.append((r["ts"], text))
+                    if dur_mode == "per_subtitle":
+                        dur = r.get("duration", 2.0)
+                        self._translations.append((r["ts"], text, dur))
+                    else:
+                        self._translations.append((r["ts"], text))
                     self.after(0, lambda r=r, text=text: self._add_preview(r["ts_label"], text))
                 self._progress.set(i / total)
             self._log_line("OCR 翻譯完成。")
@@ -501,8 +611,11 @@ class App(ctk.CTk):
                 messagebox.showwarning("無 SRT", "請先在「截圖與字幕」選擇目標 SRT 檔。")
                 return
         mode = self._mode_var.get()
+        dur_mode = self._dur_mode_var.get()
+        dur_val = self._get_duration_value() if dur_mode == "unified" else 2.0
         entries = srt_utils.insert_translations(
-            list(self._srt_entries), list(self._translations), mode=mode)
+            list(self._srt_entries), list(self._translations),
+            mode=mode, duration_mode=dur_mode, duration=dur_val)
         orig = Path(self._srt_path) if self._srt_path else Path(self._settings.get("last_srt_path", ""))
         default_name = ""
         if orig.name:
@@ -524,8 +637,8 @@ class App(ctk.CTk):
         new_count = len(entries) - len(self._srt_entries)
         messagebox.showinfo("完成",
             f"已儲存：{out}\n共 {len(entries)} 條字幕"
-            f"（新增/調整 {new_count} 條，模式：{mode}）")
-        self._log_line(f"已另存：{out}（{len(entries)} 條，模式 {mode}）")
+            f"（新增/調整 {new_count} 條，模式：{mode}，時間長度：{dur_mode}）")
+        self._log_line(f"已另存：{out}（{len(entries)} 條，模式 {mode}，時間長度：{dur_mode}）")
 
 
 def main():

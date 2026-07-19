@@ -100,30 +100,44 @@ def write_srt(path: str | Path, entries: list[dict]) -> None:
 
 def insert_translations(
     entries: list[dict],
-    translations: list[tuple[float, str]],
+    translations: list[tuple[float, str]] | list[tuple[float, str, float]],
     mode: str = "insert",
+    duration_mode: str = "auto",
+    duration: float = 2.0,
 ) -> list[dict]:
     """Return a new entry list with translated text spliced in.
 
-    translations: list of (timestamp_seconds, translated_text).
-    mode: 'insert'  → each becomes a new entry: start=ts, end=next entry's
-                       start (merged view), or ts+2.0 if none.
+    translations: list of (timestamp_seconds, translated_text) or
+                  (timestamp_seconds, translated_text, duration_seconds).
+    mode: 'insert'  → each becomes a new entry: start=ts, end is determined
+                       by duration_mode.
           'append' → append the text to the existing entry whose [start,end)
                      contains ts; if ts falls in a gap, fall back to insert.
+
+    duration_mode:
+      'auto'         → end = next entry's start (or ts+2.0 if none).
+      'unified'      → end = ts + duration (all subtitles use the same value).
+      'per_subtitle' → end = ts + the 3rd element of each translation tuple.
 
     Empty/whitespace-only translations are skipped. Result is unsorted;
     call write_srt() to sort + re-index, or sort here so the caller can count.
     """
     # work on copies
     result = [dict(e) for e in entries]
-    # de-dup & sort translations by ts
-    trans = sorted(
-        ((ts, txt.strip()) for ts, txt in translations if txt and txt.strip()),
-        key=lambda t: t[0],
-    )
+
+    # normalise translations: filter empties, sort, extract optional dur
+    raw: list[tuple[float, str, float | None]] = []
+    for t in translations:
+        txt = t[1].strip() if len(t) > 1 and t[1] else ""
+        if not txt:
+            continue
+        ts = t[0]
+        dur = float(t[2]) if len(t) > 2 and t[2] is not None else None
+        raw.append((ts, txt, dur))
+    raw.sort(key=lambda x: x[0])
 
     if mode == "append":
-        for ts, txt in trans:
+        for ts, txt, _dur in raw:
             host = None
             for e in result:
                 if e["start"] <= ts < e["end"]:
@@ -135,8 +149,16 @@ def insert_translations(
                 # gap → fall back to inserting a new entry
                 result.append(_make_new_entry(ts, txt, result))
     else:  # insert
-        for ts, txt in trans:
-            result.append(_make_new_entry(ts, txt, result))
+        if duration_mode == "unified":
+            for ts, txt, _dur in raw:
+                result.append({"start": ts, "end": ts + duration, "text": txt})
+        elif duration_mode == "per_subtitle":
+            for ts, txt, dur in raw:
+                dur = dur if dur is not None and dur > 0 else 2.0
+                result.append({"start": ts, "end": ts + dur, "text": txt})
+        else:  # auto
+            for ts, txt, _dur in raw:
+                result.append(_make_new_entry(ts, txt, result))
 
     # defensive: never end before start
     for e in result:

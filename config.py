@@ -44,6 +44,8 @@ _DEFAULTS: dict = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "user_prompt": DEFAULT_USER_PROMPT,
     "insertion_mode": "insert",  # "insert" | "append"
+    "duration_mode": "auto",     # "auto" | "unified" | "per_subtitle"
+    "subtitle_duration": 2.0,    # 統一秒數模式的預設值（秒）
     "image_max_side": 1568,
     "last_image_dir": "",
     "last_srt_path": "",
