@@ -37,6 +37,9 @@ class App(ctk.CTk):
         self._srt_path: str = ""
         self._srt_entries: list[dict] = []
         self._translations: list[tuple[float, str]] = []  # (ts, text)
+        # parallel to _translations: the image-row dict each came from, so
+        # per_subtitle durations are read LIVE at insert time (editable after OCR)
+        self._translation_rows: list[dict] = []
         self._busy = False
 
         # ---- tabs ----
@@ -560,6 +563,7 @@ class App(ctk.CTk):
         max_side = int(self._settings.get("image_max_side", 1568))
 
         self._translations = []
+        self._translation_rows = []
         self._log.delete("1.0", "end")
         for w in self._preview_scroll.winfo_children():
             w.destroy()
@@ -582,11 +586,10 @@ class App(ctk.CTk):
                 preview = text.replace("\n", " ⏎ ") if text else "（無文字）"
                 self._log_line(f"    ✅ {preview}")
                 if text:
-                    if dur_mode == "per_subtitle":
-                        dur = r.get("duration", 2.0)
-                        self._translations.append((r["ts"], text, dur))
-                    else:
-                        self._translations.append((r["ts"], text))
+                    # store (ts, text) + a reference to the source row so the
+                    # per-subtitle duration can be read LIVE at insert time
+                    self._translations.append((r["ts"], text))
+                    self._translation_rows.append(r)
                     self.after(0, lambda r=r, text=text: self._add_preview(r["ts_label"], text))
                 self._progress.set(i / total)
             self._log_line("OCR 翻譯完成。")
@@ -613,8 +616,28 @@ class App(ctk.CTk):
         mode = self._mode_var.get()
         dur_mode = self._dur_mode_var.get()
         dur_val = self._get_duration_value() if dur_mode == "unified" else 2.0
+
+        # build the translation list to pass in:
+        # - per_subtitle: read each row's LIVE duration now (so edits made in
+        #   Tab1 after OCR still take effect, even without a FocusOut); pair by
+        #   the parallel _translation_rows
+        # - otherwise: plain (ts, text) tuples
+        if dur_mode == "per_subtitle" and len(self._translation_rows) == len(self._translations):
+            trans = []
+            for (ts, txt), row in zip(self._translations, self._translation_rows):
+                dur = row.get("duration", 2.0)
+                var = row.get("dur_var")
+                if var is not None:
+                    try:
+                        dur = max(float(var.get().strip()), 0.5)
+                    except (ValueError, AttributeError):
+                        pass
+                trans.append((ts, txt, dur))
+        else:
+            trans = list(self._translations)
+
         entries = srt_utils.insert_translations(
-            list(self._srt_entries), list(self._translations),
+            list(self._srt_entries), trans,
             mode=mode, duration_mode=dur_mode, duration=dur_val)
         orig = Path(self._srt_path) if self._srt_path else Path(self._settings.get("last_srt_path", ""))
         default_name = ""
