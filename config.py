@@ -66,6 +66,8 @@ _DEFAULTS: dict = {
     "subtitle_duration": 2.0,    # 統一秒數模式的預設值（秒）
     "image_max_side": 1568,
     "last_image_dir": "",
+    "last_video_dir": "",
+    "last_video_path": "",
     "last_srt_path": "",
     "appearance_mode": "dark",
 }

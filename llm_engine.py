@@ -37,14 +37,20 @@ class LLMError(RuntimeError):
     """Raised when the API call fails or returns an unusable payload."""
 
 
-def encode_image(path: str | Path, max_side: int = 1568) -> tuple[str, str]:
-    """Load an image, downscale longest side to max_side, return (b64, mime).
+def encode_image(image_or_path: str | Path | Image.Image, max_side: int = 1568) -> tuple[str, str]:
+    """Load or accept an image, downscale longest side to max_side, return (b64, mime).
 
     Re-encodes as JPEG to keep payload size down. Returns mime 'image/jpeg'.
     """
     from PIL import Image  # imported lazily so config errors surface first
 
-    img = Image.open(path)
+    if isinstance(image_or_path, (str, Path)):
+        img = Image.open(image_or_path)
+    elif isinstance(image_or_path, Image.Image):
+        img = image_or_path.copy()
+    else:
+        raise ValueError(f"不支援的圖片類型：{type(image_or_path)}")
+
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     # downscale if needed (preserve aspect)
@@ -86,14 +92,14 @@ def _post(cfg: ProviderCfg, payload: dict, timeout: int = 120) -> dict:
 
 def translate_image(
     cfg: ProviderCfg,
-    image_path: str | Path,
+    image_or_path: str | Path | Image.Image,
     system_prompt: str,
     user_prompt: str,
     lang: str,
     max_side: int = 1568,
 ) -> str:
     """OCR+translate one image via the vision LLM; return the translated text."""
-    b64, mime = encode_image(image_path, max_side)
+    b64, mime = encode_image(image_or_path, max_side)
     try:
         user_text = user_prompt.format(lang=lang)
     except (KeyError, IndexError):

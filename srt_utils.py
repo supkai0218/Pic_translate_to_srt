@@ -137,7 +137,7 @@ def insert_translations(
     raw.sort(key=lambda x: x[0])
 
     if mode == "append":
-        for ts, txt, _dur in raw:
+        for ts, txt, dur in raw:
             host = None
             for e in result:
                 if e["start"] <= ts < e["end"]:
@@ -147,7 +147,7 @@ def insert_translations(
                 host["text"] = (host["text"] + "\n" + txt).strip()
             else:
                 # gap → fall back to inserting a new entry
-                result.append(_make_new_entry(ts, txt, result))
+                result.append(_make_new_entry(ts, txt, result, dur=dur))
     else:  # insert
         if duration_mode == "unified":
             for ts, txt, _dur in raw:
@@ -157,8 +157,8 @@ def insert_translations(
                 dur = dur if dur is not None and dur > 0 else 2.0
                 result.append({"start": ts, "end": ts + dur, "text": txt})
         else:  # auto
-            for ts, txt, _dur in raw:
-                result.append(_make_new_entry(ts, txt, result))
+            for ts, txt, dur in raw:
+                result.append(_make_new_entry(ts, txt, result, dur=dur))
 
     # defensive: never end before start
     for e in result:
@@ -169,8 +169,11 @@ def insert_translations(
     return result
 
 
-def _make_new_entry(ts: float, txt: str, all_entries: list[dict]) -> dict:
-    """Build a new entry whose end is the next later start, else ts+2.0."""
-    later_starts = [e["start"] for e in all_entries if e["start"] > ts + 1e-6]
-    end = min(later_starts) if later_starts else ts + 2.0
+def _make_new_entry(ts: float, txt: str, all_entries: list[dict], dur: float | None = None) -> dict:
+    """Build a new entry whose end is ts+dur (if provided) or next later start, else ts+2.0."""
+    if dur is not None and dur > 0:
+        end = ts + dur
+    else:
+        later_starts = [e["start"] for e in all_entries if e["start"] > ts + 1e-6]
+        end = min(later_starts) if later_starts else ts + 2.0
     return {"start": ts, "end": end, "text": txt}
