@@ -132,6 +132,7 @@ class TestV102Features(unittest.TestCase):
         a = app.App()
         try:
             a.update()
+            a._keybindings = dict(config.DEFAULT_KEYBINDINGS)
             a._toggle_play = MagicMock()
             a._on_step_back_large = MagicMock()
             a._set_as_start = MagicMock()
@@ -169,6 +170,7 @@ class TestV102Features(unittest.TestCase):
         a = app.App()
         try:
             a.update()
+            a._keybindings = dict(config.DEFAULT_KEYBINDINGS)
             a._toggle_play = MagicMock()
 
             # Mock focus_get to return an Entry widget

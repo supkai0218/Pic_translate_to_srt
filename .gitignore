@@ -37,3 +37,5 @@ Thumbs.db
 # User defined ignore patterns
 source/
 dist/
+vlc/
+vlc_core/

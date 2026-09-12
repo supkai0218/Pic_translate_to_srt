@@ -1,4 +1,4 @@
-"""Video OCR → translate → SRT generator/inserter (v1.02).
+"""Video OCR → translate → SRT generator/inserter (v1.03).
 
 Run: python app.py
 """
@@ -20,6 +20,9 @@ import config
 import srt_utils
 from llm_engine import LLMError, ProviderCfg, test_connection, translate_image
 from video_engine import VideoEngine, VideoEngineError
+import vlc_engine
+from vlc_engine import VLCPlayer, VLCPlayerError, is_vlc_available
+
 
 FONT_BODY = ("Microsoft JhengHei", 13)
 FONT_SMALL = ("Microsoft JhengHei", 11)
@@ -133,8 +136,8 @@ class SubtitleTask:
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.02)")
-        self.geometry("1160x800")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.03)")
+        self.geometry("1160x820")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -149,6 +152,19 @@ class App(ctk.CTk):
         self._current_frame_img: Optional[Image.Image] = None
         self._current_sec: float = 0.0
         self._is_scrubbing: bool = False
+
+        # VLC Player (Hardware accelerated audio/video playback engine)
+        self._vlc_player: Optional[VLCPlayer] = None
+        if is_vlc_available():
+            try:
+                self._vlc_player = VLCPlayer()
+            except Exception:
+                self._vlc_player = None
+
+        self._volume_var = ctk.DoubleVar(value=80.0)
+        self._playback_rate_var = ctk.StringVar(value="1.0x")
+        self._is_muted: bool = False
+        self._active_display_mode: str = "canvas"  # "vlc" | "canvas"
 
         # Range & Crop State
         self._start_sec: float = 0.0
@@ -241,10 +257,14 @@ class App(ctk.CTk):
         left_col = ctk.CTkFrame(main_box)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
 
-        # 1. Canvas for Video Display & Interactive ROI Drag
+        # 1. Video Display Container (Dual Layer: VLC HWND Output + Tkinter Canvas for ROI)
         self._canvas_container = ctk.CTkFrame(left_col, fg_color="black")
         self._canvas_container.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
+        # VLC Player HWND Frame
+        self._vlc_frame = tk.Frame(self._canvas_container, bg="black")
+
+        # Static Canvas for frozen frame display & interactive mouse ROI drag
         self._canvas = tk.Canvas(self._canvas_container, bg="#141414", highlightthickness=0, cursor="cross")
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", self._on_canvas_resize)
@@ -312,6 +332,36 @@ class App(ctk.CTk):
             btn_row, text="⏩ +5s", width=62, height=28, font=FONT_SMALL,
             command=self._on_step_forward_large)
         self._btn_step_forward_large.pack(side="left")
+
+        # Row 3: Audio Volume, Mute, Playback Rate, and Subtitle Status
+        audio_row = ctk.CTkFrame(ctl_frame, fg_color="transparent")
+        audio_row.pack(fill="x", pady=(2, 2))
+
+        self._mute_btn = ctk.CTkButton(
+            audio_row, text="🔊", width=36, height=26, font=FONT_SMALL,
+            command=self._toggle_mute)
+        self._mute_btn.pack(side="left", padx=(0, 4))
+
+        self._volume_slider = ctk.CTkSlider(
+            audio_row, from_=0, to=100, width=90, height=14,
+            variable=self._volume_var, command=self._on_volume_change)
+        self._volume_slider.pack(side="left", padx=(0, 6))
+
+        self._volume_label = ctk.CTkLabel(
+            audio_row, text="80%", font=FONT_SMALL, width=38, anchor="w")
+        self._volume_label.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(audio_row, text="倍速：", font=FONT_SMALL).pack(side="left")
+        self._rate_menu = ctk.CTkOptionMenu(
+            audio_row, values=["0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x"],
+            variable=self._playback_rate_var, width=78, height=26, font=FONT_SMALL,
+            command=self._on_rate_change)
+        self._rate_menu.pack(side="left", padx=(2, 10))
+
+        self._sub_status_label = ctk.CTkLabel(
+            audio_row, text="字幕：未掛載", font=FONT_SMALL,
+            text_color=("gray50", "gray60"), anchor="e")
+        self._sub_status_label.pack(side="right", padx=(0, 4))
 
         # 3. Task Configuration Box (Interval Setting & ROI Info)
         task_cfg_box = ctk.CTkFrame(left_col, fg_color=("gray85", "gray20"))
@@ -436,6 +486,32 @@ class App(ctk.CTk):
         self._video_spec_label.configure(text=f"{w}x{h} | {fps:.2f} FPS | 總長 {dur_str}")
         self._time_slider.configure(to=max(1.0, self._video_engine.duration_sec))
 
+        # Check for same-named .srt file in the same directory if user hasn't selected one
+        candidate_srt = Path(path).with_suffix(".srt")
+        if candidate_srt.is_file():
+            self._srt_path = str(candidate_srt)
+            self._settings["last_srt_path"] = self._srt_path
+            config.patch_setting("last_srt_path", self._srt_path)
+            self._srt_var.set(self._srt_path)
+            try:
+                self._srt_entries = srt_utils.parse_srt(self._srt_path)
+            except Exception:
+                self._srt_entries = []
+
+        # Initialize/Load VLC Player if available
+        if self._vlc_player:
+            self.update_idletasks()
+            self._vlc_player.bind_window(self._vlc_frame.winfo_id())
+            self._vlc_player.load_media(path, srt_path=self._srt_path)
+            self._vlc_player.set_volume(int(self._volume_var.get()))
+            try:
+                rate_val = float(self._playback_rate_var.get().replace("x", "").strip())
+                self._vlc_player.set_rate(rate_val)
+            except Exception:
+                pass
+
+        self._update_sub_status_label()
+
         # Default start and end
         self._current_sec = 0.0
         self._start_sec = 0.0
@@ -444,7 +520,22 @@ class App(ctk.CTk):
 
         # Remove hint and seek to first frame
         self._canvas.delete(self._hint_text_id)
+        self._show_canvas_display()
         self._seek_to(0.0)
+
+    def _show_vlc_display(self):
+        if self._active_display_mode != "vlc":
+            self._canvas.pack_forget()
+            self._vlc_frame.pack(fill="both", expand=True)
+            self._vlc_frame.update_idletasks()
+            self._active_display_mode = "vlc"
+
+    def _show_canvas_display(self):
+        if self._active_display_mode != "canvas":
+            self._vlc_frame.pack_forget()
+            self._canvas.pack(fill="both", expand=True)
+            self._canvas.update_idletasks()
+            self._active_display_mode = "canvas"
 
     def _seek_to(self, sec: float):
         if not self._video_engine:
@@ -456,6 +547,8 @@ class App(ctk.CTk):
             self._current_sec = sec
             self._render_current_frame()
             self._update_time_labels()
+        if self._vlc_player:
+            self._vlc_player.set_time(sec)
 
     def _render_current_frame(self):
         if not self._current_frame_img:
@@ -489,7 +582,7 @@ class App(ctk.CTk):
             self._draw_crop_box_on_canvas(self._crop_box)
 
     def _on_canvas_resize(self, _event):
-        if self._current_frame_img:
+        if self._current_frame_img and self._active_display_mode == "canvas":
             self._render_current_frame()
 
     def _update_time_labels(self):
@@ -501,8 +594,13 @@ class App(ctk.CTk):
 
     def _on_slider_change(self, val: float):
         self._is_scrubbing = True
-        if self._video_engine:
-            self._seek_to(val)
+        val_f = float(val)
+        if self._is_playing and self._vlc_player:
+            self._vlc_player.set_time(val_f)
+            self._current_sec = val_f
+            self._update_time_labels()
+        elif self._video_engine:
+            self._seek_to(val_f)
 
     def _on_slider_release(self, _event):
         self._is_scrubbing = False
@@ -520,7 +618,18 @@ class App(ctk.CTk):
             return
         self._is_playing = True
         self._play_btn.configure(text="⏸ 暫停")
-        self._play_tick()
+
+        if self._vlc_player:
+            self._show_vlc_display()
+            # If current position is near end, wrap around to 0
+            if self._video_engine and self._current_sec >= self._video_engine.duration_sec - 0.2:
+                self._current_sec = 0.0
+            self._vlc_player.set_time(self._current_sec)
+            self._vlc_player.play()
+            self._vlc_play_tick()
+        else:
+            self._show_canvas_display()
+            self._play_tick()
 
     def _stop_play(self):
         self._is_playing = False
@@ -528,6 +637,33 @@ class App(ctk.CTk):
             self.after_cancel(self._play_after_id)
             self._play_after_id = None
         self._play_btn.configure(text="▶ 播放")
+
+        if self._vlc_player:
+            vlc_t = self._vlc_player.get_time()
+            self._vlc_player.pause()
+            if vlc_t > 0:
+                self._current_sec = vlc_t
+
+        self._show_canvas_display()
+        if self._video_engine:
+            self._seek_to(self._current_sec)
+
+    def _vlc_play_tick(self):
+        if not self._is_playing or not self._vlc_player:
+            return
+
+        t = self._vlc_player.get_time()
+        dur = self._video_engine.duration_sec if self._video_engine else self._vlc_player.get_duration()
+
+        if t > 0:
+            self._current_sec = t
+            self._update_time_labels()
+
+        if dur > 0 and t >= dur - 0.1:
+            self._stop_play()
+            return
+
+        self._play_after_id = self.after(50, self._vlc_play_tick)
 
     def _play_tick(self):
         if not self._is_playing or not self._video_engine:
@@ -547,6 +683,54 @@ class App(ctk.CTk):
         else:
             self._stop_play()
 
+    def _on_volume_change(self, val):
+        vol = int(float(val))
+        self._volume_label.configure(text=f"{vol}%")
+        if self._vlc_player:
+            self._vlc_player.set_volume(vol)
+        if vol == 0:
+            self._is_muted = True
+            self._mute_btn.configure(text="🔇")
+        else:
+            self._is_muted = False
+            self._mute_btn.configure(text="🔊")
+
+    def _toggle_mute(self):
+        if self._vlc_player:
+            is_muted = self._vlc_player.toggle_mute()
+            self._is_muted = is_muted
+            vol = self._vlc_player.get_volume()
+            self._volume_var.set(vol)
+            self._volume_label.configure(text=f"{vol}%")
+            self._mute_btn.configure(text="🔇" if is_muted else "🔊")
+        else:
+            self._is_muted = not self._is_muted
+            self._mute_btn.configure(text="🔇" if self._is_muted else "🔊")
+
+    def _on_rate_change(self, val: str):
+        try:
+            rate = float(val.replace("x", "").strip())
+            if self._vlc_player:
+                self._vlc_player.set_rate(rate)
+        except Exception:
+            pass
+
+    def _update_sub_status_label(self):
+        if not hasattr(self, "_sub_status_label"):
+            return
+        if self._srt_path and os.path.isfile(self._srt_path):
+            name = Path(self._srt_path).name
+            count = len(self._srt_entries)
+            self._sub_status_label.configure(
+                text=f"字幕：已掛載 ({name} · {count} 條)",
+                text_color=("#0a7d2c", "#5ec97a")
+            )
+        else:
+            self._sub_status_label.configure(
+                text="字幕：未掛載",
+                text_color=("gray50", "gray60")
+            )
+
     def _step_time(self, delta_sec: float):
         self._stop_play()
         self._seek_to(self._current_sec + delta_sec)
@@ -563,6 +747,8 @@ class App(ctk.CTk):
             self._current_sec = self._video_engine.current_sec
             self._render_current_frame()
             self._update_time_labels()
+            if self._vlc_player:
+                self._vlc_player.set_time(self._current_sec)
 
     def _on_step_back_large(self):
         sec = float(self._step_settings.get("step_back_large_sec", 5.0))
@@ -920,10 +1106,17 @@ class App(ctk.CTk):
             self._srt_var.set(f"解析失敗：{exc}")
             self._srt_entries = []
 
+        if self._vlc_player and self._srt_path:
+            self._vlc_player.set_subtitle_file(self._srt_path)
+        self._update_sub_status_label()
+
     def _clear_srt(self):
         self._srt_path = ""
         self._srt_entries = []
         self._srt_var.set("（未選擇，將直接匯出新 SRT 檔案）")
+        if self._vlc_player:
+            self._vlc_player.clear_subtitle()
+        self._update_sub_status_label()
 
     # ------------------------------------------------------------------ #
     #  Tab 2: Button Step Settings & Keyboard Shortcuts
@@ -1614,6 +1807,16 @@ class App(ctk.CTk):
             messagebox.showerror("寫檔失敗", str(exc))
             return
 
+        # Update current SRT path and hot-reload into VLC
+        self._srt_path = out
+        self._settings["last_srt_path"] = out
+        config.patch_setting("last_srt_path", out)
+        self._srt_var.set(out)
+        self._srt_entries = entries
+        if self._vlc_player:
+            self._vlc_player.set_subtitle_file(out)
+        self._update_sub_status_label()
+
         messagebox.showinfo(
             "匯出完成",
             f"已成功儲存 SRT 字幕：\n{out}\n共包含 {len(entries)} 條字幕。"
@@ -1628,6 +1831,12 @@ class App(ctk.CTk):
 
     def destroy(self):
         self._stop_play()
+        if self._vlc_player:
+            try:
+                self._vlc_player.release()
+            except Exception:
+                pass
+            self._vlc_player = None
         if self._video_engine:
             try:
                 self._video_engine.close()
