@@ -79,13 +79,36 @@ class VLCPlayer:
         self._media_path: str = ""
         self._srt_path: str = ""
         self._is_muted: bool = False
-        self._last_volume: int = 100
+        self._last_volume: int = 80
+        self._volume: int = 80
 
     def bind_window(self, hwnd: int) -> None:
-        """Bind native Windows HWND to VLC player."""
-        self._hwnd = hwnd
-        if sys.platform.startswith("win"):
-            self._player.set_hwnd(hwnd)
+        """Bind native Windows HWND to VLC player with vout re-creation if switching."""
+        if self._hwnd != hwnd:
+            self._hwnd = hwnd
+            if sys.platform.startswith("win"):
+                was_playing = self.is_playing()
+                cur_t = self.get_time()
+                cur_rate = self.get_rate()
+                try:
+                    self._player.stop()
+                    self._player.release()
+                except Exception:
+                    pass
+                self._player = self._instance.media_player_new()
+                self._player.set_hwnd(hwnd)
+                try:
+                    self._player.audio_set_volume(0 if self._is_muted else self._volume)
+                    if cur_rate > 0:
+                        self._player.set_rate(cur_rate)
+                except Exception:
+                    pass
+                if self._media_path and os.path.isfile(self._media_path):
+                    self.load_media(self._media_path, self._srt_path)
+                if cur_t > 0:
+                    self.set_time(cur_t)
+                if was_playing:
+                    self._player.play()
 
     def load_media(self, video_path: str | Path, srt_path: str = "") -> None:
         """Load video media into player and optionally attach external subtitle."""
@@ -93,14 +116,19 @@ class VLCPlayer:
         self._srt_path = str(srt_path) if srt_path else ""
 
         media = self._instance.media_new(self._media_path)
+        if self._srt_path and os.path.isfile(self._srt_path):
+            try:
+                mrl = self._srt_path.replace("\\", "/")
+                if not mrl.startswith("file:///"):
+                    mrl = "file:///" + mrl
+                media.slaves_add(vlc.MediaSlaveType.subtitle, 4, mrl)
+            except Exception:
+                pass
         self._player.set_media(media)
 
         # Re-bind HWND if previously set
         if self._hwnd and sys.platform.startswith("win"):
             self._player.set_hwnd(self._hwnd)
-
-        if self._srt_path and os.path.isfile(self._srt_path):
-            self.set_subtitle_file(self._srt_path)
 
     def set_subtitle_file(self, srt_path: str | Path) -> bool:
         """Set or hot-reload an external SRT subtitle file."""
@@ -108,12 +136,26 @@ class VLCPlayer:
         if not os.path.isfile(p):
             return False
         self._srt_path = p
-        # LibVLC native subtitle file setter
-        try:
-            ok = self._player.video_set_subtitle_file(p)
-            return bool(ok)
-        except Exception:
+        if self._player.is_playing():
+            try:
+                ok = self._player.video_set_subtitle_file(p)
+                return bool(ok)
+            except Exception:
+                return False
+        else:
+            t_sec = self.get_time()
+            if self._media_path:
+                self.load_media(self._media_path, self._srt_path)
+                if t_sec > 0:
+                    self.set_time(t_sec)
+                return True
             return False
+
+    def reload_subtitle(self) -> bool:
+        """Reload currently assigned subtitle file into VLC."""
+        if self._srt_path and os.path.isfile(self._srt_path):
+            return self.set_subtitle_file(self._srt_path)
+        return False
 
     def clear_subtitle(self) -> None:
         """Disable or clear subtitles."""
@@ -182,37 +224,48 @@ class VLCPlayer:
 
     def get_volume(self) -> int:
         """Return current audio volume (0-100)."""
-        try:
-            return max(0, min(100, self._player.audio_get_volume()))
-        except Exception:
-            return 100
+        if self._is_muted:
+            return 0
+        return self._volume
 
     def set_volume(self, volume: int) -> None:
         """Set audio volume (0-100)."""
+        vol = max(0, min(100, int(volume)))
+        self._volume = vol
         try:
-            vol = max(0, min(100, int(volume)))
             self._player.audio_set_volume(vol)
-            if vol > 0:
-                self._last_volume = vol
-                self._is_muted = False
         except Exception:
             pass
+        if vol > 0:
+            self._last_volume = vol
+            self._is_muted = False
+        else:
+            self._is_muted = True
 
     def toggle_mute(self) -> bool:
         """Toggle mute state. Returns True if now muted."""
-        cur_vol = self.get_volume()
-        if cur_vol > 0:
-            self._last_volume = cur_vol
-            self.set_volume(0)
+        if not self._is_muted:
+            self._last_volume = self._volume if self._volume > 0 else (self._last_volume or 80)
             self._is_muted = True
+            self._volume = 0
+            try:
+                self._player.audio_set_volume(0)
+                self._player.audio_set_mute(True)
+            except Exception:
+                pass
         else:
-            self.set_volume(self._last_volume or 80)
             self._is_muted = False
+            self._volume = self._last_volume or 80
+            try:
+                self._player.audio_set_volume(self._volume)
+                self._player.audio_set_mute(False)
+            except Exception:
+                pass
         return self._is_muted
 
     @property
     def is_muted(self) -> bool:
-        return self._is_muted or (self.get_volume() == 0)
+        return self._is_muted or (self._volume == 0)
 
     def get_rate(self) -> float:
         """Return playback rate (e.g. 1.0)."""

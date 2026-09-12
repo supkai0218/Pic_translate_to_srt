@@ -1,4 +1,4 @@
-"""Video OCR → translate → SRT generator/inserter (v1.03).
+"""Video OCR → translate → SRT generator/inserter (v1.04).
 
 Run: python app.py
 """
@@ -10,7 +10,7 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 import customtkinter as ctk
@@ -52,6 +52,8 @@ KEY_DISPLAY_MAP = {
     "escape": "Esc",
     "backspace": "Backspace",
     "delete": "Delete",
+    "f11": "F11 (全螢幕)",
+    "f5": "F5 (熱重載)",
 }
 
 
@@ -81,6 +83,8 @@ KEYBINDING_ACTIONS = [
     ("reset_roi", "重設全畫面 (ROI)"),
     ("apply_last_roi", "套用上次框選"),
     ("add_task", "➕ 新增至任務清單"),
+    ("toggle_fullscreen", "切換全螢幕 (全螢幕/退出)"),
+    ("hot_reload_sub", "重新載入字幕 (Hot Reload)"),
 ]
 
 
@@ -136,7 +140,7 @@ class SubtitleTask:
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.03)")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.04)")
         self.geometry("1160x820")
         self.minsize(980, 680)
 
@@ -152,6 +156,19 @@ class App(ctk.CTk):
         self._current_frame_img: Optional[Image.Image] = None
         self._current_sec: float = 0.0
         self._is_scrubbing: bool = False
+
+        # Fullscreen and window scale
+        self._is_fullscreen: bool = False
+        self._saved_geometry: str = "1160x820"
+        self._fullscreen_win: Optional[tk.Toplevel] = None
+        self._fullscreen_frame: Optional[tk.Frame] = None
+        self._window_scale_var = ctk.StringVar(value="1.0x (原始)")
+        self._active_tab_name: str = "  影音播放器  "
+
+        # Subtitle inline editor state
+        self._inline_entry: Optional[tk.Entry] = None
+        self._inline_edit_item: Optional[str] = None
+        self._inline_edit_idx: Optional[int] = None
 
         # VLC Player (Hardware accelerated audio/video playback engine)
         self._vlc_player: Optional[VLCPlayer] = None
@@ -196,14 +213,16 @@ class App(ctk.CTk):
         self._busy: bool = False
 
         # Tabs
-        self.tabs = ctk.CTkTabview(self, anchor="nw")
+        self.tabs = ctk.CTkTabview(self, anchor="nw", command=self._on_tab_change)
         self.tabs.pack(fill="both", expand=True, padx=10, pady=(8, 10))
+        self.tabs.add("  影音播放器  ")
         self.tabs.add("  影片與字幕任務  ")
         self.tabs.add("  按鈕與快捷鍵設定  ")
         self.tabs.add("  API 設定  ")
         self.tabs.add("  Prompt 設定  ")
         self.tabs.add("  執行  ")
 
+        self._build_player_tab(self.tabs.tab("  影音播放器  "))
         self._build_video_tab(self.tabs.tab("  影片與字幕任務  "))
         self._build_keybindings_tab(self.tabs.tab("  按鈕與快捷鍵設定  "))
         self._build_api_tab(self.tabs.tab("  API 設定  "))
@@ -216,7 +235,644 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
     # ------------------------------------------------------------------ #
-    #  Tab 1: Video Player & Subtitle Tasks
+    #  Tab 1: Pure Media Player & Live Subtitle Editor (v1.04)
+    # ------------------------------------------------------------------ #
+    def _build_player_tab(self, parent):
+        # Top bar: Video & Subtitle Controls
+        top_bar = ctk.CTkFrame(parent, fg_color=("gray90", "gray17"))
+        top_bar.pack(fill="x", padx=10, pady=(6, 6))
+
+        # Row 1: Video file picker
+        v_row = ctk.CTkFrame(top_bar, fg_color="transparent")
+        v_row.pack(fill="x", padx=8, pady=(6, 4))
+        ctk.CTkButton(v_row, text="選擇影片", width=110, height=30,
+                      font=FONT_BODY, command=self._pick_video).pack(side="left")
+        self._player_video_label = ctk.CTkLabel(v_row, text="（尚未載入影片）", font=FONT_BODY, anchor="w")
+        self._player_video_label.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        self._player_video_spec_label = ctk.CTkLabel(v_row, text="", font=FONT_SMALL,
+                                                     text_color=("gray40", "#9aa0a6"), anchor="e")
+        self._player_video_spec_label.pack(side="right", padx=(0, 4))
+
+        # Row 2: Subtitle selection & Hot-Reload
+        s_row = ctk.CTkFrame(top_bar, fg_color="transparent")
+        s_row.pack(fill="x", padx=8, pady=(2, 6))
+        ctk.CTkButton(s_row, text="目標字幕", width=110, height=28,
+                      font=FONT_SMALL, command=self._pick_srt).pack(side="left")
+        self._player_srt_var = ctk.StringVar(value="（未選擇字幕檔案）")
+        ctk.CTkLabel(s_row, textvariable=self._player_srt_var, font=FONT_SMALL,
+                     anchor="w", text_color=("gray40", "#9aa0a6")).pack(side="left", fill="x", expand=True, padx=(8, 8))
+
+        ctk.CTkButton(s_row, text="🔄 重新載入 (Hot Reload)", width=170, height=26,
+                      font=FONT_SMALL, fg_color="#1f6aa5", hover_color="#144870",
+                      command=self._hot_reload_subtitle).pack(side="right", padx=(4, 4))
+        ctk.CTkButton(s_row, text="清除", width=60, height=26,
+                      font=FONT_SMALL, command=self._clear_srt).pack(side="right", padx=(0, 4))
+
+        # Main Draggable Split Container: Left = Video + Controls, Right = Subtitle Viewer & Editor
+        self._player_paned = tk.PanedWindow(
+            parent, orient="horizontal", sashrelief="raised", sashwidth=6,
+            bg="#252526", bd=0, opaqueresize=True
+        )
+        self._player_paned.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        # Left Column: Player Display & Controls
+        left_col = ctk.CTkFrame(self._player_paned)
+
+        # 1. Native VLC HWND Frame
+        self._player_canvas_container = ctk.CTkFrame(left_col, fg_color="black")
+        self._player_canvas_container.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+        self._player_vlc_frame = tk.Frame(self._player_canvas_container, bg="black")
+        self._player_vlc_frame.pack(fill="both", expand=True)
+
+        # 2. Controls Frame
+        ctl_frame = ctk.CTkFrame(left_col, fg_color="transparent")
+        ctl_frame.pack(fill="x", padx=8, pady=(2, 4))
+
+        # Slider row
+        slider_row = ctk.CTkFrame(ctl_frame, fg_color="transparent")
+        slider_row.pack(fill="x", pady=(0, 2))
+        self._player_time_slider = ctk.CTkSlider(slider_row, from_=0, to=100,
+                                                 command=self._on_slider_change)
+        self._player_time_slider.set(0)
+        self._player_time_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._player_time_slider.bind("<ButtonRelease-1>", self._on_slider_release)
+        self._player_time_label = ctk.CTkLabel(slider_row, text="00:00:00,000 / 00:00:00,000",
+                                               font=FONT_MONO, width=190, anchor="e")
+        self._player_time_label.pack(side="right")
+
+        # Button row: Step & Play (in player mode, clicking step seeks and keeps/resumes playing)
+        btn_row = ctk.CTkFrame(ctl_frame, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(2, 2))
+
+        self._player_btn_step_back_large = ctk.CTkButton(
+            btn_row, text="⏪ -5s", width=62, height=28, font=FONT_SMALL,
+            command=self._on_player_step_back_large)
+        self._player_btn_step_back_large.pack(side="left", padx=(0, 3))
+
+        self._player_btn_step_back_small = ctk.CTkButton(
+            btn_row, text="⏪ -3s", width=62, height=28, font=FONT_SMALL,
+            command=self._on_player_step_back_small)
+        self._player_btn_step_back_small.pack(side="left", padx=(0, 3))
+
+        self._player_btn_step_back_frame = ctk.CTkButton(
+            btn_row, text="◀ -1幀", width=62, height=28, font=FONT_SMALL,
+            command=self._on_player_step_back_frame)
+        self._player_btn_step_back_frame.pack(side="left", padx=(0, 5))
+
+        self._player_play_btn = ctk.CTkButton(
+            btn_row, text="▶ 播放", width=82, height=28, font=FONT_BODY,
+            command=self._toggle_play)
+        self._player_play_btn.pack(side="left", padx=(0, 5))
+
+        self._player_btn_step_forward_frame = ctk.CTkButton(
+            btn_row, text="▶ +1幀", width=62, height=28, font=FONT_SMALL,
+            command=self._on_player_step_forward_frame)
+        self._player_btn_step_forward_frame.pack(side="left", padx=(0, 3))
+
+        self._player_btn_step_forward_small = ctk.CTkButton(
+            btn_row, text="⏩ +3s", width=62, height=28, font=FONT_SMALL,
+            command=self._on_player_step_forward_small)
+        self._player_btn_step_forward_small.pack(side="left", padx=(0, 3))
+
+        self._player_btn_step_forward_large = ctk.CTkButton(
+            btn_row, text="⏩ +5s", width=62, height=28, font=FONT_SMALL,
+            command=self._on_player_step_forward_large)
+        self._player_btn_step_forward_large.pack(side="left")
+
+        # Row 3: Audio, Zoom & Fullscreen
+        audio_row = ctk.CTkFrame(ctl_frame, fg_color="transparent")
+        audio_row.pack(fill="x", pady=(2, 2))
+
+        self._player_mute_btn = ctk.CTkButton(
+            audio_row, text="🔊", width=36, height=26, font=FONT_SMALL,
+            command=self._toggle_mute)
+        self._player_mute_btn.pack(side="left", padx=(0, 4))
+
+        self._player_volume_slider = ctk.CTkSlider(
+            audio_row, from_=0, to=100, width=90, height=14,
+            variable=self._volume_var, command=self._on_volume_change)
+        self._player_volume_slider.pack(side="left", padx=(0, 6))
+
+        self._player_volume_label = ctk.CTkLabel(
+            audio_row, text="80%", font=FONT_SMALL, width=38, anchor="w")
+        self._player_volume_label.pack(side="left", padx=(0, 8))
+
+        ctk.CTkLabel(audio_row, text="倍速：", font=FONT_SMALL).pack(side="left")
+        self._player_rate_menu = ctk.CTkOptionMenu(
+            audio_row, values=["0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x"],
+            variable=self._playback_rate_var, width=78, height=26, font=FONT_SMALL,
+            command=self._on_rate_change)
+        self._player_rate_menu.pack(side="left", padx=(2, 10))
+
+        ctk.CTkLabel(audio_row, text="縮放：", font=FONT_SMALL).pack(side="left")
+        self._player_scale_menu = ctk.CTkOptionMenu(
+            audio_row, values=["0.5x", "0.75x", "1.0x (原始)", "1.5x", "2.0x"],
+            variable=self._window_scale_var, width=105, height=26, font=FONT_SMALL,
+            command=self._on_window_scale_change)
+        self._player_scale_menu.pack(side="left", padx=(2, 8))
+
+        self._player_fullscreen_btn = ctk.CTkButton(
+            audio_row, text="⛶ 全螢幕", width=78, height=26, font=FONT_SMALL,
+            fg_color="#333333", hover_color="#444444",
+            command=self._toggle_fullscreen)
+        self._player_fullscreen_btn.pack(side="left", padx=(0, 8))
+
+        self._player_sub_status_label = ctk.CTkLabel(
+            audio_row, text="字幕：未掛載", font=FONT_SMALL,
+            text_color=("gray50", "gray60"), anchor="e")
+        self._player_sub_status_label.pack(side="right", padx=(0, 4))
+
+        # Right Column: Subtitle List & Live Editor
+        right_col = ctk.CTkFrame(self._player_paned)
+
+        # Add panes to draggable PanedWindow
+        self._player_paned.add(left_col, minsize=480, stretch="always")
+        self._player_paned.add(right_col, minsize=260, stretch="always")
+
+        # Header
+        r_hdr = ctk.CTkFrame(right_col, fg_color="transparent")
+        r_hdr.pack(fill="x", padx=8, pady=(8, 4))
+        self._sub_count_label = ctk.CTkLabel(r_hdr, text="字幕清單 (共 0 條)", font=FONT_SUBTITLE, anchor="w")
+        self._sub_count_label.pack(side="left")
+
+        # Treeview style
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(
+            "Player.Treeview",
+            background="#1e1e1e",
+            foreground="#e0e0e0",
+            rowheight=26,
+            fieldbackground="#1e1e1e",
+            bordercolor="#333333",
+            borderwidth=0,
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Player.Treeview.Heading",
+            background="#2d2d2d",
+            foreground="#ffffff",
+            relief="flat",
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            "Player.Treeview",
+            background=[("selected", "#1f6aa5")],
+            foreground=[("selected", "#ffffff")],
+        )
+
+        # Treeview + Scrollbar Container
+        tree_container = tk.Frame(right_col, bg="#1e1e1e")
+        tree_container.pack(fill="both", expand=True, padx=8, pady=(2, 4))
+
+        tree_scroll = ttk.Scrollbar(tree_container, orient="vertical")
+        tree_scroll.pack(side="right", fill="y")
+
+        self._sub_tree = ttk.Treeview(
+            tree_container,
+            columns=("time", "text"),
+            show="headings",
+            selectmode="browse",
+            style="Player.Treeview",
+            yscrollcommand=tree_scroll.set
+        )
+        tree_scroll.config(command=self._sub_tree.yview)
+
+        self._sub_tree.heading("time", text="時間區間")
+        self._sub_tree.heading("text", text="字幕內容")
+
+        self._sub_tree.column("time", width=190, minwidth=150, anchor="center")
+        self._sub_tree.column("text", width=320, minwidth=200, anchor="w")
+
+        self._sub_tree.pack(fill="both", expand=True)
+
+        # Context Menu for Right-click
+        self._sub_context_menu = tk.Menu(self, tearoff=0, bg="#2b2b2b", fg="white", activebackground="#1f6aa5", activeforeground="white")
+        self._sub_context_menu.add_command(label="✏ 編輯此行字幕", command=self._on_ctx_edit)
+        self._sub_context_menu.add_command(label="📋 複製字幕文字", command=self._on_ctx_copy)
+        self._sub_context_menu.add_command(label="⏱ 跳至此時間點", command=self._on_ctx_jump)
+
+        # Treeview Events
+        self._sub_tree.bind("<ButtonRelease-1>", self._on_sub_left_click)
+        self._sub_tree.bind("<Double-Button-1>", self._on_sub_left_double_click)
+        self._sub_tree.bind("<Button-3>", self._on_sub_right_click)
+        self._sub_tree.bind("<Double-Button-3>", self._on_sub_right_double_click)
+
+        # Footer instructions
+        tip_label = ctk.CTkLabel(
+            right_col,
+            text="💡 左鍵單擊跳轉 | 左鍵雙擊播放 | 右鍵單擊選單 | 右鍵雙擊編輯",
+            font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w"
+        )
+        tip_label.pack(fill="x", padx=10, pady=(2, 6))
+
+    # ------------------------------------------------------------------ #
+    #  Tab Change & Dual-Tab Sync Methods
+    # ------------------------------------------------------------------ #
+    def _on_tab_change(self):
+        tab_name = self.tabs.get()
+        self._active_tab_name = tab_name
+
+        if tab_name == "  影音播放器  ":
+            if self._vlc_player and hasattr(self, "_player_vlc_frame"):
+                self.update_idletasks()
+                self._vlc_player.bind_window(self._player_vlc_frame.winfo_id())
+                self._vlc_player.set_time(self._current_sec)
+            self._sync_player_ui()
+            self._populate_sub_treeview()
+            self._sync_subtitle_highlight()
+
+        elif tab_name == "  影片與字幕任務  ":
+            if self._vlc_player and hasattr(self, "_vlc_frame"):
+                self._show_vlc_display()
+                self.update_idletasks()
+                self._vlc_player.bind_window(self._vlc_frame.winfo_id())
+                self._show_canvas_display()
+                self._vlc_player.set_time(self._current_sec)
+            self._show_canvas_display()
+            if self._video_engine:
+                self._seek_to(self._current_sec)
+            self._sync_video_tab_ui()
+
+    def _sync_player_ui(self):
+        filename = Path(self._video_path).name if self._video_path else "（尚未載入影片）"
+        if hasattr(self, "_player_video_label"):
+            self._player_video_label.configure(text=filename)
+        if hasattr(self, "_player_video_spec_label") and self._video_engine:
+            dur_str = srt_utils.sec_to_ts(self._video_engine.duration_sec)
+            self._player_video_spec_label.configure(
+                text=f"{self._video_engine.width}x{self._video_engine.height} | {self._video_engine.fps:.2f} FPS | 總長 {dur_str}"
+            )
+        if hasattr(self, "_player_srt_var"):
+            self._player_srt_var.set(self._srt_path or "（未選擇字幕檔案）")
+        if hasattr(self, "_player_time_slider") and self._video_engine:
+            self._player_time_slider.configure(to=max(1.0, self._video_engine.duration_sec))
+            self._player_time_slider.set(self._current_sec)
+        self._update_time_labels()
+        self._update_sub_status_label()
+
+    def _sync_video_tab_ui(self):
+        filename = Path(self._video_path).name if self._video_path else "（尚未載入影片）"
+        if hasattr(self, "_video_label"):
+            self._video_label.configure(text=filename)
+        if hasattr(self, "_video_spec_label") and self._video_engine:
+            dur_str = srt_utils.sec_to_ts(self._video_engine.duration_sec)
+            self._video_spec_label.configure(
+                text=f"{self._video_engine.width}x{self._video_engine.height} | {self._video_engine.fps:.2f} FPS | 總長 {dur_str}"
+            )
+        if hasattr(self, "_srt_var"):
+            self._srt_var.set(self._srt_path or "（未選擇，將直接匯出新 SRT 檔案）")
+        if hasattr(self, "_time_slider") and self._video_engine:
+            self._time_slider.configure(to=max(1.0, self._video_engine.duration_sec))
+            self._time_slider.set(self._current_sec)
+        self._update_range_inputs()
+        self._update_time_labels()
+        self._update_sub_status_label()
+
+    # ------------------------------------------------------------------ #
+    #  Subtitle Treeview & Inline Editing Methods
+    # ------------------------------------------------------------------ #
+    def _populate_sub_treeview(self):
+        if not hasattr(self, "_sub_tree"):
+            return
+        for item in self._sub_tree.get_children():
+            self._sub_tree.delete(item)
+
+        for i, entry in enumerate(self._srt_entries, 1):
+            start = entry.get("start", entry.get("start_sec", 0.0))
+            end = entry.get("end", entry.get("end_sec", 0.0))
+            t_str = f"{srt_utils.sec_to_ts(start)} → {srt_utils.sec_to_ts(end)}"
+            txt = entry.get("text", "").replace("\n", " ⏎ ")
+            self._sub_tree.insert("", "end", iid=str(i), values=(t_str, txt))
+
+        if hasattr(self, "_sub_count_label"):
+            self._sub_count_label.configure(text=f"字幕清單 (共 {len(self._srt_entries)} 條)")
+
+    def _sync_subtitle_highlight(self):
+        if not hasattr(self, "_sub_tree") or not self._srt_entries:
+            return
+        cur_sec = self._current_sec
+        active_idx = None
+        for i, ent in enumerate(self._srt_entries):
+            start = ent.get("start", ent.get("start_sec", 0.0))
+            end = ent.get("end", ent.get("end_sec", 0.0))
+            if start <= cur_sec <= end:
+                active_idx = i
+                break
+
+        if active_idx is not None:
+            target_iid = str(active_idx + 1)
+            try:
+                cur_sel = self._sub_tree.selection()
+                if not cur_sel or cur_sel[0] != target_iid:
+                    self._sub_tree.selection_set(target_iid)
+                    self._sub_tree.see(target_iid)
+            except Exception:
+                pass
+
+    def _on_sub_left_click(self, event):
+        item = self._sub_tree.identify_row(event.y)
+        if not item:
+            return
+        try:
+            idx = int(item) - 1
+            if 0 <= idx < len(self._srt_entries):
+                sec = self._srt_entries[idx].get("start", self._srt_entries[idx].get("start_sec", 0.0))
+                self._seek_to(sec)
+        except Exception:
+            pass
+
+    def _on_sub_left_double_click(self, event):
+        item = self._sub_tree.identify_row(event.y)
+        if not item:
+            return
+        try:
+            idx = int(item) - 1
+            if 0 <= idx < len(self._srt_entries):
+                sec = self._srt_entries[idx].get("start", self._srt_entries[idx].get("start_sec", 0.0))
+                self._seek_to(sec)
+                if not self._is_playing:
+                    self._start_play()
+        except Exception:
+            pass
+
+    def _on_sub_right_click(self, event):
+        item = self._sub_tree.identify_row(event.y)
+        if item:
+            self._sub_tree.selection_set(item)
+            self._context_menu_item = item
+            try:
+                self._sub_context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self._sub_context_menu.grab_release()
+
+    def _on_sub_right_double_click(self, event):
+        item = self._sub_tree.identify_row(event.y)
+        if item:
+            self._start_inline_sub_edit(item)
+
+    def _on_ctx_edit(self):
+        item = getattr(self, "_context_menu_item", None)
+        if item:
+            self._start_inline_sub_edit(item)
+
+    def _on_ctx_copy(self):
+        item = getattr(self, "_context_menu_item", None)
+        if not item:
+            return
+        try:
+            idx = int(item) - 1
+            if 0 <= idx < len(self._srt_entries):
+                txt = self._srt_entries[idx].get("text", "")
+                self.clipboard_clear()
+                self.clipboard_append(txt)
+        except Exception:
+            pass
+
+    def _on_ctx_jump(self):
+        item = getattr(self, "_context_menu_item", None)
+        if not item:
+            return
+        try:
+            idx = int(item) - 1
+            if 0 <= idx < len(self._srt_entries):
+                sec = self._srt_entries[idx].get("start", self._srt_entries[idx].get("start_sec", 0.0))
+                self._seek_to(sec)
+                if not self._is_playing:
+                    self._start_play()
+        except Exception:
+            pass
+
+    def _start_inline_sub_edit(self, item: str):
+        if not item:
+            return
+        self._close_inline_sub_edit(commit=False)
+
+        bbox = self._sub_tree.bbox(item, "text")
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        try:
+            idx = int(item) - 1
+            cur_text = self._srt_entries[idx].get("text", "")
+        except Exception:
+            return
+
+        self._inline_edit_item = item
+        self._inline_edit_idx = idx
+
+        self._inline_entry = tk.Entry(
+            self._sub_tree, font=("Segoe UI", 10),
+            bg="#2c3e50", fg="white", insertbackground="white",
+            relief="solid", bd=1
+        )
+        self._inline_entry.place(x=x, y=y, width=max(w, 240), height=max(h, 24))
+        self._inline_entry.insert(0, cur_text.replace("\n", " \\n "))
+        self._inline_entry.focus_set()
+        self._inline_entry.select_range(0, "end")
+
+        self._inline_entry.bind("<Return>", lambda _e: self._close_inline_sub_edit(commit=True))
+        self._inline_entry.bind("<Escape>", lambda _e: self._close_inline_sub_edit(commit=False))
+        self._inline_entry.bind("<FocusOut>", lambda _e: self._close_inline_sub_edit(commit=True))
+
+    def _close_inline_sub_edit(self, commit: bool = True):
+        if not hasattr(self, "_inline_entry") or self._inline_entry is None:
+            return
+        entry = self._inline_entry
+        self._inline_entry = None
+        item = getattr(self, "_inline_edit_item", None)
+        idx = getattr(self, "_inline_edit_idx", None)
+
+        if commit and item is not None and idx is not None and 0 <= idx < len(self._srt_entries):
+            new_text = entry.get().replace(" \\n ", "\n").strip()
+            self._srt_entries[idx]["text"] = new_text
+            ent = self._srt_entries[idx]
+            start = ent.get("start", ent.get("start_sec", 0.0))
+            end = ent.get("end", ent.get("end_sec", 0.0))
+            t_str = f"{srt_utils.sec_to_ts(start)} → {srt_utils.sec_to_ts(end)}"
+            self._sub_tree.item(item, values=(t_str, new_text.replace("\n", " ⏎ ")))
+            if self._srt_path and os.path.isfile(self._srt_path):
+                try:
+                    srt_utils.write_srt(self._srt_path, self._srt_entries)
+                    if self._vlc_player:
+                        self._vlc_player.reload_subtitle()
+                except Exception:
+                    pass
+
+        try:
+            entry.destroy()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  Player Step Controls (Seek & Auto-Continue Playing)
+    # ------------------------------------------------------------------ #
+    def _player_step_time(self, delta_sec: float):
+        target = self._current_sec + delta_sec
+        if self._video_engine:
+            target = max(0.0, min(target, self._video_engine.duration_sec))
+        self._current_sec = target
+        if self._vlc_player:
+            self._vlc_player.set_time(target)
+            if not self._is_playing:
+                self._start_play()
+        self._update_time_labels()
+
+    def _player_step_frame(self, delta_frames: int):
+        if not self._video_engine:
+            return
+        fps = self._video_engine.fps or 30.0
+        cur_frame = int(round(self._current_sec * fps))
+        target_frame = max(0, cur_frame + delta_frames)
+        target_sec = target_frame / fps
+        target_sec = min(target_sec, self._video_engine.duration_sec)
+        self._current_sec = target_sec
+        if self._vlc_player:
+            self._vlc_player.set_time(target_sec)
+            if not self._is_playing:
+                self._start_play()
+        self._update_time_labels()
+
+    def _on_player_step_back_large(self):
+        sec = float(self._step_settings.get("step_back_large_sec", 5.0))
+        self._player_step_time(-sec)
+
+    def _on_player_step_back_small(self):
+        sec = float(self._step_settings.get("step_back_small_sec", 3.0))
+        self._player_step_time(-sec)
+
+    def _on_player_step_back_frame(self):
+        frames = int(self._step_settings.get("step_back_frames", 1))
+        self._player_step_frame(-frames)
+
+    def _on_player_step_forward_frame(self):
+        frames = int(self._step_settings.get("step_forward_frames", 1))
+        self._player_step_frame(frames)
+
+    def _on_player_step_forward_small(self):
+        sec = float(self._step_settings.get("step_forward_small_sec", 3.0))
+        self._player_step_time(sec)
+
+    def _on_player_step_forward_large(self):
+        sec = float(self._step_settings.get("step_forward_large_sec", 5.0))
+        self._player_step_time(sec)
+
+    # ------------------------------------------------------------------ #
+    #  Window Scale & Fullscreen Controls
+    # ------------------------------------------------------------------ #
+    def _on_window_scale_change(self, scale_str: str):
+        try:
+            val = float(scale_str.split("x")[0].strip())
+        except Exception:
+            val = 1.0
+
+        vw = self._video_engine.width if self._video_engine else 1280
+        vh = self._video_engine.height if self._video_engine else 720
+
+        extra_w = 400
+        extra_h = 250
+
+        target_w = int(vw * val) + extra_w
+        target_h = int(vh * val) + extra_h
+
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+
+        w = max(980, min(target_w, sw - 60))
+        h = max(680, min(target_h, sh - 80))
+
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _toggle_fullscreen(self):
+        if self._is_fullscreen:
+            self._is_fullscreen = False
+            if hasattr(self, "_fullscreen_win") and self._fullscreen_win:
+                try:
+                    self._fullscreen_win.destroy()
+                except Exception:
+                    pass
+                self._fullscreen_win = None
+                self._fullscreen_frame = None
+
+            # Restore HWND to active tab frame
+            if self._vlc_player:
+                self.update_idletasks()
+                if self._active_tab_name == "  影音播放器  " and hasattr(self, "_player_vlc_frame"):
+                    self._vlc_player.bind_window(self._player_vlc_frame.winfo_id())
+                elif hasattr(self, "_vlc_frame"):
+                    self._vlc_player.bind_window(self._vlc_frame.winfo_id())
+
+            if hasattr(self, "_player_fullscreen_btn"):
+                self._player_fullscreen_btn.configure(text="⛶ 全螢幕")
+        else:
+            self._is_fullscreen = True
+            if hasattr(self, "_player_fullscreen_btn"):
+                self._player_fullscreen_btn.configure(text="🗗 退出全螢幕")
+
+            # Create true borderless fullscreen Toplevel
+            fs = tk.Toplevel(self)
+            fs.title("全螢幕播放")
+            fs.attributes("-fullscreen", True)
+            fs.configure(bg="black")
+            self._fullscreen_win = fs
+
+            fs_frame = tk.Frame(fs, bg="black")
+            fs_frame.pack(fill="both", expand=True)
+            self._fullscreen_frame = fs_frame
+            fs.update_idletasks()
+
+            # Floating exit button in top-right corner
+            exit_btn = ctk.CTkButton(
+                fs, text="🗗 退出全螢幕 (Esc / F11)", width=170, height=32,
+                font=FONT_SMALL, fg_color="#222222", hover_color="#444444",
+                command=self._toggle_fullscreen
+            )
+            exit_btn.place(relx=0.98, rely=0.03, anchor="ne")
+
+            # Keyboard & mouse event bindings on fullscreen window
+            fs.bind("<Escape>", lambda _e: self._toggle_fullscreen())
+            fs.bind("<F11>", lambda _e: self._toggle_fullscreen())
+            fs.bind("<space>", lambda _e: self._toggle_play())
+            fs.bind("<Double-Button-1>", lambda _e: self._toggle_fullscreen())
+            fs.bind("<Left>", lambda _e: self._on_player_step_back_large())
+            fs.bind("<Right>", lambda _e: self._on_player_step_forward_large())
+            fs.protocol("WM_DELETE_WINDOW", self._toggle_fullscreen)
+
+            # Redirect VLC output to fullscreen frame
+            if self._vlc_player:
+                self._vlc_player.bind_window(fs_frame.winfo_id())
+
+    def _hot_reload_subtitle(self):
+        if not self._srt_path or not os.path.isfile(self._srt_path):
+            messagebox.showinfo("無字幕檔案", "目前尚未載入外部 SRT 字幕檔案。")
+            return
+        try:
+            self._srt_entries = srt_utils.parse_srt(self._srt_path)
+        except Exception as exc:
+            messagebox.showerror("解析失敗", f"重新讀取 SRT 失敗：{exc}")
+            return
+
+        if self._vlc_player:
+            self._vlc_player.reload_subtitle()
+
+        self._populate_sub_treeview()
+        self._update_sub_status_label()
+        if hasattr(self, "_player_sub_status_label"):
+            name = Path(self._srt_path).name
+            count = len(self._srt_entries)
+            self._player_sub_status_label.configure(
+                text=f"字幕：已重載 ({name} · {count} 條)",
+                text_color=("#0a7d2c", "#5ec97a")
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Tab 2: Video Player & Subtitle Tasks
     # ------------------------------------------------------------------ #
     def _build_video_tab(self, parent):
         # Top bar: Video & SRT selection
@@ -470,6 +1126,7 @@ class App(ctk.CTk):
         if self._video_engine:
             self._video_engine.close()
 
+        self._video_path = str(path)
         try:
             self._video_engine = VideoEngine(path)
         except VideoEngineError as exc:
@@ -482,17 +1139,49 @@ class App(ctk.CTk):
         w = self._video_engine.width
         h = self._video_engine.height
 
-        self._video_label.configure(text=filename)
-        self._video_spec_label.configure(text=f"{w}x{h} | {fps:.2f} FPS | 總長 {dur_str}")
-        self._time_slider.configure(to=max(1.0, self._video_engine.duration_sec))
+        if hasattr(self, "_video_label"):
+            self._video_label.configure(text=filename)
+        if hasattr(self, "_player_video_label"):
+            self._player_video_label.configure(text=filename)
 
-        # Check for same-named .srt file in the same directory if user hasn't selected one
-        candidate_srt = Path(path).with_suffix(".srt")
-        if candidate_srt.is_file():
-            self._srt_path = str(candidate_srt)
+        spec_text = f"{w}x{h} | {fps:.2f} FPS | 總長 {dur_str}"
+        if hasattr(self, "_video_spec_label"):
+            self._video_spec_label.configure(text=spec_text)
+        if hasattr(self, "_player_video_spec_label"):
+            self._player_video_spec_label.configure(text=spec_text)
+
+        dur_max = max(1.0, self._video_engine.duration_sec)
+        if hasattr(self, "_time_slider"):
+            self._time_slider.configure(to=dur_max)
+        if hasattr(self, "_player_time_slider"):
+            self._player_time_slider.configure(to=dur_max)
+
+        # Check for same-named or matching .srt file in the same directory
+        p_obj = Path(path)
+        found_srt = None
+        for cand in [p_obj.with_suffix(".srt"), p_obj.with_suffix(".SRT")]:
+            if cand.is_file():
+                found_srt = cand
+                break
+
+        if not found_srt:
+            parent_dir = p_obj.parent
+            stem = p_obj.stem
+            try:
+                for f in parent_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() == ".srt" and f.name.startswith(stem):
+                        found_srt = f
+                        break
+            except Exception:
+                pass
+
+        if found_srt and found_srt.is_file():
+            self._srt_path = str(found_srt)
             self._settings["last_srt_path"] = self._srt_path
             config.patch_setting("last_srt_path", self._srt_path)
             self._srt_var.set(self._srt_path)
+            if hasattr(self, "_player_srt_var"):
+                self._player_srt_var.set(self._srt_path)
             try:
                 self._srt_entries = srt_utils.parse_srt(self._srt_path)
             except Exception:
@@ -501,7 +1190,11 @@ class App(ctk.CTk):
         # Initialize/Load VLC Player if available
         if self._vlc_player:
             self.update_idletasks()
-            self._vlc_player.bind_window(self._vlc_frame.winfo_id())
+            if self._active_tab_name == "  影音播放器  " and hasattr(self, "_player_vlc_frame"):
+                self._vlc_player.bind_window(self._player_vlc_frame.winfo_id())
+            elif hasattr(self, "_vlc_frame"):
+                self._vlc_player.bind_window(self._vlc_frame.winfo_id())
+
             self._vlc_player.load_media(path, srt_path=self._srt_path)
             self._vlc_player.set_volume(int(self._volume_var.get()))
             try:
@@ -510,7 +1203,9 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+        self._populate_sub_treeview()
         self._update_sub_status_label()
+        self._sync_player_ui()
 
         # Default start and end
         self._current_sec = 0.0
@@ -520,7 +1215,8 @@ class App(ctk.CTk):
 
         # Remove hint and seek to first frame
         self._canvas.delete(self._hint_text_id)
-        self._show_canvas_display()
+        if self._active_tab_name == "  影片與字幕任務  ":
+            self._show_canvas_display()
         self._seek_to(0.0)
 
     def _show_vlc_display(self):
@@ -528,6 +1224,8 @@ class App(ctk.CTk):
             self._canvas.pack_forget()
             self._vlc_frame.pack(fill="both", expand=True)
             self._vlc_frame.update_idletasks()
+            if self._vlc_player:
+                self._vlc_player.bind_window(self._vlc_frame.winfo_id())
             self._active_display_mode = "vlc"
 
     def _show_canvas_display(self):
@@ -587,10 +1285,22 @@ class App(ctk.CTk):
 
     def _update_time_labels(self):
         cur_str = srt_utils.sec_to_ts(self._current_sec)
-        total_str = srt_utils.sec_to_ts(self._video_engine.duration_sec if self._video_engine else 0.0)
-        self._time_label.configure(text=f"{cur_str} / {total_str}")
+        total_sec = self._video_engine.duration_sec if self._video_engine else 0.0
+        total_str = srt_utils.sec_to_ts(total_sec)
+        time_text = f"{cur_str} / {total_str}"
+
+        if hasattr(self, "_time_label"):
+            self._time_label.configure(text=time_text)
+        if hasattr(self, "_player_time_label"):
+            self._player_time_label.configure(text=time_text)
+
         if not self._is_scrubbing:
-            self._time_slider.set(self._current_sec)
+            if hasattr(self, "_time_slider"):
+                self._time_slider.set(self._current_sec)
+            if hasattr(self, "_player_time_slider"):
+                self._player_time_slider.set(self._current_sec)
+
+        self._sync_subtitle_highlight()
 
     def _on_slider_change(self, val: float):
         self._is_scrubbing = True
@@ -611,19 +1321,27 @@ class App(ctk.CTk):
         if self._is_playing:
             self._stop_play()
         else:
+            if self._video_engine and self._video_engine.duration_sec > 0 and self._current_sec >= self._video_engine.duration_sec - 0.05:
+                self._seek_to(0.0)
             self._start_play()
 
     def _start_play(self):
         if not self._video_engine:
             return
         self._is_playing = True
-        self._play_btn.configure(text="⏸ 暫停")
+        if hasattr(self, "_play_btn"):
+            self._play_btn.configure(text="⏸ 暫停")
+        if hasattr(self, "_player_play_btn"):
+            self._player_play_btn.configure(text="⏸ 暫停")
 
         if self._vlc_player:
-            self._show_vlc_display()
-            # If current position is near end, wrap around to 0
-            if self._video_engine and self._current_sec >= self._video_engine.duration_sec - 0.2:
-                self._current_sec = 0.0
+            if self._active_tab_name == "  影片與字幕任務  ":
+                self._show_vlc_display()
+            else:
+                if hasattr(self, "_player_vlc_frame"):
+                    self._vlc_player.bind_window(self._player_vlc_frame.winfo_id())
+                self._active_display_mode = "vlc"
+
             self._vlc_player.set_time(self._current_sec)
             self._vlc_player.play()
             self._vlc_play_tick()
@@ -636,7 +1354,10 @@ class App(ctk.CTk):
         if self._play_after_id:
             self.after_cancel(self._play_after_id)
             self._play_after_id = None
-        self._play_btn.configure(text="▶ 播放")
+        if hasattr(self, "_play_btn"):
+            self._play_btn.configure(text="▶ 播放")
+        if hasattr(self, "_player_play_btn"):
+            self._player_play_btn.configure(text="▶ 播放")
 
         if self._vlc_player:
             vlc_t = self._vlc_player.get_time()
@@ -644,9 +1365,14 @@ class App(ctk.CTk):
             if vlc_t > 0:
                 self._current_sec = vlc_t
 
-        self._show_canvas_display()
-        if self._video_engine:
-            self._seek_to(self._current_sec)
+        if self._active_tab_name == "  影片與字幕任務  ":
+            self._show_canvas_display()
+            if self._video_engine:
+                self._seek_to(self._current_sec)
+        else:
+            self._active_display_mode = "canvas"
+            if self._video_engine:
+                self._seek_to(self._current_sec)
 
     def _vlc_play_tick(self):
         if not self._is_playing or not self._vlc_player:
@@ -685,15 +1411,29 @@ class App(ctk.CTk):
 
     def _on_volume_change(self, val):
         vol = int(float(val))
-        self._volume_label.configure(text=f"{vol}%")
+        if hasattr(self, "_volume_label"):
+            self._volume_label.configure(text=f"{vol}%")
+        if hasattr(self, "_player_volume_label"):
+            self._player_volume_label.configure(text=f"{vol}%")
+        if hasattr(self, "_volume_slider"):
+            self._volume_slider.set(vol)
+        if hasattr(self, "_player_volume_slider"):
+            self._player_volume_slider.set(vol)
+
         if self._vlc_player:
             self._vlc_player.set_volume(vol)
         if vol == 0:
             self._is_muted = True
-            self._mute_btn.configure(text="🔇")
+            if hasattr(self, "_mute_btn"):
+                self._mute_btn.configure(text="🔇")
+            if hasattr(self, "_player_mute_btn"):
+                self._player_mute_btn.configure(text="🔇")
         else:
             self._is_muted = False
-            self._mute_btn.configure(text="🔊")
+            if hasattr(self, "_mute_btn"):
+                self._mute_btn.configure(text="🔊")
+            if hasattr(self, "_player_mute_btn"):
+                self._player_mute_btn.configure(text="🔊")
 
     def _toggle_mute(self):
         if self._vlc_player:
@@ -701,35 +1441,54 @@ class App(ctk.CTk):
             self._is_muted = is_muted
             vol = self._vlc_player.get_volume()
             self._volume_var.set(vol)
-            self._volume_label.configure(text=f"{vol}%")
-            self._mute_btn.configure(text="🔇" if is_muted else "🔊")
+            if hasattr(self, "_volume_label"):
+                self._volume_label.configure(text=f"{vol}%")
+            if hasattr(self, "_player_volume_label"):
+                self._player_volume_label.configure(text=f"{vol}%")
+            if hasattr(self, "_volume_slider"):
+                self._volume_slider.set(vol)
+            if hasattr(self, "_player_volume_slider"):
+                self._player_volume_slider.set(vol)
+
+            icon = "🔇" if is_muted else "🔊"
+            if hasattr(self, "_mute_btn"):
+                self._mute_btn.configure(text=icon)
+            if hasattr(self, "_player_mute_btn"):
+                self._player_mute_btn.configure(text=icon)
         else:
             self._is_muted = not self._is_muted
-            self._mute_btn.configure(text="🔇" if self._is_muted else "🔊")
+            icon = "🔇" if self._is_muted else "🔊"
+            if hasattr(self, "_mute_btn"):
+                self._mute_btn.configure(text=icon)
+            if hasattr(self, "_player_mute_btn"):
+                self._player_mute_btn.configure(text=icon)
 
     def _on_rate_change(self, val: str):
         try:
             rate = float(val.replace("x", "").strip())
             if self._vlc_player:
                 self._vlc_player.set_rate(rate)
+            if hasattr(self, "_rate_menu"):
+                self._rate_menu.set(val)
+            if hasattr(self, "_player_rate_menu"):
+                self._player_rate_menu.set(val)
         except Exception:
             pass
 
     def _update_sub_status_label(self):
-        if not hasattr(self, "_sub_status_label"):
-            return
         if self._srt_path and os.path.isfile(self._srt_path):
             name = Path(self._srt_path).name
             count = len(self._srt_entries)
-            self._sub_status_label.configure(
-                text=f"字幕：已掛載 ({name} · {count} 條)",
-                text_color=("#0a7d2c", "#5ec97a")
-            )
+            text = f"字幕：已掛載 ({name} · {count} 條)"
+            color = ("#0a7d2c", "#5ec97a")
         else:
-            self._sub_status_label.configure(
-                text="字幕：未掛載",
-                text_color=("gray50", "gray60")
-            )
+            text = "字幕：未掛載"
+            color = ("gray50", "gray60")
+
+        if hasattr(self, "_sub_status_label"):
+            self._sub_status_label.configure(text=text, text_color=color)
+        if hasattr(self, "_player_sub_status_label"):
+            self._player_sub_status_label.configure(text=text, text_color=color)
 
     def _step_time(self, delta_sec: float):
         self._stop_play()
@@ -783,6 +1542,7 @@ class App(ctk.CTk):
         f_small_sec = float(s.get("step_forward_small_sec", 3.0))
         f_large_sec = float(s.get("step_forward_large_sec", 5.0))
 
+        # Video tab buttons
         if hasattr(self, "_btn_step_back_large"):
             self._btn_step_back_large.configure(text=f"⏪ -{b_large_sec:g}s")
         if hasattr(self, "_btn_step_back_small"):
@@ -795,6 +1555,20 @@ class App(ctk.CTk):
             self._btn_step_forward_small.configure(text=f"⏩ +{f_small_sec:g}s")
         if hasattr(self, "_btn_step_forward_large"):
             self._btn_step_forward_large.configure(text=f"⏩ +{f_large_sec:g}s")
+
+        # Player tab buttons
+        if hasattr(self, "_player_btn_step_back_large"):
+            self._player_btn_step_back_large.configure(text=f"⏪ -{b_large_sec:g}s")
+        if hasattr(self, "_player_btn_step_back_small"):
+            self._player_btn_step_back_small.configure(text=f"⏪ -{b_small_sec:g}s")
+        if hasattr(self, "_player_btn_step_back_frame"):
+            self._player_btn_step_back_frame.configure(text=f"◀ -{b_frames}幀")
+        if hasattr(self, "_player_btn_step_forward_frame"):
+            self._player_btn_step_forward_frame.configure(text=f"▶ +{f_frames}幀")
+        if hasattr(self, "_player_btn_step_forward_small"):
+            self._player_btn_step_forward_small.configure(text=f"⏩ +{f_small_sec:g}s")
+        if hasattr(self, "_player_btn_step_forward_large"):
+            self._player_btn_step_forward_large.configure(text=f"⏩ +{f_large_sec:g}s")
 
 
     # ------------------------------------------------------------------ #
@@ -1106,16 +1880,23 @@ class App(ctk.CTk):
             self._srt_var.set(f"解析失敗：{exc}")
             self._srt_entries = []
 
+        if hasattr(self, "_player_srt_var"):
+            self._player_srt_var.set(p)
+
         if self._vlc_player and self._srt_path:
             self._vlc_player.set_subtitle_file(self._srt_path)
+        self._populate_sub_treeview()
         self._update_sub_status_label()
 
     def _clear_srt(self):
         self._srt_path = ""
         self._srt_entries = []
         self._srt_var.set("（未選擇，將直接匯出新 SRT 檔案）")
+        if hasattr(self, "_player_srt_var"):
+            self._player_srt_var.set("（未選擇字幕檔案）")
         if self._vlc_player:
             self._vlc_player.clear_subtitle()
+        self._populate_sub_treeview()
         self._update_sub_status_label()
 
     # ------------------------------------------------------------------ #
@@ -1344,6 +2125,11 @@ class App(ctk.CTk):
                 self._kb_status_label.configure(text=f"已將快捷鍵設定為：{format_key_display(key)}")
             return "break"
 
+        # Check Escape for fullscreen
+        if event.keysym in ("Escape", "Esc") and self._is_fullscreen:
+            self._toggle_fullscreen()
+            return "break"
+
         # 2. Check if focused on entry or text widget
         try:
             focused = self.focus_get()
@@ -1367,20 +2153,42 @@ class App(ctk.CTk):
             return None
 
         # 4. Dispatch action
-        if matched_action == "play_pause":
+        if matched_action == "toggle_fullscreen":
+            self._toggle_fullscreen()
+        elif matched_action == "hot_reload_sub":
+            self._hot_reload_subtitle()
+        elif matched_action == "play_pause":
             self._toggle_play()
         elif matched_action == "step_back_large":
-            self._on_step_back_large()
+            if self._active_tab_name == "  影音播放器  ":
+                self._on_player_step_back_large()
+            else:
+                self._on_step_back_large()
         elif matched_action == "step_back_small":
-            self._on_step_back_small()
+            if self._active_tab_name == "  影音播放器  ":
+                self._on_player_step_back_small()
+            else:
+                self._on_step_back_small()
         elif matched_action == "step_back_frame":
-            self._on_step_back_frame()
+            if self._active_tab_name == "  影音播放器  ":
+                self._on_player_step_back_frame()
+            else:
+                self._on_step_back_frame()
         elif matched_action == "step_forward_frame":
-            self._on_step_forward_frame()
+            if self._active_tab_name == "  影音播放器  ":
+                self._on_player_step_forward_frame()
+            else:
+                self._on_step_forward_frame()
         elif matched_action == "step_forward_small":
-            self._on_step_forward_small()
+            if self._active_tab_name == "  影音播放器  ":
+                self._on_player_step_forward_small()
+            else:
+                self._on_step_forward_small()
         elif matched_action == "step_forward_large":
-            self._on_step_forward_large()
+            if self._active_tab_name == "  影音播放器  ":
+                self._on_player_step_forward_large()
+            else:
+                self._on_step_forward_large()
         elif matched_action == "set_start":
             self._set_as_start()
         elif matched_action == "set_end":
@@ -1812,9 +2620,12 @@ class App(ctk.CTk):
         self._settings["last_srt_path"] = out
         config.patch_setting("last_srt_path", out)
         self._srt_var.set(out)
+        if hasattr(self, "_player_srt_var"):
+            self._player_srt_var.set(out)
         self._srt_entries = entries
         if self._vlc_player:
             self._vlc_player.set_subtitle_file(out)
+        self._populate_sub_treeview()
         self._update_sub_status_label()
 
         messagebox.showinfo(

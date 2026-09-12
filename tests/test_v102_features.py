@@ -132,10 +132,13 @@ class TestV102Features(unittest.TestCase):
         a = app.App()
         try:
             a.update()
+            a.tabs.set("  影片與字幕任務  ")
+            a._on_tab_change()
             a._keybindings = dict(config.DEFAULT_KEYBINDINGS)
             a._toggle_play = MagicMock()
             a._on_step_back_large = MagicMock()
             a._set_as_start = MagicMock()
+            a._set_end = MagicMock() if hasattr(a, "_set_end") else MagicMock()
             a._set_as_end = MagicMock()
             a._add_task = MagicMock()
 

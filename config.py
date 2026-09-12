@@ -69,6 +69,8 @@ DEFAULT_KEYBINDINGS: dict = {
     "reset_roi": "r",
     "apply_last_roi": "t",
     "add_task": "Return",
+    "toggle_fullscreen": "F11",
+    "hot_reload_sub": "F5",
 }
 
 _DEFAULTS: dict = {
