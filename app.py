@@ -162,6 +162,15 @@ class App(ctk.CTk):
         self._saved_geometry: str = "1160x820"
         self._fullscreen_win: Optional[tk.Toplevel] = None
         self._fullscreen_frame: Optional[tk.Frame] = None
+        self._fullscreen_exit_btn: Optional[ctk.CTkButton] = None
+        self._fs_bar: Optional[ctk.CTkFrame] = None
+        self._fs_time_slider: Optional[ctk.CTkSlider] = None
+        self._fs_time_label: Optional[ctk.CTkLabel] = None
+        self._fs_play_btn: Optional[ctk.CTkButton] = None
+        self._fs_bar_visible: bool = False
+        self._fs_exit_timer: Optional[str] = None
+        self._fs_bar_timer: Optional[str] = None
+        self._fs_poll_after_id: Optional[str] = None
         self._window_scale_var = ctk.StringVar(value="1.0x (原始)")
         self._active_tab_name: str = "  影音播放器  "
 
@@ -789,9 +798,82 @@ class App(ctk.CTk):
         y = max(0, (sh - h) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
+    def _get_current_monitor_rect(self) -> tuple[int, int, int, int]:
+        """Return (left, top, width, height) of the monitor where this app window is located."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", RECT),
+                    ("rcWork", RECT),
+                    ("dwFlags", wintypes.DWORD)
+                ]
+
+            self.update_idletasks()
+            x = self.winfo_rootx() + max(1, self.winfo_width() // 2)
+            y = self.winfo_rooty() + max(1, self.winfo_height() // 2)
+            pt = wintypes.POINT(x, y)
+            hmon = user32.MonitorFromPoint(pt, 2)  # MONITOR_DEFAULTTONEAREST = 2
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                r = info.rcMonitor
+                return r.left, r.top, r.right - r.left, r.bottom - r.top
+        except Exception:
+            pass
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+
+    def _hide_fs_bar(self):
+        if hasattr(self, "_fs_bar_visible") and self._fs_bar_visible and not self._is_scrubbing:
+            if hasattr(self, "_fs_bar") and self._fs_bar:
+                try:
+                    if self._fs_bar.winfo_exists():
+                        self._fs_bar.place_forget()
+                except Exception:
+                    pass
+            self._fs_bar_visible = False
+            self._fs_bar_timer = None
+
     def _toggle_fullscreen(self):
+        cur_sec = self._current_sec
+        if self._vlc_player:
+            vlc_t = self._vlc_player.get_time()
+            if vlc_t > 0:
+                cur_sec = vlc_t
+        was_playing = self._is_playing
+
         if self._is_fullscreen:
             self._is_fullscreen = False
+
+            # Cancel pending fullscreen timers
+            if hasattr(self, "_fs_exit_timer") and self._fs_exit_timer and self._fullscreen_win:
+                try:
+                    self._fullscreen_win.after_cancel(self._fs_exit_timer)
+                except Exception:
+                    pass
+                self._fs_exit_timer = None
+            if hasattr(self, "_fs_bar_timer") and self._fs_bar_timer and self._fullscreen_win:
+                try:
+                    self._fullscreen_win.after_cancel(self._fs_bar_timer)
+                except Exception:
+                    pass
+                self._fs_bar_timer = None
+            if hasattr(self, "_fs_poll_after_id") and self._fs_poll_after_id and self._fullscreen_win:
+                try:
+                    self._fullscreen_win.after_cancel(self._fs_poll_after_id)
+                except Exception:
+                    pass
+                self._fs_poll_after_id = None
+
             if hasattr(self, "_fullscreen_win") and self._fullscreen_win:
                 try:
                     self._fullscreen_win.destroy()
@@ -799,14 +881,23 @@ class App(ctk.CTk):
                     pass
                 self._fullscreen_win = None
                 self._fullscreen_frame = None
+                self._fullscreen_exit_btn = None
+                self._fs_bar = None
+                self._fs_time_slider = None
+                self._fs_time_label = None
+                self._fs_play_btn = None
+                self._fs_bar_visible = False
 
             # Restore HWND to active tab frame
             if self._vlc_player:
                 self.update_idletasks()
                 if self._active_tab_name == "  影音播放器  " and hasattr(self, "_player_vlc_frame"):
-                    self._vlc_player.bind_window(self._player_vlc_frame.winfo_id())
+                    self._vlc_player.bind_window(self._player_vlc_frame.winfo_id(), start_sec=cur_sec, is_playing=was_playing)
                 elif hasattr(self, "_vlc_frame"):
-                    self._vlc_player.bind_window(self._vlc_frame.winfo_id())
+                    self._vlc_player.bind_window(self._vlc_frame.winfo_id(), start_sec=cur_sec, is_playing=was_playing)
+
+            self._current_sec = cur_sec
+            self._update_time_labels()
 
             if hasattr(self, "_player_fullscreen_btn"):
                 self._player_fullscreen_btn.configure(text="⛶ 全螢幕")
@@ -815,16 +906,25 @@ class App(ctk.CTk):
             if hasattr(self, "_player_fullscreen_btn"):
                 self._player_fullscreen_btn.configure(text="🗗 退出全螢幕")
 
-            # Create true borderless fullscreen Toplevel
+            # Detect current monitor bounds (multi-monitor support)
+            mon_left, mon_top, mon_w, mon_h = self._get_current_monitor_rect()
+
+            # Create borderless fullscreen Toplevel on target monitor
             fs = tk.Toplevel(self)
             fs.title("全螢幕播放")
-            fs.attributes("-fullscreen", True)
+            fs.withdraw()  # Hide initially to avoid flickering on primary display
+            fs.overrideredirect(True)
+            fs.geometry(f"{mon_w}x{mon_h}+{mon_left}+{mon_top}")
             fs.configure(bg="black")
             self._fullscreen_win = fs
 
             fs_frame = tk.Frame(fs, bg="black")
             fs_frame.pack(fill="both", expand=True)
             self._fullscreen_frame = fs_frame
+
+            fs.deiconify()
+            fs.lift()
+            fs.focus_force()
             fs.update_idletasks()
 
             # Floating exit button in top-right corner
@@ -834,6 +934,111 @@ class App(ctk.CTk):
                 command=self._toggle_fullscreen
             )
             exit_btn.place(relx=0.98, rely=0.03, anchor="ne")
+            exit_btn.lift()
+            self._fullscreen_exit_btn = exit_btn
+
+            # Auto-hide exit button after 3 seconds
+            def _hide_exit_btn():
+                if hasattr(self, "_fullscreen_exit_btn") and self._fullscreen_exit_btn:
+                    try:
+                        if self._fullscreen_exit_btn.winfo_exists():
+                            self._fullscreen_exit_btn.place_forget()
+                    except Exception:
+                        pass
+                self._fs_exit_timer = None
+
+            self._fs_exit_timer = fs.after(3000, _hide_exit_btn)
+
+            # Bottom Control Bar: timeline slider, time label, play button
+            fs_bar = ctk.CTkFrame(fs, fg_color="#181818", height=54, corner_radius=0)
+            self._fs_bar = fs_bar
+            self._fs_bar_visible = False
+            self._fs_bar_timer = None
+
+            fs_play_btn = ctk.CTkButton(
+                fs_bar, text="⏸ 暫停" if was_playing else "▶ 播放",
+                width=72, height=32, font=FONT_SMALL, command=self._toggle_play
+            )
+            fs_play_btn.pack(side="left", padx=(14, 8), pady=10)
+            self._fs_play_btn = fs_play_btn
+
+            dur_val = self._video_engine.duration_sec if self._video_engine else (self._vlc_player.get_duration() if self._vlc_player else 100.0)
+            fs_slider = ctk.CTkSlider(
+                fs_bar, from_=0, to=max(1.0, dur_val),
+                command=self._on_slider_change
+            )
+            fs_slider.set(cur_sec)
+            fs_slider.pack(side="left", fill="x", expand=True, padx=(4, 12), pady=10)
+            fs_slider.bind("<ButtonRelease-1>", self._on_slider_release)
+            self._fs_time_slider = fs_slider
+
+            time_str = f"{srt_utils.sec_to_ts(cur_sec)} / {srt_utils.sec_to_ts(dur_val)}"
+            fs_time_lbl = ctk.CTkLabel(
+                fs_bar, text=time_str, font=FONT_SMALL, text_color="white"
+            )
+            fs_time_lbl.pack(side="left", padx=(0, 16), pady=10)
+            self._fs_time_label = fs_time_lbl
+
+            def _show_bar():
+                if not self._fs_bar_visible and self._fs_bar and self._fs_bar.winfo_exists():
+                    self._fs_bar.place(relx=0.0, rely=1.0, anchor="sw", relwidth=1.0)
+                    self._fs_bar.lift()
+                    self._fs_bar_visible = True
+
+            def _on_mouse_activity(x: int, y: int):
+                if not self._is_fullscreen or not hasattr(self, "_fullscreen_win") or not self._fullscreen_win:
+                    return
+                # Top-right hover: reveal exit button if mouse is in top-right area
+                if y <= 70 and x >= mon_w - 230:
+                    if hasattr(self, "_fullscreen_exit_btn") and self._fullscreen_exit_btn and self._fullscreen_exit_btn.winfo_exists():
+                        self._fullscreen_exit_btn.place(relx=0.98, rely=0.03, anchor="ne")
+                        self._fullscreen_exit_btn.lift()
+                        if self._fs_exit_timer:
+                            try:
+                                fs.after_cancel(self._fs_exit_timer)
+                            except Exception:
+                                pass
+                        self._fs_exit_timer = fs.after(3000, _hide_exit_btn)
+
+                # Bottom hover: reveal timeline bar if within 80px of bottom
+                if y >= mon_h - 80:
+                    _show_bar()
+                    if self._fs_bar_timer:
+                        try:
+                            fs.after_cancel(self._fs_bar_timer)
+                        except Exception:
+                            pass
+                        self._fs_bar_timer = None
+                else:
+                    if self._fs_bar_visible and not self._is_scrubbing and not self._fs_bar_timer:
+                        self._fs_bar_timer = fs.after(2000, self._hide_fs_bar)
+
+            def _on_motion(event):
+                try:
+                    px = event.x_root - mon_left
+                    py = event.y_root - mon_top
+                    _on_mouse_activity(px, py)
+                except Exception:
+                    pass
+
+            fs.bind("<Motion>", _on_motion)
+            fs_frame.bind("<Motion>", _on_motion)
+            fs_bar.bind("<Motion>", _on_motion)
+            fs_slider.bind("<Motion>", _on_motion)
+
+            def _fs_mouse_poll():
+                if not self._is_fullscreen or not hasattr(self, "_fullscreen_win") or not self._fullscreen_win:
+                    return
+                try:
+                    px = fs.winfo_pointerx() - mon_left
+                    py = fs.winfo_pointery() - mon_top
+                    _on_mouse_activity(px, py)
+                except Exception:
+                    pass
+                if self._is_fullscreen and hasattr(self, "_fullscreen_win") and self._fullscreen_win:
+                    self._fs_poll_after_id = fs.after(150, _fs_mouse_poll)
+
+            self._fs_poll_after_id = fs.after(150, _fs_mouse_poll)
 
             # Keyboard & mouse event bindings on fullscreen window
             fs.bind("<Escape>", lambda _e: self._toggle_fullscreen())
@@ -844,9 +1049,12 @@ class App(ctk.CTk):
             fs.bind("<Right>", lambda _e: self._on_player_step_forward_large())
             fs.protocol("WM_DELETE_WINDOW", self._toggle_fullscreen)
 
-            # Redirect VLC output to fullscreen frame
+            # Redirect VLC output to fullscreen frame with timestamp preserved
             if self._vlc_player:
-                self._vlc_player.bind_window(fs_frame.winfo_id())
+                self._vlc_player.bind_window(fs_frame.winfo_id(), start_sec=cur_sec, is_playing=was_playing)
+
+            self._current_sec = cur_sec
+            self._update_time_labels()
 
     def _hot_reload_subtitle(self):
         if not self._srt_path or not os.path.isfile(self._srt_path):
@@ -1284,21 +1492,33 @@ class App(ctk.CTk):
             self._render_current_frame()
 
     def _update_time_labels(self):
+        dur = self._video_engine.duration_sec if self._video_engine else (self._vlc_player.get_duration() if self._vlc_player else 0.0)
         cur_str = srt_utils.sec_to_ts(self._current_sec)
-        total_sec = self._video_engine.duration_sec if self._video_engine else 0.0
-        total_str = srt_utils.sec_to_ts(total_sec)
+        total_str = srt_utils.sec_to_ts(dur)
         time_text = f"{cur_str} / {total_str}"
 
         if hasattr(self, "_time_label"):
             self._time_label.configure(text=time_text)
         if hasattr(self, "_player_time_label"):
             self._player_time_label.configure(text=time_text)
+        if hasattr(self, "_fs_time_label") and self._fs_time_label:
+            try:
+                if self._fs_time_label.winfo_exists():
+                    self._fs_time_label.configure(text=time_text)
+            except Exception:
+                pass
 
         if not self._is_scrubbing:
             if hasattr(self, "_time_slider"):
                 self._time_slider.set(self._current_sec)
             if hasattr(self, "_player_time_slider"):
                 self._player_time_slider.set(self._current_sec)
+            if hasattr(self, "_fs_time_slider") and self._fs_time_slider:
+                try:
+                    if self._fs_time_slider.winfo_exists():
+                        self._fs_time_slider.set(self._current_sec)
+                except Exception:
+                    pass
 
         self._sync_subtitle_highlight()
 
@@ -1309,11 +1529,23 @@ class App(ctk.CTk):
             self._vlc_player.set_time(val_f)
             self._current_sec = val_f
             self._update_time_labels()
+        elif self._is_fullscreen and self._vlc_player:
+            self._vlc_player.set_time(val_f)
+            self._current_sec = val_f
+            self._update_time_labels()
         elif self._video_engine:
             self._seek_to(val_f)
 
     def _on_slider_release(self, _event):
         self._is_scrubbing = False
+        if self._is_fullscreen and hasattr(self, "_fs_bar_visible") and self._fs_bar_visible:
+            if hasattr(self, "_fullscreen_win") and self._fullscreen_win:
+                if hasattr(self, "_fs_bar_timer") and self._fs_bar_timer:
+                    try:
+                        self._fullscreen_win.after_cancel(self._fs_bar_timer)
+                    except Exception:
+                        pass
+                self._fs_bar_timer = self._fullscreen_win.after(2000, self._hide_fs_bar)
 
     def _toggle_play(self):
         if not self._video_engine:
@@ -1333,9 +1565,17 @@ class App(ctk.CTk):
             self._play_btn.configure(text="⏸ 暫停")
         if hasattr(self, "_player_play_btn"):
             self._player_play_btn.configure(text="⏸ 暫停")
+        if hasattr(self, "_fs_play_btn") and self._fs_play_btn:
+            try:
+                if self._fs_play_btn.winfo_exists():
+                    self._fs_play_btn.configure(text="⏸ 暫停")
+            except Exception:
+                pass
 
         if self._vlc_player:
-            if self._active_tab_name == "  影片與字幕任務  ":
+            if self._is_fullscreen and hasattr(self, "_fullscreen_frame") and self._fullscreen_frame:
+                self._vlc_player.bind_window(self._fullscreen_frame.winfo_id())
+            elif self._active_tab_name == "  影片與字幕任務  ":
                 self._show_vlc_display()
             else:
                 if hasattr(self, "_player_vlc_frame"):
@@ -1358,6 +1598,12 @@ class App(ctk.CTk):
             self._play_btn.configure(text="▶ 播放")
         if hasattr(self, "_player_play_btn"):
             self._player_play_btn.configure(text="▶ 播放")
+        if hasattr(self, "_fs_play_btn") and self._fs_play_btn:
+            try:
+                if self._fs_play_btn.winfo_exists():
+                    self._fs_play_btn.configure(text="▶ 播放")
+            except Exception:
+                pass
 
         if self._vlc_player:
             vlc_t = self._vlc_player.get_time()

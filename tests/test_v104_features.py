@@ -231,10 +231,17 @@ class TestV104Features(unittest.TestCase):
             geo_half = a.geometry()
             self.assertTrue(len(geo_half) > 0)
 
+            # Test monitor detection
+            mon_l, mon_t, mon_w, mon_h = a._get_current_monitor_rect()
+            self.assertGreater(mon_w, 0)
+            self.assertGreater(mon_h, 0)
+
             # Fullscreen toggle
             a._toggle_fullscreen()
             self.assertTrue(a._is_fullscreen)
             self.assertIsNotNone(a._fullscreen_win)
+            self.assertEqual(a._fullscreen_win.winfo_width(), mon_w)
+            self.assertEqual(a._fullscreen_win.winfo_height(), mon_h)
             self.assertEqual(a._player_fullscreen_btn.cget("text"), "🗗 退出全螢幕")
 
             # Exit fullscreen
@@ -274,6 +281,54 @@ class TestV104Features(unittest.TestCase):
                 self.assertEqual(a._player_video_label.cget("text"), "sample_v104.mp4")
                 self.assertEqual(a._player_srt_var.get(), str(s_path))
                 self.assertAlmostEqual(a._current_sec, 1.5, places=2)
+            finally:
+                a.destroy()
+
+    def test_fullscreen_v105_features(self):
+        """Verify v1.05 fullscreen playback resumption, 3s exit prompt timer, and bottom timeline bar."""
+        with tempfile.TemporaryDirectory() as td:
+            v_path, s_path = _create_dummy_video_and_srt(Path(td))
+
+            a = app.App()
+            try:
+                a.update()
+                a._load_video(str(v_path))
+                a.update()
+
+                # Seek video to 1.8s
+                a._seek_to(1.8)
+                self.assertAlmostEqual(a._current_sec, 1.8, places=1)
+
+                # Enter fullscreen
+                a._toggle_fullscreen()
+                self.assertTrue(a._is_fullscreen)
+                self.assertIsNotNone(a._fullscreen_win)
+                self.assertAlmostEqual(a._current_sec, 1.8, places=1)
+
+                # Verify top-right exit button and its 3s timer
+                self.assertIsNotNone(a._fullscreen_exit_btn)
+                self.assertIsNotNone(a._fs_exit_timer)
+
+                # Verify bottom control bar widgets
+                self.assertIsNotNone(a._fs_bar)
+                self.assertIsNotNone(a._fs_time_slider)
+                self.assertIsNotNone(a._fs_time_label)
+                self.assertIsNotNone(a._fs_play_btn)
+                self.assertAlmostEqual(a._fs_time_slider.get(), 1.8, places=1)
+                self.assertIn("00:00:01,800", a._fs_time_label.cget("text"))
+
+                # Test timeline scrubbing in fullscreen
+                a._on_slider_change(2.2)
+                self.assertAlmostEqual(a._current_sec, 2.2, places=1)
+                a._on_slider_release(None)
+
+                # Exit fullscreen
+                a._toggle_fullscreen()
+                self.assertFalse(a._is_fullscreen)
+                self.assertIsNone(a._fullscreen_win)
+
+                # Verify timestamp was preserved upon exit
+                self.assertAlmostEqual(a._current_sec, 2.2, places=1)
             finally:
                 a.destroy()
 

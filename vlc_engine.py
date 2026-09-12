@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import sys
+import time
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -82,13 +84,15 @@ class VLCPlayer:
         self._last_volume: int = 80
         self._volume: int = 80
 
-    def bind_window(self, hwnd: int) -> None:
+    def bind_window(self, hwnd: int, start_sec: Optional[float] = None, is_playing: Optional[bool] = None) -> None:
         """Bind native Windows HWND to VLC player with vout re-creation if switching."""
         if self._hwnd != hwnd:
             self._hwnd = hwnd
             if sys.platform.startswith("win"):
-                was_playing = self.is_playing()
-                cur_t = self.get_time()
+                was_playing = self.is_playing() if is_playing is None else bool(is_playing)
+                cur_t = self.get_time() if start_sec is None else float(start_sec)
+                if cur_t <= 0 and start_sec is not None:
+                    cur_t = float(start_sec)
                 cur_rate = self.get_rate()
                 try:
                     self._player.stop()
@@ -98,6 +102,8 @@ class VLCPlayer:
                 self._player = self._instance.media_player_new()
                 self._player.set_hwnd(hwnd)
                 try:
+                    self._player.video_set_mouse_input(False)
+                    self._player.video_set_key_input(False)
                     self._player.audio_set_volume(0 if self._is_muted else self._volume)
                     if cur_rate > 0:
                         self._player.set_rate(cur_rate)
@@ -105,17 +111,39 @@ class VLCPlayer:
                     pass
                 if self._media_path and os.path.isfile(self._media_path):
                     self.load_media(self._media_path, self._srt_path)
-                if cur_t > 0:
-                    self.set_time(cur_t)
-                if was_playing:
                     self._player.play()
+                    target_pl = self._player
 
-    def load_media(self, video_path: str | Path, srt_path: str = "") -> None:
+                    def _sync_vout_state(pl, t, playing):
+                        for _ in range(100):
+                            time.sleep(0.01)
+                            if self._player is not pl:
+                                return
+                            try:
+                                has_vo = False
+                                try:
+                                    has_vo = (pl.has_vout() > 0)
+                                except Exception:
+                                    pass
+                                if has_vo:
+                                    if t > 0:
+                                        pl.set_time(int(round(t * 1000.0)))
+                                    if not playing:
+                                        pl.set_pause(1)
+                                    return
+                            except Exception:
+                                return
+
+                    threading.Thread(target=_sync_vout_state, args=(target_pl, cur_t, was_playing), daemon=True).start()
+
+    def load_media(self, video_path: str | Path, srt_path: str = "", start_time: float = 0.0) -> None:
         """Load video media into player and optionally attach external subtitle."""
         self._media_path = str(video_path)
         self._srt_path = str(srt_path) if srt_path else ""
 
         media = self._instance.media_new(self._media_path)
+        if start_time > 0:
+            media.add_option(f"start-time={start_time:.3f}")
         if self._srt_path and os.path.isfile(self._srt_path):
             try:
                 mrl = self._srt_path.replace("\\", "/")
@@ -125,6 +153,12 @@ class VLCPlayer:
             except Exception:
                 pass
         self._player.set_media(media)
+
+        try:
+            self._player.video_set_mouse_input(False)
+            self._player.video_set_key_input(False)
+        except Exception:
+            pass
 
         # Re-bind HWND if previously set
         if self._hwnd and sys.platform.startswith("win"):
