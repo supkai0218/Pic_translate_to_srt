@@ -1,4 +1,4 @@
-"""Video OCR → translate → SRT generator/inserter (v1.01).
+"""Video OCR → translate → SRT generator/inserter (v1.02).
 
 Run: python app.py
 """
@@ -27,6 +27,59 @@ FONT_MONO = ("Consolas", 12)
 FONT_TITLE = ("Microsoft JhengHei", 18, "bold")
 FONT_SUBTITLE = ("Microsoft JhengHei", 14, "bold")
 
+KEY_DISPLAY_MAP = {
+    "space": "Space (空白鍵)",
+    "return": "Enter (回車鍵)",
+    "left": "← Left (左方向鍵)",
+    "right": "→ Right (右方向鍵)",
+    "up": "↑ Up (上方向鍵)",
+    "down": "↓ Down (下方向鍵)",
+    "bracketleft": "[",
+    "bracketright": "]",
+    "minus": "-",
+    "plus": "+",
+    "equal": "=",
+    "comma": ",",
+    "period": ".",
+    "slash": "/",
+    "backslash": "\\",
+    "semicolon": ";",
+    "apostrophe": "'",
+    "tab": "Tab",
+    "escape": "Esc",
+    "backspace": "Backspace",
+    "delete": "Delete",
+}
+
+
+def format_key_display(keysym: str) -> str:
+    if not keysym:
+        return "（未設定）"
+    k_lower = keysym.lower()
+    if k_lower in KEY_DISPLAY_MAP:
+        return KEY_DISPLAY_MAP[k_lower]
+    if len(keysym) == 1:
+        return keysym.upper()
+    return keysym
+
+
+KEYBINDING_ACTIONS = [
+    ("play_pause", "播放 / 暫停"),
+    ("step_back_large", "快退大步長 (秒)"),
+    ("step_back_small", "快退小步長 (秒)"),
+    ("step_back_frame", "倒退幀數 (幀)"),
+    ("step_forward_frame", "前進幀數 (幀)"),
+    ("step_forward_small", "快進小步長 (秒)"),
+    ("step_forward_large", "快進大步長 (秒)"),
+    ("set_start", "[ 設為起點"),
+    ("set_end", "] 設為迄點"),
+    ("jump_start", "跳至起點"),
+    ("jump_end", "跳至迄點"),
+    ("reset_roi", "重設全畫面 (ROI)"),
+    ("apply_last_roi", "套用上次框選"),
+    ("add_task", "➕ 新增至任務清單"),
+]
+
 
 def parse_time_input(val: str, default: float = 0.0) -> float:
     """Parse time string like '00:01:23,456', '01:23.456', or '83.456' to seconds."""
@@ -49,6 +102,7 @@ def parse_time_input(val: str, default: float = 0.0) -> float:
     except Exception:
         pass
     return default
+
 
 
 @dataclass
@@ -79,7 +133,7 @@ class SubtitleTask:
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.01)")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.02)")
         self.geometry("1160x800")
         self.minsize(980, 680)
 
@@ -103,6 +157,11 @@ class App(ctk.CTk):
         self._crop_box: Optional[tuple[int, int, int, int]] = None
         self._last_crop_box: Optional[tuple[int, int, int, int]] = None
 
+        # Step Settings & Keybindings State
+        self._step_settings: dict = dict(self._settings.get("step_settings", config.DEFAULT_STEP_SETTINGS))
+        self._keybindings: dict = dict(self._settings.get("keybindings", config.DEFAULT_KEYBINDINGS))
+        self._recording_action: Optional[str] = None
+
         # Canvas drawing & coordinate mapping
         self._disp_scale: float = 1.0
         self._disp_offset_x: float = 0.0
@@ -124,16 +183,20 @@ class App(ctk.CTk):
         self.tabs = ctk.CTkTabview(self, anchor="nw")
         self.tabs.pack(fill="both", expand=True, padx=10, pady=(8, 10))
         self.tabs.add("  影片與字幕任務  ")
+        self.tabs.add("  按鈕與快捷鍵設定  ")
         self.tabs.add("  API 設定  ")
         self.tabs.add("  Prompt 設定  ")
         self.tabs.add("  執行  ")
 
         self._build_video_tab(self.tabs.tab("  影片與字幕任務  "))
+        self._build_keybindings_tab(self.tabs.tab("  按鈕與快捷鍵設定  "))
         self._build_api_tab(self.tabs.tab("  API 設定  "))
         self._build_prompt_tab(self.tabs.tab("  Prompt 設定  "))
         self._build_run_tab(self.tabs.tab("  執行  "))
 
+        self._refresh_step_buttons()
         self._sync_api_form()
+        self.bind_all("<KeyPress>", self._on_global_key_press)
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
     # ------------------------------------------------------------------ #
@@ -211,23 +274,44 @@ class App(ctk.CTk):
                                         font=FONT_MONO, width=190, anchor="e")
         self._time_label.pack(side="right")
 
-        # Button row: Step & Play
+        # Button row: Step & Play (7 buttons: -large, -small, -frame, Play, +frame, +small, +large)
         btn_row = ctk.CTkFrame(ctl_frame, fg_color="transparent")
         btn_row.pack(fill="x", pady=(2, 2))
 
-        ctk.CTkButton(btn_row, text="⏪ -5s", width=65, height=28, font=FONT_SMALL,
-                      command=lambda: self._step_time(-5.0)).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(btn_row, text="◀ -1幀", width=65, height=28, font=FONT_SMALL,
-                      command=lambda: self._step_frame(-1)).pack(side="left", padx=(0, 6))
+        self._btn_step_back_large = ctk.CTkButton(
+            btn_row, text="⏪ -5s", width=62, height=28, font=FONT_SMALL,
+            command=self._on_step_back_large)
+        self._btn_step_back_large.pack(side="left", padx=(0, 3))
 
-        self._play_btn = ctk.CTkButton(btn_row, text="▶ 播放", width=90, height=28,
-                                       font=FONT_BODY, command=self._toggle_play)
-        self._play_btn.pack(side="left", padx=(0, 6))
+        self._btn_step_back_small = ctk.CTkButton(
+            btn_row, text="⏪ -3s", width=62, height=28, font=FONT_SMALL,
+            command=self._on_step_back_small)
+        self._btn_step_back_small.pack(side="left", padx=(0, 3))
 
-        ctk.CTkButton(btn_row, text="▶ +1幀", width=65, height=28, font=FONT_SMALL,
-                      command=lambda: self._step_frame(1)).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(btn_row, text="⏩ +5s", width=65, height=28, font=FONT_SMALL,
-                      command=lambda: self._step_time(5.0)).pack(side="left")
+        self._btn_step_back_frame = ctk.CTkButton(
+            btn_row, text="◀ -1幀", width=62, height=28, font=FONT_SMALL,
+            command=self._on_step_back_frame)
+        self._btn_step_back_frame.pack(side="left", padx=(0, 5))
+
+        self._play_btn = ctk.CTkButton(
+            btn_row, text="▶ 播放", width=82, height=28, font=FONT_BODY,
+            command=self._toggle_play)
+        self._play_btn.pack(side="left", padx=(0, 5))
+
+        self._btn_step_forward_frame = ctk.CTkButton(
+            btn_row, text="▶ +1幀", width=62, height=28, font=FONT_SMALL,
+            command=self._on_step_forward_frame)
+        self._btn_step_forward_frame.pack(side="left", padx=(0, 3))
+
+        self._btn_step_forward_small = ctk.CTkButton(
+            btn_row, text="⏩ +3s", width=62, height=28, font=FONT_SMALL,
+            command=self._on_step_forward_small)
+        self._btn_step_forward_small.pack(side="left", padx=(0, 3))
+
+        self._btn_step_forward_large = ctk.CTkButton(
+            btn_row, text="⏩ +5s", width=62, height=28, font=FONT_SMALL,
+            command=self._on_step_forward_large)
+        self._btn_step_forward_large.pack(side="left")
 
         # 3. Task Configuration Box (Interval Setting & ROI Info)
         task_cfg_box = ctk.CTkFrame(left_col, fg_color=("gray85", "gray20"))
@@ -479,6 +563,53 @@ class App(ctk.CTk):
             self._current_sec = self._video_engine.current_sec
             self._render_current_frame()
             self._update_time_labels()
+
+    def _on_step_back_large(self):
+        sec = float(self._step_settings.get("step_back_large_sec", 5.0))
+        self._step_time(-sec)
+
+    def _on_step_back_small(self):
+        sec = float(self._step_settings.get("step_back_small_sec", 3.0))
+        self._step_time(-sec)
+
+    def _on_step_back_frame(self):
+        frames = int(self._step_settings.get("step_back_frames", 1))
+        self._step_frame(-frames)
+
+    def _on_step_forward_frame(self):
+        frames = int(self._step_settings.get("step_forward_frames", 1))
+        self._step_frame(frames)
+
+    def _on_step_forward_small(self):
+        sec = float(self._step_settings.get("step_forward_small_sec", 3.0))
+        self._step_time(sec)
+
+    def _on_step_forward_large(self):
+        sec = float(self._step_settings.get("step_forward_large_sec", 5.0))
+        self._step_time(sec)
+
+    def _refresh_step_buttons(self):
+        s = self._step_settings
+        b_large_sec = float(s.get("step_back_large_sec", 5.0))
+        b_small_sec = float(s.get("step_back_small_sec", 3.0))
+        b_frames = int(s.get("step_back_frames", 1))
+        f_frames = int(s.get("step_forward_frames", 1))
+        f_small_sec = float(s.get("step_forward_small_sec", 3.0))
+        f_large_sec = float(s.get("step_forward_large_sec", 5.0))
+
+        if hasattr(self, "_btn_step_back_large"):
+            self._btn_step_back_large.configure(text=f"⏪ -{b_large_sec:g}s")
+        if hasattr(self, "_btn_step_back_small"):
+            self._btn_step_back_small.configure(text=f"⏪ -{b_small_sec:g}s")
+        if hasattr(self, "_btn_step_back_frame"):
+            self._btn_step_back_frame.configure(text=f"◀ -{b_frames}幀")
+        if hasattr(self, "_btn_step_forward_frame"):
+            self._btn_step_forward_frame.configure(text=f"▶ +{f_frames}幀")
+        if hasattr(self, "_btn_step_forward_small"):
+            self._btn_step_forward_small.configure(text=f"⏩ +{f_small_sec:g}s")
+        if hasattr(self, "_btn_step_forward_large"):
+            self._btn_step_forward_large.configure(text=f"⏩ +{f_large_sec:g}s")
+
 
     # ------------------------------------------------------------------ #
     #  Range & ROI Crop Logic
@@ -795,7 +926,287 @@ class App(ctk.CTk):
         self._srt_var.set("（未選擇，將直接匯出新 SRT 檔案）")
 
     # ------------------------------------------------------------------ #
-    #  Tab 2: API Settings (Maintained from v0.03)
+    #  Tab 2: Button Step Settings & Keyboard Shortcuts
+    # ------------------------------------------------------------------ #
+    def _build_keybindings_tab(self, parent):
+        scroll = ctk.CTkScrollableFrame(parent)
+        scroll.pack(fill="both", expand=True, padx=14, pady=(10, 10))
+
+        # Title
+        ctk.CTkLabel(scroll, text="按鈕步長與鍵盤快捷鍵設定", font=FONT_TITLE, anchor="w").pack(
+            fill="x", pady=(4, 4)
+        )
+        ctk.CTkLabel(scroll, text="自訂時間軸快轉/倒退步長，以及播放器介面所有功能的鍵盤快捷鍵。",
+                     font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w").pack(
+            fill="x", pady=(0, 12)
+        )
+
+        # Section 1: Step settings
+        sec1_frame = ctk.CTkFrame(scroll)
+        sec1_frame.pack(fill="x", pady=(0, 14))
+
+        ctk.CTkLabel(sec1_frame, text="步進秒數與幀數設定", font=FONT_SUBTITLE, anchor="w").pack(
+            fill="x", padx=12, pady=(10, 4)
+        )
+        ctk.CTkLabel(sec1_frame, text="修改後點擊「儲存步長設定」，播放器控制按鈕的文字與步進長度將即時同步更新。",
+                     font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w").pack(
+            fill="x", padx=12, pady=(0, 8)
+        )
+
+        grid = ctk.CTkFrame(sec1_frame, fg_color="transparent")
+        grid.pack(fill="x", padx=12, pady=(0, 8))
+        grid.grid_columnconfigure((0, 2), weight=0)
+        grid.grid_columnconfigure((1, 3), weight=1)
+
+        self._s_back_large_var = ctk.StringVar(value=str(self._step_settings.get("step_back_large_sec", 5.0)))
+        self._s_back_small_var = ctk.StringVar(value=str(self._step_settings.get("step_back_small_sec", 3.0)))
+        self._s_back_frame_var = ctk.StringVar(value=str(self._step_settings.get("step_back_frames", 1)))
+        self._s_fwd_frame_var = ctk.StringVar(value=str(self._step_settings.get("step_forward_frames", 1)))
+        self._s_fwd_small_var = ctk.StringVar(value=str(self._step_settings.get("step_forward_small_sec", 3.0)))
+        self._s_fwd_large_var = ctk.StringVar(value=str(self._step_settings.get("step_forward_large_sec", 5.0)))
+
+        def add_step_field(row, col, label_text, var, unit):
+            ctk.CTkLabel(grid, text=label_text, font=FONT_BODY, anchor="e").grid(
+                row=row, column=col * 2, sticky="e", padx=(8, 4), pady=6
+            )
+            sub_f = ctk.CTkFrame(grid, fg_color="transparent")
+            sub_f.grid(row=row, column=col * 2 + 1, sticky="w", padx=(0, 16), pady=6)
+            e = ctk.CTkEntry(sub_f, textvariable=var, width=80, font=FONT_MONO, justify="center")
+            e.pack(side="left")
+            ctk.CTkLabel(sub_f, text=unit, font=FONT_SMALL).pack(side="left", padx=(4, 0))
+
+        add_step_field(0, 0, "快退大步長：", self._s_back_large_var, "秒")
+        add_step_field(0, 1, "快進大步長：", self._s_fwd_large_var, "秒")
+        add_step_field(1, 0, "快退小步長：", self._s_back_small_var, "秒")
+        add_step_field(1, 1, "快進小步長：", self._s_fwd_small_var, "秒")
+        add_step_field(2, 0, "倒退幀數：", self._s_back_frame_var, "幀")
+        add_step_field(2, 1, "前進幀數：", self._s_fwd_frame_var, "幀")
+
+        btn_row = ctk.CTkFrame(sec1_frame, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(4, 10))
+        ctk.CTkButton(btn_row, text="儲存步長設定", width=120, height=30, font=FONT_BODY,
+                      command=self._save_step_settings).pack(side="left")
+        ctk.CTkButton(btn_row, text="恢復預設步長", width=110, height=30, font=FONT_BODY,
+                      fg_color="#555", hover_color="#444",
+                      command=self._reset_step_settings).pack(side="left", padx=(8, 0))
+        self._step_status_label = ctk.CTkLabel(btn_row, text="", font=FONT_SMALL,
+                                               text_color=("#0a7d2c", "#5ec97a"), anchor="w")
+        self._step_status_label.pack(side="left", padx=(12, 0))
+
+        # Section 2: Keybindings mapping
+        sec2_frame = ctk.CTkFrame(scroll)
+        sec2_frame.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(sec2_frame, text="播放器按鈕鍵盤快捷鍵對應", font=FONT_SUBTITLE, anchor="w").pack(
+            fill="x", padx=12, pady=(10, 4)
+        )
+        ctk.CTkLabel(sec2_frame, text="點擊「設定按鍵」後直接在鍵盤按下目標鍵即可完成綁定。\n焦點在文字輸入框時，快捷鍵將自動暫停以避免打字衝突。",
+                     font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w", justify="left").pack(
+            fill="x", padx=12, pady=(0, 8)
+        )
+
+        top_kb_row = ctk.CTkFrame(sec2_frame, fg_color="transparent")
+        top_kb_row.pack(fill="x", padx=12, pady=(0, 6))
+        ctk.CTkButton(top_kb_row, text="全部恢復預設快捷鍵", width=160, height=28, font=FONT_SMALL,
+                      fg_color="#555", hover_color="#444",
+                      command=self._reset_keybindings).pack(side="left")
+        self._kb_status_label = ctk.CTkLabel(top_kb_row, text="", font=FONT_SMALL,
+                                             text_color=("#0a7d2c", "#5ec97a"), anchor="w")
+        self._kb_status_label.pack(side="left", padx=(12, 0))
+
+        self._kb_table_frame = ctk.CTkFrame(sec2_frame, fg_color="transparent")
+        self._kb_table_frame.pack(fill="x", padx=12, pady=(0, 12))
+
+        self._render_keybindings_table()
+
+    def _render_keybindings_table(self):
+        for w in self._kb_table_frame.winfo_children():
+            w.destroy()
+
+        # Header
+        hdr = ctk.CTkFrame(self._kb_table_frame, fg_color=("gray82", "gray22"))
+        hdr.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(hdr, text="功能說明", font=FONT_SMALL, width=220, anchor="w").pack(side="left", padx=8, pady=4)
+        ctk.CTkLabel(hdr, text="目前快捷鍵", font=FONT_SMALL, width=180, anchor="w").pack(side="left", padx=8)
+        ctk.CTkLabel(hdr, text="操作", font=FONT_SMALL, anchor="w").pack(side="left", padx=8)
+
+        for act_id, act_name in KEYBINDING_ACTIONS:
+            row = ctk.CTkFrame(self._kb_table_frame, fg_color=("gray88", "gray18"))
+            row.pack(fill="x", pady=2)
+
+            ctk.CTkLabel(row, text=act_name, font=FONT_BODY, width=220, anchor="w").pack(side="left", padx=8, pady=4)
+
+            cur_key = self._keybindings.get(act_id, "")
+            is_recording = (self._recording_action == act_id)
+            if is_recording:
+                disp_text = "⚡ 請按下任意鍵... (Esc取消)"
+                badge_fg = ("#ffcdd2", "#b71c1c")
+                text_color = ("#b71c1c", "#ffcdd2")
+            else:
+                disp_text = format_key_display(cur_key)
+                badge_fg = ("gray80", "gray25")
+                text_color = ("black", "white") if cur_key else ("gray50", "gray60")
+
+            key_badge = ctk.CTkLabel(row, text=disp_text, font=FONT_MONO, width=180,
+                                     anchor="w", fg_color=badge_fg, corner_radius=4,
+                                     text_color=text_color)
+            key_badge.pack(side="left", padx=8, pady=4)
+
+            btn_f = ctk.CTkFrame(row, fg_color="transparent")
+            btn_f.pack(side="left", padx=4)
+
+            set_btn = ctk.CTkButton(
+                btn_f, text="取消" if is_recording else "設定按鍵", width=80, height=26, font=FONT_SMALL,
+                fg_color="#b23b3b" if is_recording else "#1f6aa5",
+                hover_color="#8a2e2e" if is_recording else "#144870",
+                command=lambda a=act_id: self._on_click_record_key(a)
+            )
+            set_btn.pack(side="left", padx=(0, 4))
+
+            clr_btn = ctk.CTkButton(
+                btn_f, text="清除", width=50, height=26, font=FONT_SMALL,
+                fg_color="#666", hover_color="#555",
+                command=lambda a=act_id: self._clear_keybinding(a)
+            )
+            clr_btn.pack(side="left")
+
+    def _on_click_record_key(self, action_id: str):
+        if self._recording_action == action_id:
+            self._recording_action = None
+        else:
+            self._recording_action = action_id
+        self._render_keybindings_table()
+
+    def _clear_keybinding(self, action_id: str):
+        self._keybindings[action_id] = ""
+        config.patch_setting("keybindings", self._keybindings)
+        if self._recording_action == action_id:
+            self._recording_action = None
+        self._render_keybindings_table()
+        if hasattr(self, "_kb_status_label"):
+            self._kb_status_label.configure(text="已清除快捷鍵")
+
+    def _reset_keybindings(self):
+        self._keybindings = dict(config.DEFAULT_KEYBINDINGS)
+        config.patch_setting("keybindings", self._keybindings)
+        self._recording_action = None
+        self._render_keybindings_table()
+        if hasattr(self, "_kb_status_label"):
+            self._kb_status_label.configure(text="已恢復預設快捷鍵")
+
+    def _save_step_settings(self):
+        try:
+            b_l = max(0.1, float(self._s_back_large_var.get().strip()))
+            b_s = max(0.1, float(self._s_back_small_var.get().strip()))
+            b_f = max(1, int(self._s_back_frame_var.get().strip()))
+            f_f = max(1, int(self._s_fwd_frame_var.get().strip()))
+            f_s = max(0.1, float(self._s_fwd_small_var.get().strip()))
+            f_l = max(0.1, float(self._s_fwd_large_var.get().strip()))
+        except ValueError:
+            messagebox.showwarning("格式錯誤", "請輸入有效的正數秒數與整數幀數。")
+            return
+
+        self._step_settings = {
+            "step_back_large_sec": b_l,
+            "step_back_small_sec": b_s,
+            "step_back_frames": b_f,
+            "step_forward_frames": f_f,
+            "step_forward_small_sec": f_s,
+            "step_forward_large_sec": f_l,
+        }
+        config.patch_setting("step_settings", self._step_settings)
+        self._refresh_step_buttons()
+        if hasattr(self, "_step_status_label"):
+            self._step_status_label.configure(text="✅ 步長設定已儲存並生效")
+
+    def _reset_step_settings(self):
+        self._step_settings = dict(config.DEFAULT_STEP_SETTINGS)
+        self._s_back_large_var.set(str(self._step_settings["step_back_large_sec"]))
+        self._s_back_small_var.set(str(self._step_settings["step_back_small_sec"]))
+        self._s_back_frame_var.set(str(self._step_settings["step_back_frames"]))
+        self._s_fwd_frame_var.set(str(self._step_settings["step_forward_frames"]))
+        self._s_fwd_small_var.set(str(self._step_settings["step_forward_small_sec"]))
+        self._s_fwd_large_var.set(str(self._step_settings["step_forward_large_sec"]))
+        config.patch_setting("step_settings", self._step_settings)
+        self._refresh_step_buttons()
+        if hasattr(self, "_step_status_label"):
+            self._step_status_label.configure(text="已恢復預設步長")
+
+    def _on_global_key_press(self, event):
+        # 1. Key recording mode for settings page
+        if self._recording_action:
+            if event.keysym in ("Escape", "Esc"):
+                self._recording_action = None
+                self._render_keybindings_table()
+                return "break"
+            if event.keysym in ("Shift_L", "Shift_R", "Control_L", "Control_R",
+                                "Alt_L", "Alt_R", "Caps_Lock", "Super_L", "Super_R"):
+                return None
+            key = event.keysym
+            self._keybindings[self._recording_action] = key
+            config.patch_setting("keybindings", self._keybindings)
+            self._recording_action = None
+            self._render_keybindings_table()
+            if hasattr(self, "_kb_status_label"):
+                self._kb_status_label.configure(text=f"已將快捷鍵設定為：{format_key_display(key)}")
+            return "break"
+
+        # 2. Check if focused on entry or text widget
+        try:
+            focused = self.focus_get()
+            if focused is not None:
+                cls_name = focused.winfo_class().lower()
+                widget_str = str(focused).lower()
+                if "entry" in cls_name or "text" in cls_name or "entry" in widget_str or "text" in widget_str:
+                    return None
+        except Exception:
+            pass
+
+        # 3. Match keybinding action
+        pressed = event.keysym.lower()
+        matched_action = None
+        for act_id, bound_key in self._keybindings.items():
+            if bound_key and bound_key.lower() == pressed:
+                matched_action = act_id
+                break
+
+        if not matched_action:
+            return None
+
+        # 4. Dispatch action
+        if matched_action == "play_pause":
+            self._toggle_play()
+        elif matched_action == "step_back_large":
+            self._on_step_back_large()
+        elif matched_action == "step_back_small":
+            self._on_step_back_small()
+        elif matched_action == "step_back_frame":
+            self._on_step_back_frame()
+        elif matched_action == "step_forward_frame":
+            self._on_step_forward_frame()
+        elif matched_action == "step_forward_small":
+            self._on_step_forward_small()
+        elif matched_action == "step_forward_large":
+            self._on_step_forward_large()
+        elif matched_action == "set_start":
+            self._set_as_start()
+        elif matched_action == "set_end":
+            self._set_as_end()
+        elif matched_action == "jump_start":
+            self._jump_to_start()
+        elif matched_action == "jump_end":
+            self._jump_to_end()
+        elif matched_action == "reset_roi":
+            self._reset_roi()
+        elif matched_action == "apply_last_roi":
+            self._apply_last_roi()
+        elif matched_action == "add_task":
+            self._add_task()
+
+        return "break"
+
+    # ------------------------------------------------------------------ #
+    #  Tab 3: API Settings (Maintained from v0.03)
     # ------------------------------------------------------------------ #
     def _build_api_tab(self, parent):
         ctk.CTkLabel(parent, text="API 設定", font=FONT_TITLE, anchor="w").pack(

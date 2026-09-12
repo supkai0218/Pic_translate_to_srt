@@ -45,6 +45,32 @@ DEFAULT_TARGET_LANG = "繁體中文"
 
 TARGET_LANG_PRESETS = ["繁體中文", "簡體中文", "English", "日本語", "한국어"]
 
+DEFAULT_STEP_SETTINGS: dict = {
+    "step_back_large_sec": 5.0,
+    "step_back_small_sec": 3.0,
+    "step_back_frames": 1,
+    "step_forward_frames": 1,
+    "step_forward_small_sec": 3.0,
+    "step_forward_large_sec": 5.0,
+}
+
+DEFAULT_KEYBINDINGS: dict = {
+    "play_pause": "space",
+    "step_back_large": "Left",
+    "step_back_small": "j",
+    "step_back_frame": "bracketleft",
+    "step_forward_frame": "bracketright",
+    "step_forward_small": "l",
+    "step_forward_large": "Right",
+    "set_start": "q",
+    "set_end": "w",
+    "jump_start": "a",
+    "jump_end": "s",
+    "reset_roi": "r",
+    "apply_last_roi": "t",
+    "add_task": "Return",
+}
+
 _DEFAULTS: dict = {
     "providers": [
         {
@@ -69,6 +95,8 @@ _DEFAULTS: dict = {
     "last_video_dir": "",
     "last_video_path": "",
     "last_srt_path": "",
+    "step_settings": DEFAULT_STEP_SETTINGS,
+    "keybindings": DEFAULT_KEYBINDINGS,
     "appearance_mode": "dark",
 }
 
