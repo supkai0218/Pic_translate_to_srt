@@ -5,11 +5,30 @@
       "api_url": "https://api.openai.com/v1/chat/completions",
       "api_key": "",
       "api_key_env": "API_KEY_OPENAI",
-      "model": "gpt-4o",
+      "models": [
+        "gpt-4o",
+        "gpt-4o-mini"
+      ],
+      "selected_model": "gpt-4o",
       "is_default": true
     }
   ],
   "default_provider": "OpenAI",
+  "active_global_prompt_id": "global_default",
+  "prompt_profiles": [
+    {
+      "id": "global_default",
+      "name": "預設通用公版",
+      "scope": "global",
+      "bound_provider": "",
+      "bound_model": "",
+      "target_lang": "繁體中文",
+      "target_lang_custom": "",
+      "system_prompt": "你是一個專業的字幕 OCR 與翻譯助手。請辨識圖片畫面中所有可見的文字，將其翻譯為指定語言，保留原有的換行。只輸出翻譯結果，不要加任何說明、引號或註解。若圖片中沒有可辨識的文字，請回覆空字串。",
+      "user_prompt": "請辨識這張截圖中的所有文字，翻譯成{lang}。直接輸出翻譯內容，保留換行，不要任何說明。",
+      "is_builtin": true
+    }
+  ],
   "target_lang": "繁體中文",
   "target_lang_custom": "",
   "system_prompt": "你是一個專業的字幕 OCR 與翻譯助手。請辨識圖片畫面中所有可見的文字，將其翻譯為指定語言，保留原有的換行。只輸出翻譯結果，不要加任何說明、引號或註解。若圖片中沒有可辨識的文字，請回覆空字串。",
@@ -19,6 +38,8 @@
   "subtitle_duration": 2.0,
   "image_max_side": 1568,
   "last_image_dir": "",
+  "last_video_dir": "",
+  "last_video_path": "",
   "last_srt_path": "",
   "appearance_mode": "dark"
 }

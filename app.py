@@ -1,4 +1,4 @@
-"""Video OCR → translate → SRT generator/inserter (v1.06).
+"""Video OCR → translate → SRT generator/inserter (v1.07).
 
 Run: python app.py
 Or: PicTrans2Srt.exe [video_path] [-s srt_path] [--play]
@@ -148,7 +148,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.06)")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.07)")
         self.geometry("1160x820")
         self.minsize(980, 680)
 
@@ -248,6 +248,8 @@ class App(ctk.CTk):
 
         self._refresh_step_buttons()
         self._sync_api_form()
+        self._sync_prompt_form()
+        self._refresh_run_tab_summary()
         self.bind_all("<KeyPress>", self._on_global_key_press)
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
@@ -548,6 +550,16 @@ class App(ctk.CTk):
             if self._video_engine:
                 self._seek_to(self._current_sec)
             self._sync_video_tab_ui()
+
+        elif tab_name == "  執行  ":
+            self._refresh_run_tab_summary()
+
+        elif tab_name == "  Prompt 設定  ":
+            self._refresh_prompt_tab_providers()
+
+        elif tab_name == "  API 設定  ":
+            self._settings = config.load_settings()
+            self._sync_api_form()
 
     def _sync_player_ui(self):
         filename = Path(self._video_path).name if self._video_path else "（尚未載入影片）"
@@ -2500,26 +2512,49 @@ class App(ctk.CTk):
         return "break"
 
     # ------------------------------------------------------------------ #
-    #  Tab 3: API Settings (Maintained from v0.03)
+    #  Tab 3: API Settings (v1.07)
     # ------------------------------------------------------------------ #
     def _build_api_tab(self, parent):
         ctk.CTkLabel(parent, text="API 設定", font=FONT_TITLE, anchor="w").pack(
             fill="x", padx=14, pady=(12, 4))
-        ctk.CTkLabel(parent, text="可設定多組供應商，於下方下拉選單快速切換。",
+        ctk.CTkLabel(parent, text="可自訂多組供應商與模型，金鑰將自動寫入 .env 檔案中。",
                      font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w").pack(
             fill="x", padx=14)
 
+        # 常用範本快速填入
+        preset_row = ctk.CTkFrame(parent, fg_color="transparent")
+        preset_row.pack(fill="x", padx=14, pady=(8, 2))
+        ctk.CTkLabel(preset_row, text="常用範本快速填入：", font=FONT_BODY).pack(side="left")
+        preset_names = ["（選擇常用範本…）"] + [p["name"] for p in config.PROVIDER_PRESETS]
+        self._preset_menu = ctk.CTkOptionMenu(
+            preset_row, width=220, height=30, font=FONT_BODY,
+            values=preset_names, command=self._on_select_preset
+        )
+        self._preset_menu.pack(side="left", padx=(6, 12))
+
+        ctk.CTkLabel(
+            preset_row,
+            text="⚠️ 提示：範本僅供快速填寫參考，端點 URL、金鑰與支援模型請以各供應商官方最新文件為準。",
+            font=FONT_SMALL, text_color=("#b45309", "#f59e0b")
+        ).pack(side="left")
+
+        # 供應商切換列
         switch_row = ctk.CTkFrame(parent, fg_color="transparent")
-        switch_row.pack(fill="x", padx=14, pady=(8, 6))
+        switch_row.pack(fill="x", padx=14, pady=(6, 6))
         ctk.CTkLabel(switch_row, text="供應商：", font=FONT_BODY).pack(side="left")
         self._provider_menu = ctk.CTkOptionMenu(switch_row, width=200, height=30,
                                                 font=FONT_BODY,
                                                 values=["（無）"],
                                                 command=self._on_provider_switch)
-        self._provider_menu.pack(side="left", padx=(6, 12))
-        ctk.CTkButton(switch_row, text="測試連線", width=110, height=30,
-                      font=FONT_BODY, command=self._on_test_connection).pack(side="left")
+        self._provider_menu.pack(side="left", padx=(6, 10))
 
+        ctk.CTkButton(switch_row, text="設為預設供應商", width=120, height=30, font=FONT_BODY,
+                      command=self._set_default_provider).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(switch_row, text="刪除供應商", width=95, height=30, font=FONT_BODY,
+                      fg_color="#b23b3b", hover_color="#8a2e2e",
+                      command=self._delete_current_provider).pack(side="left", padx=(0, 6))
+
+        # 供應商詳細資料表單
         form = ctk.CTkFrame(parent)
         form.pack(fill="both", expand=True, padx=14, pady=(0, 6))
         form.grid_columnconfigure(1, weight=1)
@@ -2527,43 +2562,105 @@ class App(ctk.CTk):
         self._p_name = ctk.StringVar()
         self._p_url = ctk.StringVar()
         self._p_key = ctk.StringVar()
-        self._p_model = ctk.StringVar()
+        self._current_provider_models: list[str] = []
+        self._p_selected_model = ctk.StringVar()
 
-        def add_field(row, label, var, show=None):
-            ctk.CTkLabel(form, text=label, font=FONT_BODY, anchor="e").grid(
-                row=row, column=0, sticky="e", padx=(10, 8), pady=8
-            )
-            entry = ctk.CTkEntry(form, textvariable=var, font=FONT_BODY, show=show)
-            entry.grid(row=row, column=1, sticky="ew", padx=(0, 10), pady=8)
-            return entry
+        # Row 0: 名稱
+        ctk.CTkLabel(form, text="名稱：", font=FONT_BODY, anchor="e").grid(
+            row=0, column=0, sticky="e", padx=(10, 8), pady=6
+        )
+        ctk.CTkEntry(form, textvariable=self._p_name, font=FONT_BODY).grid(
+            row=0, column=1, sticky="ew", padx=(0, 10), pady=6
+        )
 
-        add_field(0, "名稱：", self._p_name)
-        add_field(1, "API 網址：", self._p_url)
-        add_field(2, "API 金鑰：", self._p_key, show="•")
-        add_field(3, "模型名稱：", self._p_model)
+        # Row 1: API 網址
+        ctk.CTkLabel(form, text="API 網址：", font=FONT_BODY, anchor="e").grid(
+            row=1, column=0, sticky="e", padx=(10, 8), pady=6
+        )
+        ctk.CTkEntry(form, textvariable=self._p_url, font=FONT_BODY).grid(
+            row=1, column=1, sticky="ew", padx=(0, 10), pady=6
+        )
 
+        # Row 2: API 金鑰 + 檢視/編輯 .env 按鈕
+        ctk.CTkLabel(form, text="API 金鑰：", font=FONT_BODY, anchor="e").grid(
+            row=2, column=0, sticky="e", padx=(10, 8), pady=6
+        )
+        key_row = ctk.CTkFrame(form, fg_color="transparent")
+        key_row.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=6)
+        ctk.CTkEntry(key_row, textvariable=self._p_key, font=FONT_BODY, show="•").pack(
+            side="left", fill="x", expand=True
+        )
+        ctk.CTkButton(
+            key_row, text="檢視/編輯 .env (記事本)", width=175, height=28, font=FONT_SMALL,
+            command=config.open_env_in_editor
+        ).pack(side="left", padx=(8, 0))
+
+        # Row 3: 金鑰提示
         self._key_hint = ctk.StringVar(value="")
         ctk.CTkLabel(
             form, textvariable=self._key_hint, font=FONT_SMALL,
             text_color=("gray40", "#9aa0a6"), anchor="w"
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=(10, 10), pady=(0, 4))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=(10, 10), pady=(0, 4))
 
+        # Row 4: 模型清單管理子區塊
+        model_group = ctk.CTkFrame(form, fg_color=("gray92", "gray20"))
+        model_group.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 8))
+        model_group.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(model_group, text="【模型清單管理】", font=FONT_BODY, anchor="w").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2)
+        )
+
+        ctk.CTkLabel(model_group, text="模型選擇：", font=FONT_BODY, anchor="e").grid(
+            row=1, column=0, sticky="e", padx=(10, 8), pady=4
+        )
+        self._model_menu = ctk.CTkOptionMenu(
+            model_group, width=280, height=28, font=FONT_BODY,
+            values=["（無）"], variable=self._p_selected_model,
+            command=self._on_model_menu_select
+        )
+        self._model_menu.grid(row=1, column=1, sticky="w", pady=4)
+
+        model_btns = ctk.CTkFrame(model_group, fg_color="transparent")
+        model_btns.grid(row=1, column=2, sticky="w", padx=(10, 10), pady=4)
+        ctk.CTkButton(
+            model_btns, text="設為目前使用", width=105, height=28, font=FONT_SMALL,
+            command=self._set_current_model_active
+        ).pack(side="left")
+        ctk.CTkButton(
+            model_btns, text="刪除此模型", width=90, height=28, font=FONT_SMALL,
+            fg_color="#b23b3b", hover_color="#8a2e2e",
+            command=self._delete_current_model
+        ).pack(side="left", padx=(6, 0))
+
+        ctk.CTkLabel(model_group, text="新增模型：", font=FONT_BODY, anchor="e").grid(
+            row=2, column=0, sticky="e", padx=(10, 8), pady=(4, 8)
+        )
+        self._new_model_var = ctk.StringVar()
+        new_model_entry = ctk.CTkEntry(
+            model_group, textvariable=self._new_model_var, font=FONT_BODY,
+            placeholder_text="輸入模型名稱，例如 deepseek/deepseek-chat"
+        )
+        new_model_entry.grid(row=2, column=1, sticky="ew", pady=(4, 8))
+        ctk.CTkButton(
+            model_group, text="＋ 加入模型", width=105, height=28, font=FONT_SMALL,
+            command=self._add_model_to_current
+        ).grid(row=2, column=2, sticky="w", padx=(10, 10), pady=(4, 8))
+
+        # Bottom buttons
         btns = ctk.CTkFrame(parent, fg_color="transparent")
         btns.pack(fill="x", padx=14, pady=(0, 6))
-        ctk.CTkButton(btns, text="新增", width=90, height=30, font=FONT_BODY,
+        ctk.CTkButton(btns, text="新增空白供應商", width=120, height=30, font=FONT_BODY,
                       command=self._new_provider).pack(side="left")
-        ctk.CTkButton(btns, text="儲存目前", width=110, height=30, font=FONT_BODY,
+        ctk.CTkButton(btns, text="儲存供應商與模型", width=140, height=30, font=FONT_BODY,
                       command=self._save_current_provider).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(btns, text="刪除", width=90, height=30, font=FONT_BODY,
-                      fg_color="#b23b3b", hover_color="#8a2e2e",
-                      command=self._delete_current_provider).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(btns, text="設為預設", width=110, height=30, font=FONT_BODY,
-                      command=self._set_default_provider).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(btns, text="測試連線", width=110, height=30, font=FONT_BODY,
+                      command=self._on_test_connection).pack(side="left", padx=(8, 0))
 
         self._test_status = ctk.StringVar(value="")
         self._test_label = ctk.CTkLabel(parent, textvariable=self._test_status,
                                         font=FONT_SMALL, anchor="w")
-        self._test_label.pack(fill="x", padx=14, pady=(0, 10))
+        self._test_label.pack(fill="x", padx=14, pady=(0, 6))
 
     def _provider_names(self) -> list[str]:
         return [p["name"] for p in self._settings.get("providers", [])]
@@ -2573,6 +2670,72 @@ class App(ctk.CTk):
         self._provider_menu.configure(values=names)
         sel = keep if keep in names else (names[0] if names != ["（無）"] else "（無）")
         self._provider_menu.set(sel)
+
+    def _refresh_model_menu(self, keep: str | None = None):
+        models = self._current_provider_models or ["（無）"]
+        self._model_menu.configure(values=models)
+        sel = keep if keep in models else (models[0] if models != ["（無）"] else "（無）")
+        self._model_menu.set(sel)
+        self._p_selected_model.set(sel)
+
+    def _on_model_menu_select(self, val: str):
+        self._p_selected_model.set(val)
+
+    def _set_current_model_active(self):
+        m = self._p_selected_model.get().strip()
+        if not m or m == "（無）":
+            return
+        p_name = self._p_name.get().strip()
+        if p_name:
+            config.select_provider_model(p_name, m)
+            self._settings = config.load_settings()
+        self._test_status.set(f"已將「{m}」設為此供應商的使用模型。")
+        self._test_label.configure(text_color=("#0a7d2c", "#5ec97a"))
+        self._refresh_run_tab_summary()
+
+    def _add_model_to_current(self):
+        m = self._new_model_var.get().strip()
+        if not m:
+            return
+        if m not in self._current_provider_models:
+            self._current_provider_models.append(m)
+        self._p_selected_model.set(m)
+        self._refresh_model_menu(keep=m)
+        self._new_model_var.set("")
+        self._save_current_provider()
+
+    def _delete_current_model(self):
+        m = self._p_selected_model.get().strip()
+        if not m or m == "（無）":
+            return
+        if len(self._current_provider_models) <= 1:
+            messagebox.showwarning("無法刪除", "供應商至少需保留一個模型。")
+            return
+        self._current_provider_models = [x for x in self._current_provider_models if x != m]
+        new_sel = self._current_provider_models[0]
+        self._p_selected_model.set(new_sel)
+        self._refresh_model_menu(keep=new_sel)
+        self._save_current_provider()
+
+    def _on_select_preset(self, choice: str):
+        if choice.startswith("（"):
+            return
+        preset = next((p for p in config.PROVIDER_PRESETS if p["name"] == choice), None)
+        if not preset:
+            return
+        self._p_name.set(preset["name"])
+        self._p_url.set(preset["api_url"])
+        env = config._env_var_name_for(preset["name"])
+        existing_key = os.environ.get(env, "")
+        self._p_key.set(existing_key)
+        self._current_provider_models = list(preset.get("models", []))
+        sel_m = preset.get("selected_model") or (self._current_provider_models[0] if self._current_provider_models else "")
+        self._p_selected_model.set(sel_m)
+        self._refresh_model_menu(keep=sel_m)
+        self._key_hint.set(f"金鑰儲存於 .env：{env}")
+        self._test_status.set(f"已帶入「{choice}」常用設定，請確認/填寫 API 金鑰後點擊儲存。")
+        self._test_label.configure(text_color=("#0a7d2c", "#5ec97a"))
+        self._preset_menu.set("（選擇常用範本…）")
 
     def _sync_api_form(self):
         self._refresh_provider_menu()
@@ -2585,7 +2748,11 @@ class App(ctk.CTk):
         self._p_name.set(p.get("name", ""))
         self._p_url.set(p.get("api_url", ""))
         self._p_key.set(p.get("api_key", ""))
-        self._p_model.set(p.get("model", ""))
+        models = list(p.get("models") or [p.get("model", "gpt-4o")])
+        self._current_provider_models = models
+        sel_m = p.get("selected_model") or (models[0] if models else "")
+        self._p_selected_model.set(sel_m)
+        self._refresh_model_menu(keep=sel_m)
         env = p.get("api_key_env") or ""
         self._key_hint.set(f"金鑰儲存於 .env：{env}" if env else "金鑰儲存於 .env")
 
@@ -2596,11 +2763,20 @@ class App(ctk.CTk):
                 break
 
     def _form_to_provider(self) -> dict:
+        models = list(self._current_provider_models)
+        sel_m = self._p_selected_model.get().strip()
+        if sel_m and sel_m not in models:
+            models.append(sel_m)
+        if not models:
+            models = ["gpt-4o"]
+        if not sel_m:
+            sel_m = models[0]
         return {
             "name": self._p_name.get().strip(),
             "api_url": self._p_url.get().strip(),
             "api_key": self._p_key.get().strip(),
-            "model": self._p_model.get().strip(),
+            "models": models,
+            "selected_model": sel_m,
             "is_default": False,
         }
 
@@ -2608,7 +2784,9 @@ class App(ctk.CTk):
         self._p_name.set("")
         self._p_url.set("https://api.openai.com/v1/chat/completions")
         self._p_key.set("")
-        self._p_model.set("gpt-4o")
+        self._current_provider_models = ["gpt-4o"]
+        self._p_selected_model.set("gpt-4o")
+        self._refresh_model_menu(keep="gpt-4o")
         self._key_hint.set("填入名稱與金鑰後儲存，金鑰將寫入 .env（API_KEY_<名稱>）")
 
     def _save_current_provider(self):
@@ -2616,8 +2794,8 @@ class App(ctk.CTk):
         if not p["name"]:
             messagebox.showwarning("缺少名稱", "請先填入供應商「名稱」。")
             return
-        if not p["api_url"] or not p["model"]:
-            messagebox.showwarning("資料不完整", "API 網址與模型名稱為必填。")
+        if not p["api_url"]:
+            messagebox.showwarning("資料不完整", "API 網址為必填。")
             return
         for ex in self._settings.get("providers", []):
             if ex.get("name") == p["name"]:
@@ -2626,6 +2804,10 @@ class App(ctk.CTk):
         config.upsert_provider(p)
         self._settings = config.load_settings()
         self._refresh_provider_menu(keep=p["name"])
+        self._refresh_prompt_tab_providers()
+        self._refresh_run_tab_summary()
+        self._test_status.set(f"已儲存供應商「{p['name']}」與模型設定。")
+        self._test_label.configure(text_color=("#0a7d2c", "#5ec97a"))
 
     def _delete_current_provider(self):
         name = self._p_name.get().strip()
@@ -2636,6 +2818,8 @@ class App(ctk.CTk):
         config.delete_provider(name)
         self._settings = config.load_settings()
         self._sync_api_form()
+        self._refresh_prompt_tab_providers()
+        self._refresh_run_tab_summary()
 
     def _set_default_provider(self):
         name = self._p_name.get().strip()
@@ -2646,14 +2830,15 @@ class App(ctk.CTk):
         config.upsert_provider(p)
         self._settings = config.load_settings()
         self._refresh_provider_menu(keep=name)
+        self._refresh_run_tab_summary()
 
     def _on_test_connection(self):
         p = self._form_to_provider()
-        if not p["api_url"] or not p["model"]:
-            messagebox.showwarning("資料不完整", "請先填入 API 網址與模型名稱。")
+        if not p["api_url"] or not p["selected_model"]:
+            messagebox.showwarning("資料不完整", "請先填入 API 網址並選擇模型。")
             return
         cfg = ProviderCfg.from_dict(p)
-        self._test_status.set("測試中…")
+        self._test_status.set(f"測試連線至 {cfg.model}…")
         self._test_label.configure(text_color=("#555", "#9aa0a6"))
 
         def work():
@@ -2667,66 +2852,235 @@ class App(ctk.CTk):
         self._test_label.configure(text_color=("#0a7d2c", "#5ec97a") if ok else ("#b23b3b", "#ff8a80"))
 
     # ------------------------------------------------------------------ #
-    #  Tab 3: Prompt Settings (Maintained from v0.03)
+    #  Tab 3: Prompt Settings (v1.07)
     # ------------------------------------------------------------------ #
     def _build_prompt_tab(self, parent):
-        ctk.CTkLabel(parent, text="Prompt 與翻譯設定", font=FONT_TITLE, anchor="w").pack(
-            fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(parent, text="Prompt 方案庫與翻譯設定", font=FONT_TITLE, anchor="w").pack(
+            fill="x", padx=14, pady=(12, 4)
+        )
+        ctk.CTkLabel(
+            parent,
+            text="支援多組 Prompt 方案：可建立全域通用公版，或指定綁定某供應商模型的專用版本。",
+            font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w"
+        ).pack(fill="x", padx=14)
 
-        lang_row = ctk.CTkFrame(parent, fg_color="transparent")
-        lang_row.pack(fill="x", padx=14, pady=(0, 8))
+        # Profile selection & action buttons row
+        top_row = ctk.CTkFrame(parent, fg_color="transparent")
+        top_row.pack(fill="x", padx=14, pady=(8, 6))
+
+        ctk.CTkLabel(top_row, text="方案選擇：", font=FONT_BODY).pack(side="left")
+        self._prompt_menu_var = ctk.StringVar(value="（無）")
+        self._prompt_display_map: dict[str, str] = {}
+        self._prompt_menu = ctk.CTkOptionMenu(
+            top_row, width=280, height=30, font=FONT_BODY,
+            variable=self._prompt_menu_var,
+            values=["（無）"],
+            command=self._on_prompt_profile_switch
+        )
+        self._prompt_menu.pack(side="left", padx=(6, 10))
+
+        ctk.CTkButton(top_row, text="新增方案", width=85, height=30, font=FONT_BODY,
+                      command=self._new_prompt_profile).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(top_row, text="複製目前", width=85, height=30, font=FONT_BODY,
+                      command=self._clone_prompt_profile).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(top_row, text="刪除方案", width=85, height=30, font=FONT_BODY,
+                      fg_color="#b23b3b", hover_color="#8a2e2e",
+                      command=self._delete_current_prompt_profile).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(top_row, text="設為預設公版", width=115, height=30, font=FONT_BODY,
+                      command=self._set_current_as_active_global).pack(side="left", padx=(0, 6))
+
+        # Profile details form
+        form = ctk.CTkFrame(parent)
+        form.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        form.grid_columnconfigure(1, weight=1)
+
+        self._current_prompt_id = ""
+        self._prompt_name_var = ctk.StringVar()
+        self._prompt_scope_var = ctk.StringVar(value="通用公版 (Global)")
+        self._bound_provider_var = ctk.StringVar()
+        self._bound_model_var = ctk.StringVar()
+
+        # Row 0: 方案名稱
+        ctk.CTkLabel(form, text="方案名稱：", font=FONT_BODY, anchor="e").grid(
+            row=0, column=0, sticky="e", padx=(10, 8), pady=6
+        )
+        ctk.CTkEntry(form, textvariable=self._prompt_name_var, font=FONT_BODY).grid(
+            row=0, column=1, sticky="ew", padx=(0, 10), pady=6
+        )
+
+        # Row 1: 適用類型
+        ctk.CTkLabel(form, text="適用類型：", font=FONT_BODY, anchor="e").grid(
+            row=1, column=0, sticky="e", padx=(10, 8), pady=6
+        )
+        self._prompt_scope_seg = ctk.CTkSegmentedButton(
+            form, values=["通用公版 (Global)", "綁定特定模型 (Model-bound)"],
+            variable=self._prompt_scope_var, command=self._on_prompt_scope_change,
+            height=28, font=FONT_BODY
+        )
+        self._prompt_scope_seg.grid(row=1, column=1, sticky="w", padx=(0, 10), pady=6)
+
+        # Row 2: 綁定設定 (Model-bound options)
+        self._bound_frame = ctk.CTkFrame(form, fg_color=("gray92", "gray20"))
+        self._bound_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        ctk.CTkLabel(self._bound_frame, text="綁定供應商：", font=FONT_BODY).pack(side="left", padx=(10, 4), pady=4)
+        self._bound_provider_menu = ctk.CTkOptionMenu(
+            self._bound_frame, width=180, height=28, font=FONT_BODY,
+            variable=self._bound_provider_var, command=self._on_bound_provider_change
+        )
+        self._bound_provider_menu.pack(side="left", padx=(0, 12), pady=4)
+
+        ctk.CTkLabel(self._bound_frame, text="綁定模型：", font=FONT_BODY).pack(side="left", padx=(0, 4), pady=4)
+        self._bound_model_menu = ctk.CTkOptionMenu(
+            self._bound_frame, width=220, height=28, font=FONT_BODY,
+            variable=self._bound_model_var
+        )
+        self._bound_model_menu.pack(side="left", padx=(0, 10), pady=4)
+        self._bound_frame.grid_remove()  # hidden by default for global scope
+
+        # Row 3: 目標語言
+        lang_row = ctk.CTkFrame(form, fg_color="transparent")
+        lang_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=6)
         ctk.CTkLabel(lang_row, text="目標語言：", font=FONT_BODY).pack(side="left")
         self._lang_var = ctk.StringVar(value=self._settings.get("target_lang", config.DEFAULT_TARGET_LANG))
-        self._lang_menu = ctk.CTkOptionMenu(lang_row, width=180, height=30,
-                                            font=FONT_BODY, values=config.TARGET_LANG_PRESETS,
-                                            variable=self._lang_var,
-                                            command=self._on_lang_change)
+        self._lang_menu = ctk.CTkOptionMenu(
+            lang_row, width=160, height=28, font=FONT_BODY,
+            values=config.TARGET_LANG_PRESETS, variable=self._lang_var
+        )
         self._lang_menu.pack(side="left", padx=(6, 12))
         ctk.CTkLabel(lang_row, text="或自訂：", font=FONT_BODY).pack(side="left")
-        self._lang_custom = ctk.StringVar(value=self._settings.get("target_lang_custom", ""))
-        entry = ctk.CTkEntry(lang_row, textvariable=self._lang_custom, width=180,
-                             font=FONT_BODY)
+        self._lang_custom = ctk.StringVar(value="")
+        entry = ctk.CTkEntry(lang_row, textvariable=self._lang_custom, width=160, font=FONT_BODY)
         entry.pack(side="left", padx=(6, 0))
-        entry.bind("<FocusOut>", lambda _e: config.patch_setting("target_lang_custom", self._lang_custom.get()))
 
-        ctk.CTkLabel(parent, text="System Prompt", font=FONT_BODY, anchor="w").pack(
-            fill="x", padx=14, pady=(6, 2))
-        self._sys_box = ctk.CTkTextbox(parent, height=110, font=FONT_BODY)
-        self._sys_box.pack(fill="x", expand=False, padx=14)
-        self._sys_box.insert("1.0", self._settings.get("system_prompt", config.DEFAULT_SYSTEM_PROMPT))
+        # Row 4: System Prompt
+        ctk.CTkLabel(form, text="System Prompt", font=FONT_BODY, anchor="w").grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 2)
+        )
+        self._sys_box = ctk.CTkTextbox(form, height=95, font=FONT_BODY)
+        self._sys_box.grid(row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
 
-        ur = ctk.CTkFrame(parent, fg_color="transparent")
-        ur.pack(fill="x", padx=14, pady=(8, 2))
-        ctk.CTkLabel(ur, text="User Prompt（{lang} 會自動帶入目標語言）", font=FONT_BODY,
-                     anchor="w").pack(side="left")
-        ctk.CTkButton(ur, text="恢復預設", width=90, height=26, font=FONT_SMALL,
+        # Row 6: User Prompt
+        ur = ctk.CTkFrame(form, fg_color="transparent")
+        ur.grid(row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 2))
+        ctk.CTkLabel(ur, text="User Prompt（{lang} 會自動帶入目標語言）", font=FONT_BODY, anchor="w").pack(side="left")
+        ctk.CTkButton(ur, text="恢復預設內容", width=100, height=24, font=FONT_SMALL,
                       command=self._reset_prompts).pack(side="right")
-        self._usr_box = ctk.CTkTextbox(parent, height=110, font=FONT_BODY)
-        self._usr_box.pack(fill="x", expand=False, padx=14)
-        self._usr_box.insert("1.0", self._settings.get("user_prompt", config.DEFAULT_USER_PROMPT))
 
-        mode_row = ctk.CTkFrame(parent, fg_color="transparent")
-        mode_row.pack(fill="x", padx=14, pady=(12, 4))
-        ctk.CTkLabel(mode_row, text="插入方式（當有指定目標 SRT 時）：", font=FONT_BODY).pack(side="left")
-        self._mode_var = ctk.StringVar(value=self._settings.get("insertion_mode", "insert"))
-        self._mode_seg = ctk.CTkSegmentedButton(
-            mode_row, values=["insert", "append"],
-            command=lambda v: self._mode_var.set(v),
-            variable=self._mode_var, height=30, font=FONT_BODY)
-        self._mode_seg.pack(side="left", padx=(6, 12))
-        ctk.CTkLabel(mode_row,
-                     text="insert=依時間軸插入新字幕　append=附加至涵蓋時間軸的現有字幕",
-                     font=FONT_SMALL, text_color=("gray40", "#9aa0a6")).pack(side="left")
+        self._usr_box = ctk.CTkTextbox(form, height=95, font=FONT_BODY)
+        self._usr_box.grid(row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
 
-        ctk.CTkButton(parent, text="儲存 Prompt 設定", width=140, height=30, font=FONT_BODY,
-                      command=self._save_prompts).pack(padx=14, pady=(8, 10), anchor="w")
+        # Bottom row
+        bottom_row = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom_row.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkButton(bottom_row, text="儲存目前 Prompt 方案", width=180, height=32, font=FONT_BODY,
+                      command=self._save_current_prompt_profile).pack(side="left")
+        self._prompt_status_label = ctk.CTkLabel(bottom_row, text="", font=FONT_SMALL, text_color=("#0a7d2c", "#5ec97a"))
+        self._prompt_status_label.pack(side="left", padx=(12, 0))
 
-    def _current_lang(self) -> str:
-        custom = self._lang_custom.get().strip()
-        return custom or self._lang_var.get()
+    def _format_prompt_display_name(self, p: dict) -> str:
+        name = p.get("name", "未命名")
+        if p.get("scope") == "model_bound":
+            prov = p.get("bound_provider") or "?"
+            mod = p.get("bound_model") or "?"
+            return f"[專用: {prov}/{mod}] {name}"
+        else:
+            is_active = (p.get("id") == self._settings.get("active_global_prompt_id"))
+            star = " (預設)" if is_active else ""
+            return f"[公版] {name}{star}"
 
-    def _on_lang_change(self, _v):
-        config.patch_setting("target_lang", self._lang_var.get())
+    def _refresh_prompt_tab_providers(self):
+        providers = self._settings.get("providers", [])
+        names = [p["name"] for p in providers] or ["（無供應商）"]
+        self._bound_provider_menu.configure(values=names)
+        cur_prov = self._bound_provider_var.get()
+        if cur_prov not in names:
+            cur_prov = names[0]
+            self._bound_provider_var.set(cur_prov)
+        self._on_bound_provider_change(cur_prov)
+
+    def _on_bound_provider_change(self, prov_name: str):
+        provider = next((p for p in self._settings.get("providers", []) if p.get("name") == prov_name), None)
+        if provider:
+            models = provider.get("models") or [provider.get("model", "gpt-4o")]
+        else:
+            models = ["（無模型）"]
+        self._bound_model_menu.configure(values=models)
+        cur_mod = self._bound_model_var.get()
+        if cur_mod not in models:
+            self._bound_model_var.set(models[0] if models else "")
+
+    def _on_prompt_scope_change(self, val: str):
+        if val.startswith("通用公版"):
+            self._bound_frame.grid_remove()
+        else:
+            self._bound_frame.grid()
+            self._refresh_prompt_tab_providers()
+
+    def _sync_prompt_form(self, keep_id: str | None = None):
+        self._settings = config.load_settings()
+        profiles = self._settings.get("prompt_profiles", [])
+        if not profiles:
+            return
+
+        self._prompt_display_map.clear()
+        display_names = []
+        target_disp = None
+
+        active_global_id = self._settings.get("active_global_prompt_id")
+        for p in profiles:
+            d = self._format_prompt_display_name(p)
+            self._prompt_display_map[d] = p["id"]
+            display_names.append(d)
+            if keep_id and p["id"] == keep_id:
+                target_disp = d
+            elif not keep_id and not target_disp and p["id"] == active_global_id:
+                target_disp = d
+
+        if not target_disp and display_names:
+            target_disp = display_names[0]
+
+        self._prompt_menu.configure(values=display_names)
+        if target_disp:
+            self._prompt_menu.set(target_disp)
+            pid = self._prompt_display_map.get(target_disp)
+            prof = next((p for p in profiles if p["id"] == pid), profiles[0])
+            self._load_prompt_profile_into_form(prof)
+
+    def _on_prompt_profile_switch(self, disp_name: str):
+        pid = self._prompt_display_map.get(disp_name)
+        if not pid:
+            return
+        profiles = self._settings.get("prompt_profiles", [])
+        p = next((x for x in profiles if x["id"] == pid), None)
+        if p:
+            self._load_prompt_profile_into_form(p)
+
+    def _load_prompt_profile_into_form(self, p: dict):
+        self._current_prompt_id = p.get("id", "")
+        self._prompt_name_var.set(p.get("name", ""))
+        scope = p.get("scope", "global")
+        if scope == "model_bound":
+            self._prompt_scope_seg.set("綁定特定模型 (Model-bound)")
+            self._bound_frame.grid()
+            self._refresh_prompt_tab_providers()
+            b_prov = p.get("bound_provider", "")
+            b_mod = p.get("bound_model", "")
+            if b_prov:
+                self._bound_provider_var.set(b_prov)
+                self._on_bound_provider_change(b_prov)
+            if b_mod:
+                self._bound_model_var.set(b_mod)
+        else:
+            self._prompt_scope_seg.set("通用公版 (Global)")
+            self._bound_frame.grid_remove()
+
+        self._lang_var.set(p.get("target_lang", config.DEFAULT_TARGET_LANG))
+        self._lang_custom.set(p.get("target_lang_custom", ""))
+        self._sys_box.delete("1.0", "end")
+        self._sys_box.insert("1.0", p.get("system_prompt", config.DEFAULT_SYSTEM_PROMPT))
+        self._usr_box.delete("1.0", "end")
+        self._usr_box.insert("1.0", p.get("user_prompt", config.DEFAULT_USER_PROMPT))
+        self._prompt_status_label.configure(text="")
 
     def _reset_prompts(self):
         self._sys_box.delete("1.0", "end")
@@ -2734,21 +3088,141 @@ class App(ctk.CTk):
         self._usr_box.delete("1.0", "end")
         self._usr_box.insert("1.0", config.DEFAULT_USER_PROMPT)
 
-    def _save_prompts(self):
-        config.patch_setting("system_prompt", self._sys_box.get("1.0", "end").strip("\n"))
-        config.patch_setting("user_prompt", self._usr_box.get("1.0", "end").strip("\n"))
-        config.patch_setting("target_lang", self._lang_var.get())
-        config.patch_setting("target_lang_custom", self._lang_custom.get().strip())
-        config.patch_setting("insertion_mode", self._mode_var.get())
+    def _save_current_prompt_profile(self):
+        name = self._prompt_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("缺少名稱", "請先填寫方案名稱。")
+            return
+
+        is_bound = self._prompt_scope_seg.get().startswith("綁定特定模型")
+        scope = "model_bound" if is_bound else "global"
+        profile = {
+            "id": self._current_prompt_id,
+            "name": name,
+            "scope": scope,
+            "bound_provider": self._bound_provider_var.get().strip() if is_bound else "",
+            "bound_model": self._bound_model_var.get().strip() if is_bound else "",
+            "target_lang": self._lang_var.get(),
+            "target_lang_custom": self._lang_custom.get().strip(),
+            "system_prompt": self._sys_box.get("1.0", "end").strip("\n"),
+            "user_prompt": self._usr_box.get("1.0", "end").strip("\n"),
+        }
+        config.upsert_prompt_profile(profile)
         self._settings = config.load_settings()
+        self._sync_prompt_form(keep_id=profile["id"])
+        self._refresh_run_tab_summary()
+        self._prompt_status_label.configure(text=f"✅ 已儲存方案「{name}」")
+
+    def _new_prompt_profile(self):
+        import uuid
+        new_id = f"prompt_{uuid.uuid4().hex[:8]}"
+        new_prof = {
+            "id": new_id,
+            "name": "新 Prompt 方案",
+            "scope": "global",
+            "bound_provider": "",
+            "bound_model": "",
+            "target_lang": config.DEFAULT_TARGET_LANG,
+            "target_lang_custom": "",
+            "system_prompt": config.DEFAULT_SYSTEM_PROMPT,
+            "user_prompt": config.DEFAULT_USER_PROMPT,
+        }
+        config.upsert_prompt_profile(new_prof)
+        self._settings = config.load_settings()
+        self._sync_prompt_form(keep_id=new_id)
+        self._prompt_status_label.configure(text="✅ 已建立新方案，請修改後儲存。")
+
+    def _clone_prompt_profile(self):
+        import uuid
+        old_name = self._prompt_name_var.get().strip() or "方案"
+        new_id = f"prompt_{uuid.uuid4().hex[:8]}"
+        is_bound = self._prompt_scope_seg.get().startswith("綁定特定模型")
+        cloned_prof = {
+            "id": new_id,
+            "name": f"{old_name} (副本)",
+            "scope": "model_bound" if is_bound else "global",
+            "bound_provider": self._bound_provider_var.get().strip() if is_bound else "",
+            "bound_model": self._bound_model_var.get().strip() if is_bound else "",
+            "target_lang": self._lang_var.get(),
+            "target_lang_custom": self._lang_custom.get().strip(),
+            "system_prompt": self._sys_box.get("1.0", "end").strip("\n"),
+            "user_prompt": self._usr_box.get("1.0", "end").strip("\n"),
+        }
+        config.upsert_prompt_profile(cloned_prof)
+        self._settings = config.load_settings()
+        self._sync_prompt_form(keep_id=new_id)
+        self._prompt_status_label.configure(text=f"✅ 已複製方案為「{cloned_prof['name']}」")
+
+    def _delete_current_prompt_profile(self):
+        profiles = self._settings.get("prompt_profiles", [])
+        if len(profiles) <= 1:
+            messagebox.showwarning("無法刪除", "系統至少需保留一組 Prompt 方案。")
+            return
+        name = self._prompt_name_var.get().strip()
+        if not messagebox.askyesno("刪除方案", f"確定刪除 Prompt 方案「{name}」？"):
+            return
+        config.delete_prompt_profile(self._current_prompt_id)
+        self._settings = config.load_settings()
+        self._sync_prompt_form()
+        self._refresh_run_tab_summary()
+
+    def _set_current_as_active_global(self):
+        is_bound = self._prompt_scope_seg.get().startswith("綁定特定模型")
+        if is_bound:
+            messagebox.showwarning("無法設為預設公版", "此方案為「綁定特定模型」的專用版本，請先改為「通用公版」再設為全域預設。")
+            return
+        config.set_active_global_prompt(self._current_prompt_id)
+        self._settings = config.load_settings()
+        self._sync_prompt_form(keep_id=self._current_prompt_id)
+        self._refresh_run_tab_summary()
+        self._prompt_status_label.configure(text="⭐ 已將此方案設為全域預設公版。")
 
     # ------------------------------------------------------------------ #
-    #  Tab 4: Execution & Batch LLM Translation
+    #  Tab 4: Execution & Batch LLM Translation (v1.07)
     # ------------------------------------------------------------------ #
     def _build_run_tab(self, parent):
         ctk.CTkLabel(parent, text="執行 OCR 翻譯與 SRT 匯出", font=FONT_TITLE, anchor="w").pack(
             fill="x", padx=14, pady=(12, 4))
 
+        # 【目前執行配置摘要】
+        summary_card = ctk.CTkFrame(parent)
+        summary_card.pack(fill="x", padx=14, pady=(0, 8))
+        summary_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(summary_card, text="【目前執行配置摘要】", font=FONT_BODY, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=12, pady=(8, 4)
+        )
+        self._run_prov_model_label = ctk.CTkLabel(
+            summary_card, text="🔹 供應商：— ｜ 模型：—", font=FONT_BODY, anchor="w"
+        )
+        self._run_prov_model_label.grid(row=1, column=0, sticky="w", padx=12, pady=1)
+
+        self._run_prompt_label = ctk.CTkLabel(
+            summary_card, text="🔹 套用 Prompt：—", font=FONT_BODY, anchor="w"
+        )
+        self._run_prompt_label.grid(row=2, column=0, sticky="w", padx=12, pady=1)
+
+        ctk.CTkLabel(
+            summary_card,
+            text="（💡 如需切換供應商或模型，請至「API 設定」頁籤調整）",
+            font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w"
+        ).grid(row=3, column=0, sticky="w", padx=12, pady=(2, 8))
+
+        # SRT 插入方式 (由 Prompt 設定頁移入)
+        mode_row = ctk.CTkFrame(parent, fg_color="transparent")
+        mode_row.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkLabel(mode_row, text="SRT 插入方式（當有指定目標 SRT 時）：", font=FONT_BODY).pack(side="left")
+        self._mode_var = ctk.StringVar(value=self._settings.get("insertion_mode", "insert"))
+        self._mode_seg = ctk.CTkSegmentedButton(
+            mode_row, values=["insert", "append"],
+            command=lambda v: [self._mode_var.set(v), config.patch_setting("insertion_mode", v)],
+            variable=self._mode_var, height=30, font=FONT_BODY)
+        self._mode_seg.pack(side="left", padx=(6, 12))
+        ctk.CTkLabel(mode_row,
+                     text="insert=依時間軸插入新字幕　append=附加至涵蓋時間軸的現有字幕",
+                     font=FONT_SMALL, text_color=("gray40", "#9aa0a6")).pack(side="left")
+
+        # 控制按鈕與任務統計
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=(0, 8))
         self._run_btn = ctk.CTkButton(row, text="開始 OCR 翻譯", width=160, height=32,
@@ -2774,6 +3248,20 @@ class App(ctk.CTk):
         self._preview_scroll = ctk.CTkScrollableFrame(parent, height=160)
         self._preview_scroll.pack(fill="both", expand=False, padx=14, pady=(0, 10))
 
+    def _refresh_run_tab_summary(self):
+        provider = config.get_default_provider()
+        prov_name = provider.get("name", "（未設定）") if provider else "（未設定）"
+        if provider:
+            models = provider.get("models") or [provider.get("model", "")]
+            model_name = provider.get("selected_model") or (models[0] if models else "（未設定）")
+        else:
+            model_name = "（未設定）"
+        prof, desc = config.resolve_prompt(prov_name, model_name, self._settings)
+        if hasattr(self, "_run_prov_model_label"):
+            self._run_prov_model_label.configure(text=f"🔹 供應商：{prov_name}  ｜  🔹 模型：{model_name}")
+        if hasattr(self, "_run_prompt_label"):
+            self._run_prompt_label.configure(text=f"🔹 套用 Prompt：{desc}")
+
     def _log_line(self, msg: str):
         self.after(0, lambda: self._log.insert("end", msg + "\n"))
         self.after(0, lambda: self._log.see("end"))
@@ -2790,19 +3278,30 @@ class App(ctk.CTk):
             messagebox.showwarning("無任務", "請先在「影片與字幕任務」中設置至少一組畫面轉字幕任務。")
             return
 
+        config.reload_env()
+        self._settings = config.load_settings()
+
         provider = config.get_default_provider()
         if not provider or not provider.get("api_key"):
             provider = self._form_to_provider()
-        if not provider or not provider.get("api_url") or not provider.get("model"):
-            messagebox.showwarning("API 未設定", "請先在「API 設定」填入網址、模型與金鑰。")
+        if not provider or not provider.get("api_url"):
+            messagebox.showwarning("API 未設定", "請先在「API 設定」填入網址與金鑰。")
             return
 
-        self._save_prompts()
+        model_name = provider.get("selected_model") or (provider.get("models")[0] if provider.get("models") else "")
+        if not model_name:
+            messagebox.showwarning("模型未設定", "請先在「API 設定」中新增並選擇模型。")
+            return
+
+        # 解析適用的 Prompt 方案 (專用優先，無則回退預設公版)
+        prompt_prof, prompt_desc = config.resolve_prompt(provider.get("name", ""), model_name, self._settings)
         cfg = ProviderCfg.from_dict(provider)
-        sys_prompt = self._sys_box.get("1.0", "end").strip("\n") or config.DEFAULT_SYSTEM_PROMPT
-        usr_prompt = self._usr_box.get("1.0", "end").strip("\n") or config.DEFAULT_USER_PROMPT
-        lang = self._current_lang()
+        sys_prompt = prompt_prof.get("system_prompt") or config.DEFAULT_SYSTEM_PROMPT
+        usr_prompt = prompt_prof.get("user_prompt") or config.DEFAULT_USER_PROMPT
+        lang = prompt_prof.get("target_lang_custom") or prompt_prof.get("target_lang") or config.DEFAULT_TARGET_LANG
         max_side = int(self._settings.get("image_max_side", 1568))
+
+        self._refresh_run_tab_summary()
 
         self._log.delete("1.0", "end")
         for w in self._preview_scroll.winfo_children():
@@ -2814,10 +3313,12 @@ class App(ctk.CTk):
         def work():
             total = len(self._tasks)
             self._log_line(f"開始批次 OCR 翻譯，共 {total} 組任務...")
+            self._log_line(f"使用供應商：{provider.get('name')} ｜ 模型：{model_name}")
+            self._log_line(f"套用 Prompt：{prompt_desc}")
             for i, task in enumerate(self._tasks, 1):
                 task.status = "翻譯中"
                 self.after(0, self._render_tasks_list)
-                scope = f"框選區域" if task.crop_box else "全畫面"
+                scope = "框選區域" if task.crop_box else "全畫面"
                 self._log_line(f"[{i}/{total}] {task.start_ts} → {task.end_ts} ({scope})")
 
                 try:
@@ -2953,7 +3454,7 @@ class App(ctk.CTk):
 def main():
     parser = argparse.ArgumentParser(
         prog="PicTrans2Srt",
-        description="Video OCR, Subtitle Translation & Player (v1.06)",
+        description="Video OCR, Subtitle Translation & Player (v1.07)",
     )
     parser.add_argument(
         "video_file",

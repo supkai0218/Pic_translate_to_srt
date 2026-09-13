@@ -25,11 +25,14 @@ class ProviderCfg:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ProviderCfg":
+        model = d.get("selected_model") or d.get("model", "")
+        if isinstance(model, list):
+            model = model[0] if model else ""
         return cls(
             name=d.get("name", ""),
             api_url=d.get("api_url", "").strip(),
             api_key=d.get("api_key", "").strip(),
-            model=d.get("model", "").strip(),
+            model=str(model).strip(),
         )
 
 

@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv, set_key
@@ -34,6 +35,7 @@ def _env_var_name_for(name: str) -> str:
     """Provider name → env-var name, e.g. 'Openrouter' → 'API_KEY_OPENROUTER'."""
     sanitized = re.sub(r"[^A-Z0-9]", "_", (name or "").upper()).strip("_")
     return f"{API_KEY_PREFIX}{sanitized}" if sanitized else f"{API_KEY_PREFIX}PROVIDER"
+
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一個專業的字幕 OCR 與翻譯助手。請辨識圖片畫面中所有可見的文字，"
@@ -78,6 +80,67 @@ DEFAULT_KEYBINDINGS: dict = {
     "hot_reload_sub": "F5",
 }
 
+# 內建常用供應商範本 (Presets)
+PROVIDER_PRESETS: list[dict] = [
+    {
+        "name": "OpenAI",
+        "api_url": "https://api.openai.com/v1/chat/completions",
+        "models": ["gpt-4o", "gpt-4o-mini"],
+        "selected_model": "gpt-4o",
+    },
+    {
+        "name": "OpenRouter",
+        "api_url": "https://openrouter.ai/api/v1/chat/completions",
+        "models": ["google/gemini-2.0-flash-001", "deepseek/deepseek-chat"],
+        "selected_model": "google/gemini-2.0-flash-001",
+    },
+    {
+        "name": "DeepSeek",
+        "api_url": "https://api.deepseek.com/chat/completions",
+        "models": ["deepseek-chat"],
+        "selected_model": "deepseek-chat",
+    },
+    {
+        "name": "SiliconFlow (矽基流動)",
+        "api_url": "https://api.siliconflow.cn/v1/chat/completions",
+        "models": ["Qwen/Qwen2.5-VL-72B-Instruct"],
+        "selected_model": "Qwen/Qwen2.5-VL-72B-Instruct",
+    },
+    {
+        "name": "Groq",
+        "api_url": "https://api.groq.com/openai/v1/chat/completions",
+        "models": ["llama-3.2-11b-vision-preview"],
+        "selected_model": "llama-3.2-11b-vision-preview",
+    },
+    {
+        "name": "本地 Ollama",
+        "api_url": "http://localhost:11434/v1/chat/completions",
+        "models": ["qwen2.5-vl:7b"],
+        "selected_model": "qwen2.5-vl:7b",
+    },
+    {
+        "name": "本地 LM Studio",
+        "api_url": "http://localhost:1234/v1/chat/completions",
+        "models": ["local-model"],
+        "selected_model": "local-model",
+    },
+]
+
+DEFAULT_PROMPT_PROFILES: list[dict] = [
+    {
+        "id": "global_default",
+        "name": "預設通用公版",
+        "scope": "global",            # "global" | "model_bound"
+        "bound_provider": "",
+        "bound_model": "",
+        "target_lang": DEFAULT_TARGET_LANG,
+        "target_lang_custom": "",
+        "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "user_prompt": DEFAULT_USER_PROMPT,
+        "is_builtin": True,
+    }
+]
+
 _DEFAULTS: dict = {
     "providers": [
         {
@@ -85,11 +148,14 @@ _DEFAULTS: dict = {
             "api_url": "https://api.openai.com/v1/chat/completions",
             "api_key": "",
             "api_key_env": "API_KEY_OPENAI",
-            "model": "gpt-4o",
+            "models": ["gpt-4o", "gpt-4o-mini"],
+            "selected_model": "gpt-4o",
             "is_default": True,
         }
     ],
     "default_provider": "OpenAI",
+    "prompt_profiles": DEFAULT_PROMPT_PROFILES,
+    "active_global_prompt_id": "global_default",
     "target_lang": DEFAULT_TARGET_LANG,
     "target_lang_custom": "",
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
@@ -147,6 +213,75 @@ def _migrate_secrets(settings: dict) -> bool:
     return changed
 
 
+def _migrate_v107(settings: dict) -> bool:
+    """Migrate older settings format (single model string, missing prompt_profiles) to v1.07.
+    Returns True if changes were made and need saving."""
+    changed = False
+
+    # 1. Migrate providers: model -> models + selected_model
+    for p in settings.get("providers", []):
+        old_model = p.get("model")
+        if "models" not in p or not isinstance(p["models"], list) or not p["models"]:
+            p["models"] = [old_model] if old_model else ["gpt-4o"]
+            changed = True
+        if "selected_model" not in p or not p["selected_model"]:
+            p["selected_model"] = old_model if (old_model and old_model in p["models"]) else p["models"][0]
+            changed = True
+
+    # 2. Migrate prompt_profiles
+    if "prompt_profiles" not in settings or not settings["prompt_profiles"]:
+        sys_p = settings.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+        usr_p = settings.get("user_prompt") or DEFAULT_USER_PROMPT
+        lang = settings.get("target_lang") or DEFAULT_TARGET_LANG
+        lang_cust = settings.get("target_lang_custom") or ""
+        default_prof = {
+            "id": "global_default",
+            "name": "預設通用公版",
+            "scope": "global",
+            "bound_provider": "",
+            "bound_model": "",
+            "target_lang": lang,
+            "target_lang_custom": lang_cust,
+            "system_prompt": sys_p,
+            "user_prompt": usr_p,
+            "is_builtin": True,
+        }
+        settings["prompt_profiles"] = [default_prof]
+        settings["active_global_prompt_id"] = "global_default"
+        changed = True
+    elif "active_global_prompt_id" not in settings or not settings["active_global_prompt_id"]:
+        for p in settings["prompt_profiles"]:
+            if p.get("scope") == "global":
+                settings["active_global_prompt_id"] = p["id"]
+                changed = True
+                break
+        else:
+            settings["active_global_prompt_id"] = settings["prompt_profiles"][0]["id"]
+            changed = True
+
+    return changed
+
+
+def reload_env() -> None:
+    """Reload environment variables from .env with override=True."""
+    if DOTENV_PATH.exists():
+        load_dotenv(DOTENV_PATH, override=True)
+
+
+def open_env_in_editor() -> None:
+    """Open .env in Windows Notepad (creates the file if missing)."""
+    if not DOTENV_PATH.exists():
+        DOTENV_PATH.write_text("# API Keys\n", encoding="utf-8")
+    try:
+        import subprocess
+        subprocess.Popen(["notepad.exe", str(DOTENV_PATH)])
+    except Exception:
+        try:
+            os.startfile(str(DOTENV_PATH))
+        except Exception:
+            pass
+
+
 def load_settings() -> dict:
     """Load settings, creating the file with defaults on first run and merging
     in any new default keys that an older file is missing. Migrates any
@@ -161,8 +296,10 @@ def load_settings() -> dict:
         except (json.JSONDecodeError, OSError):
             data = {}
     settings = _deep_merge(_DEFAULTS, data)
-    if _migrate_secrets(settings):
-        save_settings(settings)  # persist the now-cleaned file
+    migrated_sec = _migrate_secrets(settings)
+    migrated_v107 = _migrate_v107(settings)
+    if migrated_sec or migrated_v107:
+        save_settings(settings)  # persist the now-cleaned and upgraded file
     _resolve_keys(settings)
     return settings
 
@@ -218,6 +355,15 @@ def upsert_provider(provider: dict) -> None:
         set_key(str(DOTENV_PATH), env, key)
         os.environ[env] = key
     provider["api_key"] = ""  # never persist the secret in settings.json
+
+    # ensure models and selected_model
+    models = provider.get("models")
+    if not models:
+        m = provider.get("model", "").strip()
+        provider["models"] = [m] if m else ["gpt-4o"]
+    if not provider.get("selected_model"):
+        provider["selected_model"] = provider["models"][0]
+
     for i, p in enumerate(providers):
         if p.get("name") == name:
             providers[i] = provider
@@ -242,3 +388,118 @@ def delete_provider(name: str) -> None:
         if providers:
             providers[0]["is_default"] = True
     save_settings(s)
+
+
+def add_model_to_provider(provider_name: str, model_name: str) -> None:
+    s = load_settings()
+    for p in s.get("providers", []):
+        if p.get("name") == provider_name:
+            models = p.setdefault("models", [])
+            if model_name not in models:
+                models.append(model_name)
+            p["selected_model"] = model_name
+            break
+    save_settings(s)
+
+
+def delete_model_from_provider(provider_name: str, model_name: str) -> None:
+    s = load_settings()
+    for p in s.get("providers", []):
+        if p.get("name") == provider_name:
+            models = [m for m in p.get("models", []) if m != model_name]
+            p["models"] = models
+            if p.get("selected_model") == model_name:
+                p["selected_model"] = models[0] if models else ""
+            break
+    save_settings(s)
+
+
+def select_provider_model(provider_name: str, model_name: str) -> None:
+    s = load_settings()
+    for p in s.get("providers", []):
+        if p.get("name") == provider_name:
+            p["selected_model"] = model_name
+            break
+    save_settings(s)
+
+
+# --- prompt profile helpers -----------------------------------------------
+
+def get_prompt_profiles() -> list[dict]:
+    return load_settings().get("prompt_profiles", [])
+
+
+def get_active_global_prompt() -> dict:
+    s = load_settings()
+    active_id = s.get("active_global_prompt_id", "global_default")
+    profiles = s.get("prompt_profiles", [])
+    for p in profiles:
+        if p.get("scope") == "global" and p.get("id") == active_id:
+            return p
+    for p in profiles:
+        if p.get("scope") == "global":
+            return p
+    return DEFAULT_PROMPT_PROFILES[0]
+
+
+def set_active_global_prompt(prompt_id: str) -> None:
+    s = load_settings()
+    s["active_global_prompt_id"] = prompt_id
+    save_settings(s)
+
+
+def upsert_prompt_profile(profile: dict) -> None:
+    s = load_settings()
+    profiles = s.setdefault("prompt_profiles", [])
+    pid = profile.get("id", "").strip()
+    if not pid:
+        pid = f"prompt_{uuid.uuid4().hex[:8]}"
+        profile["id"] = pid
+    for i, p in enumerate(profiles):
+        if p.get("id") == pid:
+            profiles[i] = profile
+            break
+    else:
+        profiles.append(profile)
+    save_settings(s)
+
+
+def delete_prompt_profile(profile_id: str) -> None:
+    s = load_settings()
+    profiles = [p for p in s.get("prompt_profiles", []) if p.get("id") != profile_id]
+    s["prompt_profiles"] = profiles
+    if s.get("active_global_prompt_id") == profile_id:
+        globals_left = [p for p in profiles if p.get("scope") == "global"]
+        s["active_global_prompt_id"] = globals_left[0]["id"] if globals_left else ""
+    save_settings(s)
+
+
+def resolve_prompt(provider_name: str, model_name: str, settings: dict | None = None) -> tuple[dict, str]:
+    """Resolve prompt based on provider and model.
+    Returns: (prompt_profile_dict, description_text)
+    1. Priority: Model-bound prompt matching (provider_name, model_name).
+    2. Fallback: Active global prompt.
+    3. Final fallback: DEFAULT_PROMPT_PROFILES[0].
+    """
+    if settings is None:
+        settings = load_settings()
+    profiles = settings.get("prompt_profiles", [])
+
+    # 1. Check model-bound prompt
+    for p in profiles:
+        if p.get("scope") == "model_bound":
+            if p.get("bound_provider") == provider_name and p.get("bound_model") == model_name:
+                return p, f"[專用] {p.get('name', '未命名')}"
+
+    # 2. Check active global prompt
+    active_id = settings.get("active_global_prompt_id")
+    for p in profiles:
+        if p.get("scope") == "global" and p.get("id") == active_id:
+            return p, f"[公版] {p.get('name', '未命名')}"
+
+    # 3. Fallback to any global
+    for p in profiles:
+        if p.get("scope") == "global":
+            return p, f"[公版] {p.get('name', '未命名')}"
+
+    return DEFAULT_PROMPT_PROFILES[0], "[公版] 預設通用公版"
