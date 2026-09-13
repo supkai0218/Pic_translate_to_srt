@@ -12,11 +12,21 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+    INTERNAL_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR)).resolve()
+else:
+    APP_DIR = Path(__file__).resolve().parent
+    INTERNAL_DIR = APP_DIR
 
 # Check for local VLC binaries in vlc or vlc_core
 _LOCAL_VLC_DIR = None
-for candidate in (BASE_DIR / "vlc_core", BASE_DIR / "vlc"):
+for candidate in (
+    APP_DIR / "vlc_core",
+    APP_DIR / "vlc",
+    INTERNAL_DIR / "vlc_core",
+    INTERNAL_DIR / "vlc",
+):
     if candidate.is_dir() and (candidate / "libvlc.dll").is_file():
         _LOCAL_VLC_DIR = candidate
         break
@@ -30,14 +40,17 @@ if _LOCAL_VLC_DIR is not None:
         except Exception:
             pass
 
-# Temporarily exclude current working directory from sys.path to avoid
-# namespace package shadowing when the folder is named 'vlc'
-_saved_sys_path = list(sys.path)
-try:
-    sys.path = [p for p in sys.path if p not in ("", ".", str(BASE_DIR), str(Path.cwd()))]
+if getattr(sys, "frozen", False):
     import vlc
-finally:
-    sys.path = _saved_sys_path
+else:
+    # Temporarily exclude current working directory from sys.path to avoid
+    # namespace package shadowing when the folder is named 'vlc'
+    _saved_sys_path = list(sys.path)
+    try:
+        sys.path = [p for p in sys.path if p not in ("", ".", str(APP_DIR), str(Path.cwd()))]
+        import vlc
+    finally:
+        sys.path = _saved_sys_path
 
 
 def is_vlc_available() -> bool:

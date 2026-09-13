@@ -1,11 +1,14 @@
-"""Video OCR → translate → SRT generator/inserter (v1.04).
+"""Video OCR → translate → SRT generator/inserter (v1.06).
 
 Run: python app.py
+Or: PicTrans2Srt.exe [video_path] [-s srt_path] [--play]
 """
 from __future__ import annotations
 
+import argparse
 import os
 import re
+import sys
 import threading
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -138,9 +141,14 @@ class SubtitleTask:
 
 
 class App(ctk.CTk):
-    def __init__(self):
+    def __init__(
+        self,
+        initial_video: Optional[str] = None,
+        initial_srt: Optional[str] = None,
+        autoplay: bool = False,
+    ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.04)")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.06)")
         self.geometry("1160x820")
         self.minsize(980, 680)
 
@@ -242,6 +250,40 @@ class App(ctk.CTk):
         self._sync_api_form()
         self.bind_all("<KeyPress>", self._on_global_key_press)
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
+        if initial_video:
+            self.after(200, lambda: self._startup_load(initial_video, initial_srt, autoplay))
+
+    def _startup_load(
+        self,
+        video_path: str,
+        srt_path: Optional[str] = None,
+        autoplay: bool = False,
+    ):
+        if not video_path:
+            return
+        p = Path(video_path)
+        if not p.is_file():
+            self._log_line(f"啟動參數指定的影片不存在：{video_path}")
+            return
+
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+        self._load_video(str(p.resolve()))
+
+        if srt_path:
+            s = Path(srt_path)
+            if s.is_file():
+                self._load_srt(str(s.resolve()))
+            else:
+                self._log_line(f"啟動參數指定的字幕不存在：{srt_path}")
+
+        if autoplay:
+            self.after(150, self._start_play)
 
     # ------------------------------------------------------------------ #
     #  Tab 1: Pure Media Player & Live Subtitle Editor (v1.04)
@@ -2116,18 +2158,23 @@ class App(ctk.CTk):
         )
         if not p:
             return
-        self._srt_path = p
-        self._settings["last_srt_path"] = p
-        config.patch_setting("last_srt_path", p)
-        self._srt_var.set(p)
+        self._load_srt(p)
+
+    def _load_srt(self, p: str):
+        if not p or not os.path.exists(p):
+            return
+        self._srt_path = str(p)
+        self._settings["last_srt_path"] = self._srt_path
+        config.patch_setting("last_srt_path", self._srt_path)
+        self._srt_var.set(self._srt_path)
         try:
-            self._srt_entries = srt_utils.parse_srt(p)
+            self._srt_entries = srt_utils.parse_srt(self._srt_path)
         except Exception as exc:
             self._srt_var.set(f"解析失敗：{exc}")
             self._srt_entries = []
 
         if hasattr(self, "_player_srt_var"):
-            self._player_srt_var.set(p)
+            self._player_srt_var.set(self._srt_path)
 
         if self._vlc_player and self._srt_path:
             self._vlc_player.set_subtitle_file(self._srt_path)
@@ -2904,7 +2951,61 @@ class App(ctk.CTk):
 
 
 def main():
-    app = App()
+    parser = argparse.ArgumentParser(
+        prog="PicTrans2Srt",
+        description="Video OCR, Subtitle Translation & Player (v1.06)",
+    )
+    parser.add_argument(
+        "video_file",
+        nargs="?",
+        default=None,
+        help="影片檔案路徑 (亦支援直接將影片拖曳至程式圖示開啟)",
+    )
+    parser.add_argument(
+        "-v", "--video",
+        dest="video_opt",
+        default=None,
+        help="指定影片檔案路徑",
+    )
+    parser.add_argument(
+        "-s", "--srt",
+        dest="srt_file",
+        default=None,
+        help="指定字幕檔案路徑 (若省略則自動搜尋同目錄下同名/相符的 .srt)",
+    )
+    parser.add_argument(
+        "-p", "--play",
+        dest="autoplay",
+        action="store_true",
+        default=None,
+        help="載入後自動開始播放",
+    )
+    parser.add_argument(
+        "--no-play",
+        dest="no_play",
+        action="store_true",
+        help="載入後保持暫停狀態",
+    )
+
+    args = parser.parse_args()
+
+    video_path = args.video_opt or args.video_file
+    srt_path = args.srt_file
+    autoplay = False
+    if video_path:
+        if args.no_play:
+            autoplay = False
+        elif args.autoplay is not None:
+            autoplay = args.autoplay
+        else:
+            # 外部傳入影片預設自動播放
+            autoplay = True
+
+    app = App(
+        initial_video=video_path,
+        initial_srt=srt_path,
+        autoplay=autoplay,
+    )
     app.mainloop()
 
 

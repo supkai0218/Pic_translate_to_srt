@@ -11,11 +11,16 @@ import copy
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv, set_key
 
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+
 SETTINGS_FILE = BASE_DIR / "settings.json"
 DOTENV_PATH = BASE_DIR / ".env"
 
