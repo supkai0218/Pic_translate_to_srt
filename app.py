@@ -1,4 +1,4 @@
-"""Video OCR → translate → SRT generator/inserter (v1.08).
+"""Video OCR → translate → SRT generator/inserter (v1.09).
 
 Run: python app.py
 Or: PicTrans2Srt.exe [video_path] [-s srt_path] [--play]
@@ -148,7 +148,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.08)")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.09)")
         self.geometry("1160x820")
         self.minsize(980, 680)
 
@@ -187,11 +187,18 @@ class App(ctk.CTk):
         self._inline_edit_item: Optional[str] = None
         self._inline_edit_idx: Optional[int] = None
 
+        # Volume initialization from persistent settings
+        saved_vol = self._settings.get("last_volume", 80)
+        try:
+            saved_vol = max(0, min(100, int(saved_vol)))
+        except Exception:
+            saved_vol = 80
+
         # VLC Player (Hardware accelerated audio/video playback engine)
         self._vlc_player: Optional[VLCPlayer] = None
         if is_vlc_available():
             try:
-                self._vlc_player = VLCPlayer()
+                self._vlc_player = VLCPlayer(initial_volume=saved_vol)
             except Exception:
                 self._vlc_player = None
 
@@ -199,10 +206,11 @@ class App(ctk.CTk):
         if self._vlc_player:
             self._vlc_player.set_subtitle_visible(self._sub_render_var.get())
 
-        self._volume_var = ctk.DoubleVar(value=80.0)
+        self._volume_var = ctk.DoubleVar(value=float(saved_vol))
         self._playback_rate_var = ctk.StringVar(value="1.0x")
-        self._is_muted: bool = False
+        self._is_muted: bool = (saved_vol == 0)
         self._active_display_mode: str = "canvas"  # "vlc" | "canvas"
+        self._vol_save_timer: Optional[str] = None
 
         # Range & Crop State
         self._start_sec: float = 0.0
@@ -408,8 +416,9 @@ class App(ctk.CTk):
         audio_row = ctk.CTkFrame(ctl_frame, fg_color="transparent")
         audio_row.pack(fill="x", pady=(2, 2))
 
+        init_mute_icon = "🔇" if self._is_muted else "🔊"
         self._player_mute_btn = ctk.CTkButton(
-            audio_row, text="🔊", width=36, height=26, font=FONT_SMALL,
+            audio_row, text=init_mute_icon, width=36, height=26, font=FONT_SMALL,
             command=self._toggle_mute)
         self._player_mute_btn.pack(side="left", padx=(0, 4))
 
@@ -419,7 +428,7 @@ class App(ctk.CTk):
         self._player_volume_slider.pack(side="left", padx=(0, 6))
 
         self._player_volume_label = ctk.CTkLabel(
-            audio_row, text="80%", font=FONT_SMALL, width=38, anchor="w")
+            audio_row, text=f"{int(self._volume_var.get())}%", font=FONT_SMALL, width=38, anchor="w")
         self._player_volume_label.pack(side="left", padx=(0, 8))
 
         ctk.CTkLabel(audio_row, text="倍速：", font=FONT_SMALL).pack(side="left")
@@ -1284,8 +1293,9 @@ class App(ctk.CTk):
         audio_row = ctk.CTkFrame(ctl_frame, fg_color="transparent")
         audio_row.pack(fill="x", pady=(2, 2))
 
+        init_mute_icon = "🔇" if self._is_muted else "🔊"
         self._mute_btn = ctk.CTkButton(
-            audio_row, text="🔊", width=36, height=26, font=FONT_SMALL,
+            audio_row, text=init_mute_icon, width=36, height=26, font=FONT_SMALL,
             command=self._toggle_mute)
         self._mute_btn.pack(side="left", padx=(0, 4))
 
@@ -1295,7 +1305,7 @@ class App(ctk.CTk):
         self._volume_slider.pack(side="left", padx=(0, 6))
 
         self._volume_label = ctk.CTkLabel(
-            audio_row, text="80%", font=FONT_SMALL, width=38, anchor="w")
+            audio_row, text=f"{int(self._volume_var.get())}%", font=FONT_SMALL, width=38, anchor="w")
         self._volume_label.pack(side="left", padx=(0, 10))
 
         ctk.CTkLabel(audio_row, text="倍速：", font=FONT_SMALL).pack(side="left")
@@ -1771,6 +1781,24 @@ class App(ctk.CTk):
         else:
             self._stop_play()
 
+    def _schedule_save_volume(self, vol: int):
+        """Debounce writing volume changes to settings.json (500ms delay)."""
+        if hasattr(self, "_vol_save_timer") and self._vol_save_timer:
+            try:
+                self.after_cancel(self._vol_save_timer)
+            except Exception:
+                pass
+            self._vol_save_timer = None
+
+        def _do_save():
+            self._vol_save_timer = None
+            try:
+                config.patch_setting("last_volume", vol)
+            except Exception:
+                pass
+
+        self._vol_save_timer = self.after(500, _do_save)
+
     def _on_volume_change(self, val):
         vol = int(float(val))
         if hasattr(self, "_volume_label"):
@@ -1797,6 +1825,9 @@ class App(ctk.CTk):
             if hasattr(self, "_player_mute_btn"):
                 self._player_mute_btn.configure(text="🔊")
 
+        self._settings["last_volume"] = vol
+        self._schedule_save_volume(vol)
+
     def _toggle_mute(self):
         if self._vlc_player:
             is_muted = self._vlc_player.toggle_mute()
@@ -1817,6 +1848,8 @@ class App(ctk.CTk):
                 self._mute_btn.configure(text=icon)
             if hasattr(self, "_player_mute_btn"):
                 self._player_mute_btn.configure(text=icon)
+            self._settings["last_volume"] = vol
+            self._schedule_save_volume(vol)
         else:
             self._is_muted = not self._is_muted
             icon = "🔇" if self._is_muted else "🔊"
@@ -3496,6 +3529,12 @@ class App(ctk.CTk):
     #  Window Cleanup
     # ------------------------------------------------------------------ #
     def _on_window_close(self):
+        try:
+            if hasattr(self, "_volume_var"):
+                vol = int(float(self._volume_var.get()))
+                config.patch_setting("last_volume", vol)
+        except Exception:
+            pass
         self.destroy()
 
     def destroy(self):
@@ -3518,7 +3557,7 @@ class App(ctk.CTk):
 def main():
     parser = argparse.ArgumentParser(
         prog="PicTrans2Srt",
-        description="Video OCR, Subtitle Translation & Player (v1.08)",
+        description="Video OCR, Subtitle Translation & Player (v1.09)",
     )
     parser.add_argument(
         "video_file",

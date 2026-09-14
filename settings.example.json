@@ -42,5 +42,6 @@
   "last_video_path": "",
   "last_srt_path": "",
   "appearance_mode": "dark",
-  "sub_render_enabled": true
+  "sub_render_enabled": true,
+  "last_volume": 80
 }

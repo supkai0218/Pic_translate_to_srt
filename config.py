@@ -172,6 +172,7 @@ _DEFAULTS: dict = {
     "keybindings": DEFAULT_KEYBINDINGS,
     "appearance_mode": "dark",
     "sub_render_enabled": True,
+    "last_volume": 80,
 }
 
 

@@ -78,7 +78,7 @@ class VLCPlayerError(RuntimeError):
 
 
 class VLCPlayer:
-    def __init__(self):
+    def __init__(self, initial_volume: int = 80):
         if not is_vlc_available():
             raise VLCPlayerError("LibVLC 核心未正確載入，請確認 vlc 目錄內包含 libvlc.dll 與 plugins。")
 
@@ -93,11 +93,19 @@ class VLCPlayer:
         self._hwnd: Optional[int] = None
         self._media_path: str = ""
         self._srt_path: str = ""
-        self._is_muted: bool = False
-        self._last_volume: int = 80
-        self._volume: int = 80
+        init_vol = max(0, min(100, int(initial_volume)))
+        self._volume: int = init_vol
+        self._last_volume: int = init_vol if init_vol > 0 else 80
+        self._is_muted: bool = (init_vol == 0)
         self._subtitle_visible: bool = True
         self._last_spu: int = -1
+
+        # Apply initial audio parameters & sync mute state with OS
+        try:
+            self._player.audio_set_volume(0 if self._is_muted else self._volume)
+            self._player.audio_set_mute(self._is_muted)
+        except Exception:
+            pass
 
     def bind_window(self, hwnd: int, start_sec: Optional[float] = None, is_playing: Optional[bool] = None) -> None:
         """Bind native Windows HWND to VLC player with vout re-creation if switching."""
@@ -120,6 +128,7 @@ class VLCPlayer:
                     self._player.video_set_mouse_input(False)
                     self._player.video_set_key_input(False)
                     self._player.audio_set_volume(0 if self._is_muted else self._volume)
+                    self._player.audio_set_mute(self._is_muted)
                     if cur_rate > 0:
                         self._player.set_rate(cur_rate)
                 except Exception:
@@ -187,6 +196,13 @@ class VLCPlayer:
         # Re-bind HWND if previously set
         if self._hwnd and sys.platform.startswith("win"):
             self._player.set_hwnd(self._hwnd)
+
+        # Synchronize audio volume and mute status with Windows audio session
+        try:
+            self._player.audio_set_volume(0 if self._is_muted else self._volume)
+            self._player.audio_set_mute(self._is_muted)
+        except Exception:
+            pass
 
     def is_subtitle_visible(self) -> bool:
         """Check if subtitle overlay rendering is currently enabled."""
@@ -260,6 +276,11 @@ class VLCPlayer:
 
     def play(self) -> bool:
         """Start or resume playback."""
+        if not self._is_muted and self._volume > 0:
+            try:
+                self._player.audio_set_mute(False)
+            except Exception:
+                pass
         res = self._player.play()
         return res == 0
 
@@ -326,7 +347,7 @@ class VLCPlayer:
         return self._volume
 
     def set_volume(self, volume: int) -> None:
-        """Set audio volume (0-100)."""
+        """Set audio volume (0-100) and sync mute state with OS."""
         vol = max(0, min(100, int(volume)))
         self._volume = vol
         try:
@@ -336,8 +357,16 @@ class VLCPlayer:
         if vol > 0:
             self._last_volume = vol
             self._is_muted = False
+            try:
+                self._player.audio_set_mute(False)
+            except Exception:
+                pass
         else:
             self._is_muted = True
+            try:
+                self._player.audio_set_mute(True)
+            except Exception:
+                pass
 
     def toggle_mute(self) -> bool:
         """Toggle mute state. Returns True if now muted."""
