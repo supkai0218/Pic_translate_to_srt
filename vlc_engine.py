@@ -96,6 +96,8 @@ class VLCPlayer:
         self._is_muted: bool = False
         self._last_volume: int = 80
         self._volume: int = 80
+        self._subtitle_visible: bool = True
+        self._last_spu: int = -1
 
     def bind_window(self, hwnd: int, start_sec: Optional[float] = None, is_playing: Optional[bool] = None) -> None:
         """Bind native Windows HWND to VLC player with vout re-creation if switching."""
@@ -139,6 +141,11 @@ class VLCPlayer:
                                 except Exception:
                                     pass
                                 if has_vo:
+                                    if not self._subtitle_visible:
+                                        try:
+                                            pl.video_set_spu(-1)
+                                        except Exception:
+                                            pass
                                     if t > 0:
                                         pl.set_time(int(round(t * 1000.0)))
                                     if not playing:
@@ -155,9 +162,13 @@ class VLCPlayer:
         self._srt_path = str(srt_path) if srt_path else ""
 
         media = self._instance.media_new(self._media_path)
+        # Fix for .ts, .m2ts, .mts container playback: use avformat (FFmpeg) demuxer
+        ext = Path(self._media_path).suffix.lower()
+        if ext in (".ts", ".m2ts", ".mts"):
+            media.add_option(":demux=avformat")
         if start_time > 0:
             media.add_option(f"start-time={start_time:.3f}")
-        if self._srt_path and os.path.isfile(self._srt_path):
+        if self._srt_path and os.path.isfile(self._srt_path) and self._subtitle_visible:
             try:
                 mrl = self._srt_path.replace("\\", "/")
                 if not mrl.startswith("file:///"):
@@ -177,12 +188,47 @@ class VLCPlayer:
         if self._hwnd and sys.platform.startswith("win"):
             self._player.set_hwnd(self._hwnd)
 
+    def is_subtitle_visible(self) -> bool:
+        """Check if subtitle overlay rendering is currently enabled."""
+        return self._subtitle_visible
+
+    def set_subtitle_visible(self, visible: bool) -> None:
+        """Enable or disable subtitle overlay rendering on the video display."""
+        self._subtitle_visible = bool(visible)
+        if not self._subtitle_visible:
+            try:
+                cur_spu = self._player.video_get_spu()
+                if cur_spu > 0:
+                    self._last_spu = cur_spu
+                self._player.video_set_spu(-1)
+            except Exception:
+                pass
+        else:
+            try:
+                target_spu = self._last_spu if self._last_spu > 0 else 1
+                self._player.video_set_spu(target_spu)
+            except Exception:
+                pass
+            try:
+                cur_spu = self._player.video_get_spu()
+                if cur_spu <= 0 and self._srt_path and os.path.isfile(self._srt_path):
+                    self.set_subtitle_file(self._srt_path)
+            except Exception:
+                pass
+
+    def toggle_subtitle_visible(self) -> bool:
+        """Toggle subtitle overlay rendering. Returns the new state."""
+        self.set_subtitle_visible(not self._subtitle_visible)
+        return self._subtitle_visible
+
     def set_subtitle_file(self, srt_path: str | Path) -> bool:
         """Set or hot-reload an external SRT subtitle file."""
         p = str(srt_path)
         if not os.path.isfile(p):
             return False
         self._srt_path = p
+        if not self._subtitle_visible:
+            return True
         if self._player.is_playing():
             try:
                 ok = self._player.video_set_subtitle_file(p)
@@ -237,6 +283,10 @@ class VLCPlayer:
             self._player.stop()
         except Exception:
             pass
+
+    def release(self) -> None:
+        """Stop playback and release player resources."""
+        self.stop()
 
     def is_playing(self) -> bool:
         """Return True if media is actively playing."""

@@ -41,5 +41,6 @@
   "last_video_dir": "",
   "last_video_path": "",
   "last_srt_path": "",
-  "appearance_mode": "dark"
+  "appearance_mode": "dark",
+  "sub_render_enabled": true
 }

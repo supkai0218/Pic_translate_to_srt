@@ -1,4 +1,4 @@
-"""PyInstaller automated build script for PicTrans2Srt (v1.07).
+"""PyInstaller automated build script for PicTrans2Srt (v1.08).
 
 Builds a standalone, portable Windows directory distribution (--onedir):
 - PicTrans2Srt.exe
@@ -122,7 +122,7 @@ def print_summary():
     exe_file = TARGET_DIR / "PicTrans2Srt.exe"
     print("\n" + "=" * 60)
     if exe_file.is_file():
-        print("  PicTrans2Srt (v1.07) 打包建置成功！")
+        print("  PicTrans2Srt (v1.08) 打包建置成功！")
         print(f"  執行檔位置: {exe_file}")
         print("=" * 60)
         print("發布目錄內容確認：")

@@ -171,6 +171,7 @@ _DEFAULTS: dict = {
     "step_settings": DEFAULT_STEP_SETTINGS,
     "keybindings": DEFAULT_KEYBINDINGS,
     "appearance_mode": "dark",
+    "sub_render_enabled": True,
 }
 
 

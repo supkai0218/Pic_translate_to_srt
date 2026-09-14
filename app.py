@@ -1,4 +1,4 @@
-"""Video OCR → translate → SRT generator/inserter (v1.07).
+"""Video OCR → translate → SRT generator/inserter (v1.08).
 
 Run: python app.py
 Or: PicTrans2Srt.exe [video_path] [-s srt_path] [--play]
@@ -148,7 +148,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.07)")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.08)")
         self.geometry("1160x820")
         self.minsize(980, 680)
 
@@ -194,6 +194,10 @@ class App(ctk.CTk):
                 self._vlc_player = VLCPlayer()
             except Exception:
                 self._vlc_player = None
+
+        self._sub_render_var = ctk.BooleanVar(value=bool(self._settings.get("sub_render_enabled", True)))
+        if self._vlc_player:
+            self._vlc_player.set_subtitle_visible(self._sub_render_var.get())
 
         self._volume_var = ctk.DoubleVar(value=80.0)
         self._playback_rate_var = ctk.StringVar(value="1.0x")
@@ -315,11 +319,18 @@ class App(ctk.CTk):
         ctk.CTkLabel(s_row, textvariable=self._player_srt_var, font=FONT_SMALL,
                      anchor="w", text_color=("gray40", "#9aa0a6")).pack(side="left", fill="x", expand=True, padx=(8, 8))
 
+        ctk.CTkButton(s_row, text="清除", width=60, height=26,
+                      font=FONT_SMALL, command=self._clear_srt).pack(side="right", padx=(0, 4))
         ctk.CTkButton(s_row, text="🔄 重新載入 (Hot Reload)", width=170, height=26,
                       font=FONT_SMALL, fg_color="#1f6aa5", hover_color="#144870",
                       command=self._hot_reload_subtitle).pack(side="right", padx=(4, 4))
-        ctk.CTkButton(s_row, text="清除", width=60, height=26,
-                      font=FONT_SMALL, command=self._clear_srt).pack(side="right", padx=(0, 4))
+        self._sub_render_switch = ctk.CTkSwitch(
+            s_row, text="字幕渲染", font=FONT_SMALL,
+            variable=self._sub_render_var,
+            command=self._on_sub_render_toggle,
+            width=90, height=24,
+        )
+        self._sub_render_switch.pack(side="right", padx=(4, 8))
 
         # Main Draggable Split Container: Left = Video + Controls, Right = Subtitle Viewer & Editor
         self._player_paned = tk.PanedWindow(
@@ -531,21 +542,27 @@ class App(ctk.CTk):
         self._active_tab_name = tab_name
 
         if tab_name == "  影音播放器  ":
-            if self._vlc_player and hasattr(self, "_player_vlc_frame"):
-                self.update_idletasks()
-                self._vlc_player.bind_window(self._player_vlc_frame.winfo_id())
-                self._vlc_player.set_time(self._current_sec)
+            if self._vlc_player:
+                if hasattr(self, "_sub_render_var"):
+                    self._vlc_player.set_subtitle_visible(self._sub_render_var.get())
+                if hasattr(self, "_player_vlc_frame"):
+                    self.update_idletasks()
+                    self._vlc_player.bind_window(self._player_vlc_frame.winfo_id())
+                    self._vlc_player.set_time(self._current_sec)
             self._sync_player_ui()
             self._populate_sub_treeview()
             self._sync_subtitle_highlight()
 
         elif tab_name == "  影片與字幕任務  ":
-            if self._vlc_player and hasattr(self, "_vlc_frame"):
-                self._show_vlc_display()
-                self.update_idletasks()
-                self._vlc_player.bind_window(self._vlc_frame.winfo_id())
-                self._show_canvas_display()
-                self._vlc_player.set_time(self._current_sec)
+            if self._vlc_player:
+                if hasattr(self, "_sub_render_var"):
+                    self._vlc_player.set_subtitle_visible(self._sub_render_var.get())
+                if hasattr(self, "_vlc_frame"):
+                    self._show_vlc_display()
+                    self.update_idletasks()
+                    self._vlc_player.bind_window(self._vlc_frame.winfo_id())
+                    self._show_canvas_display()
+                    self._vlc_player.set_time(self._current_sec)
             self._show_canvas_display()
             if self._video_engine:
                 self._seek_to(self._current_sec)
@@ -566,14 +583,16 @@ class App(ctk.CTk):
         if hasattr(self, "_player_video_label"):
             self._player_video_label.configure(text=filename)
         if hasattr(self, "_player_video_spec_label") and self._video_engine:
-            dur_str = srt_utils.sec_to_ts(self._video_engine.duration_sec)
+            effective_dur = self._video_engine.duration_sec if self._video_engine.duration_sec > 0 else (self._vlc_player.get_duration() if self._vlc_player else 0.0)
+            dur_str = srt_utils.sec_to_ts(effective_dur)
             self._player_video_spec_label.configure(
                 text=f"{self._video_engine.width}x{self._video_engine.height} | {self._video_engine.fps:.2f} FPS | 總長 {dur_str}"
             )
         if hasattr(self, "_player_srt_var"):
             self._player_srt_var.set(self._srt_path or "（未選擇字幕檔案）")
         if hasattr(self, "_player_time_slider") and self._video_engine:
-            self._player_time_slider.configure(to=max(1.0, self._video_engine.duration_sec))
+            effective_dur = self._video_engine.duration_sec if self._video_engine.duration_sec > 0 else (self._vlc_player.get_duration() if self._vlc_player else 0.0)
+            self._player_time_slider.configure(to=max(1.0, effective_dur))
             self._player_time_slider.set(self._current_sec)
         self._update_time_labels()
         self._update_sub_status_label()
@@ -583,14 +602,16 @@ class App(ctk.CTk):
         if hasattr(self, "_video_label"):
             self._video_label.configure(text=filename)
         if hasattr(self, "_video_spec_label") and self._video_engine:
-            dur_str = srt_utils.sec_to_ts(self._video_engine.duration_sec)
+            effective_dur = self._video_engine.duration_sec if self._video_engine.duration_sec > 0 else (self._vlc_player.get_duration() if self._vlc_player else 0.0)
+            dur_str = srt_utils.sec_to_ts(effective_dur)
             self._video_spec_label.configure(
                 text=f"{self._video_engine.width}x{self._video_engine.height} | {self._video_engine.fps:.2f} FPS | 總長 {dur_str}"
             )
         if hasattr(self, "_srt_var"):
             self._srt_var.set(self._srt_path or "（未選擇，將直接匯出新 SRT 檔案）")
         if hasattr(self, "_time_slider") and self._video_engine:
-            self._time_slider.configure(to=max(1.0, self._video_engine.duration_sec))
+            effective_dur = self._video_engine.duration_sec if self._video_engine.duration_sec > 0 else (self._vlc_player.get_duration() if self._vlc_player else 0.0)
+            self._time_slider.configure(to=max(1.0, effective_dur))
             self._time_slider.set(self._current_sec)
         self._update_range_inputs()
         self._update_time_labels()
@@ -1133,6 +1154,14 @@ class App(ctk.CTk):
                 text_color=("#0a7d2c", "#5ec97a")
             )
 
+    def _on_sub_render_toggle(self):
+        enabled = bool(self._sub_render_var.get())
+        if self._vlc_player:
+            self._vlc_player.set_subtitle_visible(enabled)
+        self._settings["sub_render_enabled"] = enabled
+        config.patch_setting("sub_render_enabled", enabled)
+        self._update_sub_status_label()
+
     # ------------------------------------------------------------------ #
     #  Tab 2: Video Player & Subtitle Tasks
     # ------------------------------------------------------------------ #
@@ -1367,7 +1396,7 @@ class App(ctk.CTk):
         path = filedialog.askopenfilename(
             initialdir=initial,
             filetypes=[
-                ("影片檔案", "*.mp4 *.mkv *.avi *.mov *.flv *.wmv *.webm"),
+                ("影片檔案", "*.mp4 *.mkv *.avi *.mov *.flv *.wmv *.webm *.ts *.m2ts *.mts"),
                 ("所有檔案", "*.*")
             ],
             title="選擇影片檔案",
@@ -1451,6 +1480,8 @@ class App(ctk.CTk):
 
         # Initialize/Load VLC Player if available
         if self._vlc_player:
+            if hasattr(self, "_sub_render_var"):
+                self._vlc_player.set_subtitle_visible(self._sub_render_var.get())
             self.update_idletasks()
             if self._active_tab_name == "  影音播放器  " and hasattr(self, "_player_vlc_frame"):
                 self._vlc_player.bind_window(self._player_vlc_frame.winfo_id())
@@ -1465,14 +1496,26 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+            # Fallback duration if VideoEngine couldn't determine it (e.g. MPEG-TS stream without header)
+            if self._video_engine.duration_sec <= 0:
+                vlc_dur = self._vlc_player.get_duration()
+                if vlc_dur > 0:
+                    self._video_engine.duration_sec = vlc_dur
+                    dur_max = max(1.0, vlc_dur)
+                    if hasattr(self, "_time_slider"):
+                        self._time_slider.configure(to=dur_max)
+                    if hasattr(self, "_player_time_slider"):
+                        self._player_time_slider.configure(to=dur_max)
+
         self._populate_sub_treeview()
         self._update_sub_status_label()
         self._sync_player_ui()
 
         # Default start and end
+        effective_dur = self._video_engine.duration_sec if self._video_engine.duration_sec > 0 else (self._vlc_player.get_duration() if self._vlc_player else 0.0)
         self._current_sec = 0.0
         self._start_sec = 0.0
-        self._end_sec = min(2.0, self._video_engine.duration_sec)
+        self._end_sec = min(2.0, effective_dur) if effective_dur > 0 else 2.0
         self._update_range_inputs()
 
         # Remove hint and seek to first frame
@@ -1500,7 +1543,13 @@ class App(ctk.CTk):
     def _seek_to(self, sec: float):
         if not self._video_engine:
             return
-        sec = max(0.0, min(sec, self._video_engine.duration_sec))
+        effective_dur = self._video_engine.duration_sec
+        if effective_dur <= 0 and self._vlc_player:
+            effective_dur = self._vlc_player.get_duration()
+        if effective_dur > 0:
+            sec = max(0.0, min(sec, effective_dur))
+        else:
+            sec = max(0.0, sec)
         ok, img = self._video_engine.seek_time(sec)
         if ok and img:
             self._current_frame_img = img
@@ -1679,7 +1728,20 @@ class App(ctk.CTk):
             return
 
         t = self._vlc_player.get_time()
-        dur = self._video_engine.duration_sec if self._video_engine else self._vlc_player.get_duration()
+
+        # Dynamic fallback duration if VideoEngine has <= 0 (e.g. MPEG-TS stream)
+        if self._video_engine and self._video_engine.duration_sec <= 0:
+            vlc_dur = self._vlc_player.get_duration()
+            if vlc_dur > 0:
+                self._video_engine.duration_sec = vlc_dur
+                dur_max = max(1.0, vlc_dur)
+                if hasattr(self, "_time_slider"):
+                    self._time_slider.configure(to=dur_max)
+                if hasattr(self, "_player_time_slider"):
+                    self._player_time_slider.configure(to=dur_max)
+                self._sync_player_ui()
+
+        dur = self._video_engine.duration_sec if (self._video_engine and self._video_engine.duration_sec > 0) else self._vlc_player.get_duration()
 
         if t > 0:
             self._current_sec = t
@@ -1776,13 +1838,15 @@ class App(ctk.CTk):
             pass
 
     def _update_sub_status_label(self):
+        render_on = self._sub_render_var.get() if hasattr(self, "_sub_render_var") else True
+        render_suffix = "" if render_on else " [渲染已關閉]"
         if self._srt_path and os.path.isfile(self._srt_path):
             name = Path(self._srt_path).name
             count = len(self._srt_entries)
-            text = f"字幕：已掛載 ({name} · {count} 條)"
-            color = ("#0a7d2c", "#5ec97a")
+            text = f"字幕：已掛載 ({name} · {count} 條){render_suffix}"
+            color = ("#0a7d2c", "#5ec97a") if render_on else ("#b8860b", "#e0a820")
         else:
-            text = "字幕：未掛載"
+            text = f"字幕：未掛載{render_suffix}"
             color = ("gray50", "gray60")
 
         if hasattr(self, "_sub_status_label"):
@@ -3454,7 +3518,7 @@ class App(ctk.CTk):
 def main():
     parser = argparse.ArgumentParser(
         prog="PicTrans2Srt",
-        description="Video OCR, Subtitle Translation & Player (v1.07)",
+        description="Video OCR, Subtitle Translation & Player (v1.08)",
     )
     parser.add_argument(
         "video_file",
