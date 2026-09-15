@@ -11,8 +11,6 @@ import io
 from dataclasses import dataclass
 from pathlib import Path
 
-import requests
-
 TEST_MESSAGE = 'hi! this is a API test, just respond "ok!"'
 
 
@@ -69,6 +67,8 @@ def encode_image(image_or_path: str | Path | Image.Image, max_side: int = 1568) 
 
 
 def _post(cfg: ProviderCfg, payload: dict, timeout: int = 120) -> dict:
+    import requests
+
     if not cfg.api_url:
         raise LLMError("API 網址為空，請先在「API 設定」填入。")
     headers = {"Content-Type": "application/json"}

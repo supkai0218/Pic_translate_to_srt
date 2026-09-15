@@ -7,11 +7,25 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-import cv2
-import numpy as np
 from PIL import Image
+
+if TYPE_CHECKING:
+    import cv2
+    import numpy as np
+
+cv2 = None
+np = None
+
+
+def _ensure_cv2():
+    global cv2, np
+    if cv2 is None:
+        import cv2 as _cv2_mod
+        import numpy as _np_mod
+        cv2 = _cv2_mod
+        np = _np_mod
 
 
 class VideoEngineError(RuntimeError):
@@ -20,6 +34,7 @@ class VideoEngineError(RuntimeError):
 
 class VideoEngine:
     def __init__(self, video_path: str | Path):
+        _ensure_cv2()
         self.video_path = str(video_path)
         if not os.path.isfile(self.video_path):
             raise VideoEngineError(f"影片檔案不存在：{self.video_path}")

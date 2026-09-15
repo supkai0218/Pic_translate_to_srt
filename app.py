@@ -1,4 +1,4 @@
-"""Video OCR → translate → SRT generator/inserter (v1.10).
+"""Video OCR → translate → SRT generator/inserter (v1.11).
 
 Run: python app.py
 Or: PicTrans2Srt.exe [video_path] [-s srt_path] [--play]
@@ -149,7 +149,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.10)")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.11)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -255,17 +255,12 @@ class App(ctk.CTk):
         self.tabs.add("  Prompt 設定  ")
         self.tabs.add("  執行  ")
 
+        # Lazy Tab Construction (v1.11 startup delay optimization)
+        self._built_tabs: set[str] = set()
         self._build_player_tab(self.tabs.tab("  影音播放器  "))
-        self._build_video_tab(self.tabs.tab("  影片與字幕任務  "))
-        self._build_keybindings_tab(self.tabs.tab("  按鈕與快捷鍵設定  "))
-        self._build_api_tab(self.tabs.tab("  API 設定  "))
-        self._build_prompt_tab(self.tabs.tab("  Prompt 設定  "))
-        self._build_run_tab(self.tabs.tab("  執行  "))
-
+        self._built_tabs.add("  影音播放器  ")
         self._refresh_step_buttons()
-        self._sync_api_form()
-        self._sync_prompt_form()
-        self._refresh_run_tab_summary()
+
         self.bind_all("<KeyPress>", self._on_global_key_press)
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
@@ -550,9 +545,39 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ #
     #  Tab Change & Dual-Tab Sync Methods
     # ------------------------------------------------------------------ #
+    def _ensure_tab_built(self, tab_name: str):
+        if not hasattr(self, "_built_tabs"):
+            self._built_tabs = set()
+        if tab_name in self._built_tabs:
+            return
+        self._built_tabs.add(tab_name)
+        if tab_name == "  影片與字幕任務  ":
+            self._build_video_tab(self.tabs.tab("  影片與字幕任務  "))
+            self._refresh_step_buttons()
+            self._sync_video_tab_ui()
+            self._render_tasks_list()
+        elif tab_name == "  按鈕與快捷鍵設定  ":
+            self._build_keybindings_tab(self.tabs.tab("  按鈕與快捷鍵設定  "))
+            self._refresh_step_buttons()
+        elif tab_name == "  API 設定  ":
+            self._build_api_tab(self.tabs.tab("  API 設定  "))
+            self._sync_api_form()
+        elif tab_name == "  Prompt 設定  ":
+            self._build_prompt_tab(self.tabs.tab("  Prompt 設定  "))
+            self._sync_prompt_form()
+            self._refresh_prompt_tab_providers()
+        elif tab_name == "  執行  ":
+            self._build_run_tab(self.tabs.tab("  執行  "))
+            self._refresh_run_tab_summary()
+
+    def _switch_to_tab(self, name: str):
+        self.tabs.set(name)
+        self._on_tab_change()
+
     def _on_tab_change(self):
         tab_name = self.tabs.get()
         self._active_tab_name = tab_name
+        self._ensure_tab_built(tab_name)
 
         if tab_name == "  影音播放器  ":
             if self._vlc_player:
@@ -1467,7 +1492,7 @@ class App(ctk.CTk):
 
         # Bottom shortcut button
         goto_run_btn = ctk.CTkButton(right_col, text="前往執行翻譯與匯出 →", height=34,
-                                     font=FONT_BODY, command=lambda: self.tabs.set("  執行  "))
+                                     font=FONT_BODY, command=lambda: self._switch_to_tab("  執行  "))
         goto_run_btn.pack(fill="x", padx=10, pady=(4, 8))
 
     # ------------------------------------------------------------------ #
@@ -1552,7 +1577,8 @@ class App(ctk.CTk):
             self._srt_path = str(found_srt)
             self._settings["last_srt_path"] = self._srt_path
             config.patch_setting("last_srt_path", self._srt_path)
-            self._srt_var.set(self._srt_path)
+            if hasattr(self, "_srt_var"):
+                self._srt_var.set(self._srt_path)
             if hasattr(self, "_player_srt_var"):
                 self._player_srt_var.set(self._srt_path)
             try:
@@ -1601,7 +1627,8 @@ class App(ctk.CTk):
         self._update_range_inputs()
 
         # Remove hint and seek to first frame
-        self._canvas.delete(self._hint_text_id)
+        if hasattr(self, "_canvas") and hasattr(self, "_hint_text_id"):
+            self._canvas.delete(self._hint_text_id)
         if self._active_tab_name == "  影片與字幕任務  ":
             self._show_canvas_display()
         self._seek_to(0.0)
@@ -1643,6 +1670,8 @@ class App(ctk.CTk):
 
     def _render_current_frame(self):
         if not self._current_frame_img:
+            return
+        if not hasattr(self, "_canvas"):
             return
 
         c_w = self._canvas.winfo_width()
@@ -2068,10 +2097,13 @@ class App(ctk.CTk):
         self._update_range_inputs()
 
     def _update_range_inputs(self):
-        self._start_var.set(srt_utils.sec_to_ts(self._start_sec))
-        self._end_var.set(srt_utils.sec_to_ts(self._end_sec))
+        if hasattr(self, "_start_var"):
+            self._start_var.set(srt_utils.sec_to_ts(self._start_sec))
+        if hasattr(self, "_end_var"):
+            self._end_var.set(srt_utils.sec_to_ts(self._end_sec))
         dur = max(0.0, self._end_sec - self._start_sec)
-        self._dur_disp_label.configure(text=f"時長: {dur:.2f}s")
+        if hasattr(self, "_dur_disp_label"):
+            self._dur_disp_label.configure(text=f"時長: {dur:.2f}s")
 
     def _on_start_entry_change(self, _event=None):
         val = parse_time_input(self._start_var.get(), self._start_sec)
@@ -2205,6 +2237,8 @@ class App(ctk.CTk):
         return source_img
 
     def _update_crop_preview(self):
+        if not hasattr(self, "_crop_thumb_canvas"):
+            return
         crop_img = self._get_crop_image()
         # Update preview thumbnail
         thumb = crop_img.copy()
@@ -2283,6 +2317,8 @@ class App(ctk.CTk):
         self._update_crop_preview()
 
     def _render_tasks_list(self):
+        if not hasattr(self, "_task_scroll"):
+            return
         for w in self._task_scroll.winfo_children():
             w.destroy()
 
@@ -2346,12 +2382,13 @@ class App(ctk.CTk):
             return
         self._srt_path = str(p)
         self._settings["last_srt_path"] = self._srt_path
-        config.patch_setting("last_srt_path", self._srt_path)
-        self._srt_var.set(self._srt_path)
+        if hasattr(self, "_srt_var"):
+            self._srt_var.set(self._srt_path)
         try:
             self._srt_entries = srt_utils.parse_srt(self._srt_path)
         except Exception as exc:
-            self._srt_var.set(f"解析失敗：{exc}")
+            if hasattr(self, "_srt_var"):
+                self._srt_var.set(f"解析失敗：{exc}")
             self._srt_entries = []
 
         if hasattr(self, "_player_srt_var"):
@@ -2365,7 +2402,8 @@ class App(ctk.CTk):
     def _clear_srt(self):
         self._srt_path = ""
         self._srt_entries = []
-        self._srt_var.set("（未選擇，將直接匯出新 SRT 檔案）")
+        if hasattr(self, "_srt_var"):
+            self._srt_var.set("（未選擇，將直接匯出新 SRT 檔案）")
         if hasattr(self, "_player_srt_var"):
             self._player_srt_var.set("（未選擇字幕檔案）")
         if self._vlc_player:
@@ -2907,6 +2945,8 @@ class App(ctk.CTk):
         self._preset_menu.set("（選擇常用範本…）")
 
     def _sync_api_form(self):
+        if not hasattr(self, "_provider_menu"):
+            return
         self._refresh_provider_menu()
         p = config.get_default_provider()
         if p:
@@ -3158,6 +3198,8 @@ class App(ctk.CTk):
             return f"[公版] {name}{star}"
 
     def _refresh_prompt_tab_providers(self):
+        if not hasattr(self, "_bound_provider_menu"):
+            return
         providers = self._settings.get("providers", [])
         names = [p["name"] for p in providers] or ["（無供應商）"]
         self._bound_provider_menu.configure(values=names)
@@ -3186,6 +3228,8 @@ class App(ctk.CTk):
             self._refresh_prompt_tab_providers()
 
     def _sync_prompt_form(self, keep_id: str | None = None):
+        if not hasattr(self, "_prompt_display_map"):
+            return
         self._settings = config.load_settings()
         profiles = self._settings.get("prompt_profiles", [])
         if not profiles:
@@ -3432,13 +3476,17 @@ class App(ctk.CTk):
             self._run_prompt_label.configure(text=f"🔹 套用 Prompt：{desc}")
 
     def _log_line(self, msg: str):
-        self.after(0, lambda: self._log.insert("end", msg + "\n"))
-        self.after(0, lambda: self._log.see("end"))
+        if hasattr(self, "_log"):
+            self.after(0, lambda: self._log.insert("end", msg + "\n"))
+            self.after(0, lambda: self._log.see("end"))
+        else:
+            print(msg)
 
     def _set_busy(self, busy: bool):
         self._busy = busy
         state = "disabled" if busy else "normal"
-        self.after(0, lambda: self._run_btn.configure(state=state))
+        if hasattr(self, "_run_btn"):
+            self.after(0, lambda: self._run_btn.configure(state=state))
 
     def _start_ocr(self):
         if self._busy:
@@ -3633,7 +3681,7 @@ class App(ctk.CTk):
 def main():
     parser = argparse.ArgumentParser(
         prog="PicTrans2Srt",
-        description="Video OCR, Subtitle Translation & Player (v1.10)",
+        description="Video OCR, Subtitle Translation & Player (v1.11)",
     )
     parser.add_argument(
         "video_file",
