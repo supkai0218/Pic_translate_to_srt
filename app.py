@@ -1,4 +1,4 @@
-"""Video OCR → translate → SRT generator/inserter (v1.09).
+"""Video OCR → translate → SRT generator/inserter (v1.10).
 
 Run: python app.py
 Or: PicTrans2Srt.exe [video_path] [-s srt_path] [--play]
@@ -20,6 +20,7 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 import config
+import monitor_utils
 import srt_utils
 from llm_engine import LLMError, ProviderCfg, test_connection, translate_image
 from video_engine import VideoEngine, VideoEngineError
@@ -148,11 +149,14 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.09)")
-        self.geometry("1160x820")
+        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.10)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
+        self._geo_save_timer: Optional[str] = None
+        self._restore_window_geometry()
+        self.bind("<Configure>", self._on_window_configure)
+
         ctk.set_appearance_mode(self._settings.get("appearance_mode", "dark"))
         ctk.set_default_color_theme("blue")
 
@@ -857,6 +861,95 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ #
     #  Window Scale & Fullscreen Controls
     # ------------------------------------------------------------------ #
+    def _restore_window_geometry(self):
+        """Restore window position, size, and maximized state across monitors with safe fallback."""
+        geo = self._settings.get("window_geometry")
+        default_w, default_h = 1160, 820
+        prim_left, prim_top, prim_w, prim_h = monitor_utils.get_primary_monitor_work_rect()
+
+        if isinstance(geo, dict):
+            try:
+                x = int(geo.get("x", 0))
+                y = int(geo.get("y", 0))
+                w = max(980, int(geo.get("width", default_w)))
+                h = max(680, int(geo.get("height", default_h)))
+                is_max = bool(geo.get("is_maximized", False))
+
+                # Check if target window rect intersects a currently connected monitor
+                valid, work_area = monitor_utils.is_rect_on_valid_monitor(x, y, w, h)
+                if valid and work_area:
+                    # Monitor exists: clamp to its work area in case of resolution changes
+                    cx, cy, cw, ch = monitor_utils.clamp_to_monitor_work_area(x, y, w, h, work_area)
+                    self.geometry(f"{cw}x{ch}+{cx}+{cy}")
+                    if is_max:
+                        self.after(50, lambda: self.state("zoomed"))
+                    return
+            except Exception:
+                pass
+
+        # Fallback to primary monitor (Monitor 1) centered
+        fallback_w = min(default_w, prim_w - 60)
+        fallback_h = min(default_h, prim_h - 80)
+        fallback_x = prim_left + max(0, (prim_w - fallback_w) // 2)
+        fallback_y = prim_top + max(0, (prim_h - fallback_h) // 2)
+        self.geometry(f"{fallback_w}x{fallback_h}+{fallback_x}+{fallback_y}")
+
+    def _save_window_geometry(self):
+        """Save current window geometry (x, y, width, height, is_maximized) to settings."""
+        if self._is_fullscreen:
+            return
+
+        try:
+            is_max = (self.state() == "zoomed")
+            wp = None
+            if monitor_utils.IS_WINDOWS:
+                try:
+                    wp = monitor_utils.get_window_placement_bounds(self.winfo_id())
+                except Exception:
+                    wp = None
+
+            if wp:
+                geo_data = {
+                    "x": int(wp["x"]),
+                    "y": int(wp["y"]),
+                    "width": int(wp["width"]),
+                    "height": int(wp["height"]),
+                    "is_maximized": is_max,
+                }
+            else:
+                geo_data = {
+                    "x": int(self.winfo_x()),
+                    "y": int(self.winfo_y()),
+                    "width": int(self.winfo_width()),
+                    "height": int(self.winfo_height()),
+                    "is_maximized": is_max,
+                }
+
+            self._settings["window_geometry"] = geo_data
+            config.patch_setting("window_geometry", geo_data)
+        except Exception:
+            pass
+
+    def _schedule_save_window_geometry(self):
+        """Debounce saving window geometry after window move or resize (1000ms delay)."""
+        if hasattr(self, "_geo_save_timer") and self._geo_save_timer:
+            try:
+                self.after_cancel(self._geo_save_timer)
+            except Exception:
+                pass
+            self._geo_save_timer = None
+
+        def _do_save():
+            self._geo_save_timer = None
+            self._save_window_geometry()
+
+        self._geo_save_timer = self.after(1000, _do_save)
+
+    def _on_window_configure(self, event):
+        """Handle window position and dimension changes with debounced persistence."""
+        if event.widget == self and not self._is_fullscreen:
+            self._schedule_save_window_geometry()
+
     def _on_window_scale_change(self, scale_str: str):
         try:
             val = float(scale_str.split("x")[0].strip())
@@ -872,49 +965,28 @@ class App(ctk.CTk):
         target_w = int(vw * val) + extra_w
         target_h = int(vh * val) + extra_h
 
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
+        # Center within the CURRENT monitor where this app window is located
+        mon_left, mon_top, mon_w, mon_h = self._get_current_monitor_rect()
 
-        w = max(980, min(target_w, sw - 60))
-        h = max(680, min(target_h, sh - 80))
+        w = max(980, min(target_w, mon_w - 60))
+        h = max(680, min(target_h, mon_h - 80))
 
-        x = max(0, (sw - w) // 2)
-        y = max(0, (sh - h) // 2)
+        x = mon_left + max(0, (mon_w - w) // 2)
+        y = mon_top + max(0, (mon_h - h) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _get_current_monitor_rect(self) -> tuple[int, int, int, int]:
         """Return (left, top, width, height) of the monitor where this app window is located."""
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-
-            class RECT(ctypes.Structure):
-                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-
-            class MONITORINFO(ctypes.Structure):
-                _fields_ = [
-                    ("cbSize", wintypes.DWORD),
-                    ("rcMonitor", RECT),
-                    ("rcWork", RECT),
-                    ("dwFlags", wintypes.DWORD)
-                ]
-
             self.update_idletasks()
             x = self.winfo_rootx() + max(1, self.winfo_width() // 2)
             y = self.winfo_rooty() + max(1, self.winfo_height() // 2)
-            pt = wintypes.POINT(x, y)
-            hmon = user32.MonitorFromPoint(pt, 2)  # MONITOR_DEFAULTTONEAREST = 2
-            info = MONITORINFO()
-            info.cbSize = ctypes.sizeof(MONITORINFO)
-            if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
-                r = info.rcMonitor
-                return r.left, r.top, r.right - r.left, r.bottom - r.top
+            valid, work = monitor_utils.is_rect_on_valid_monitor(x, y, 1, 1)
+            if valid and work:
+                return work[0], work[1], work[2] - work[0], work[3] - work[1]
         except Exception:
             pass
-        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+        return monitor_utils.get_primary_monitor_work_rect()
 
     def _hide_fs_bar(self):
         if hasattr(self, "_fs_bar_visible") and self._fs_bar_visible and not self._is_scrubbing:
@@ -3530,6 +3602,10 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ #
     def _on_window_close(self):
         try:
+            self._save_window_geometry()
+        except Exception:
+            pass
+        try:
             if hasattr(self, "_volume_var"):
                 vol = int(float(self._volume_var.get()))
                 config.patch_setting("last_volume", vol)
@@ -3557,7 +3633,7 @@ class App(ctk.CTk):
 def main():
     parser = argparse.ArgumentParser(
         prog="PicTrans2Srt",
-        description="Video OCR, Subtitle Translation & Player (v1.09)",
+        description="Video OCR, Subtitle Translation & Player (v1.10)",
     )
     parser.add_argument(
         "video_file",

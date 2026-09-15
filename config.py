@@ -173,6 +173,7 @@ _DEFAULTS: dict = {
     "appearance_mode": "dark",
     "sub_render_enabled": True,
     "last_volume": 80,
+    "window_geometry": None,
 }
 
 
