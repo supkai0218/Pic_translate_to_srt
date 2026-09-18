@@ -1,4 +1,4 @@
-"""PyInstaller automated build script for PicTrans2Srt (v1.11).
+"""PyInstaller automated build script for PicTrans2Srt (v2.02).
 
 Builds a standalone, portable Windows directory distribution (--onedir):
 - PicTrans2Srt.exe
@@ -117,12 +117,24 @@ def copy_runtime_assets():
     if dotenv_example.is_file():
         shutil.copy2(dotenv_example, TARGET_DIR / ".env.example")
 
+    # Copy settings_p2p.example.json
+    settings_p2p_example = BASE_DIR / "settings_p2p.example.json"
+    if settings_p2p_example.is_file():
+        shutil.copy2(settings_p2p_example, TARGET_DIR / "settings_p2p.example.json")
+
+    # Copy current settings_p2p.json if exists, or fallback to example
+    settings_p2p_json = BASE_DIR / "settings_p2p.json"
+    if settings_p2p_json.is_file():
+        shutil.copy2(settings_p2p_json, TARGET_DIR / "settings_p2p.json")
+    elif settings_p2p_example.is_file():
+        shutil.copy2(settings_p2p_example, TARGET_DIR / "settings_p2p.json")
+
 
 def print_summary():
     exe_file = TARGET_DIR / "PicTrans2Srt.exe"
     print("\n" + "=" * 60)
     if exe_file.is_file():
-        print("  PicTrans2Srt (v1.11) 打包建置成功！")
+        print("  PicTrans2Srt (v2.02) 打包建置成功！")
         print(f"  執行檔位置: {exe_file}")
         print("=" * 60)
         print("發布目錄內容確認：")

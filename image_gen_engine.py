@@ -246,6 +246,91 @@ def test_p2p_connection(cfg: P2PProviderCfg) -> tuple[bool, str]:
         return False, f"連線失敗：{exc}"
 
 
+ASPECT_TO_SIZE_MAP: dict[str, str] = {
+    "1:1": "1024x1024",
+    "16:9": "2048x1152",
+    "9:16": "1152x2048",
+    "4:3": "1536x1152",
+    "3:4": "1152x1536",
+    "3:2": "1536x1024",
+    "2:3": "1024x1536",
+    "21:9": "2560x1088",
+}
+
+
+def is_gpt_image_model(model_name: str) -> bool:
+    """Return True if model follows OpenAI GPT-Image edit / dall-e parameter schema."""
+    m = model_name.lower()
+    return "gpt-image" in m or "dall-e" in m or "/edit" in m
+
+
+def build_atlas_payload(
+    cfg: P2PProviderCfg,
+    images: list[Image.Image],
+    prompt: str,
+    negative_prompt: str = "",
+    aspect_ratio: str = "1:1",
+    strength: float = 0.65,
+    num_outputs: int = 1,
+    size: str = "auto",
+    quality: str = "auto",
+    background: str = "auto",
+    output_format: str = "auto",
+    extra_params: Optional[dict] = None,
+) -> dict:
+    """Construct a clean, schema-compliant payload for Atlas Cloud image endpoints."""
+    payload: dict = {
+        "model": cfg.model,
+        "prompt": prompt,
+    }
+
+    # Encode reference images
+    if images:
+        img_list = []
+        for img in images:
+            b64, mime = encode_image_b64(img)
+            img_list.append(f"data:{mime};base64,{b64}")
+        payload["images"] = img_list
+
+    if is_gpt_image_model(cfg.model):
+        # OpenAI GPT Image Edit schema: expects size, quality, background, output_format, n
+        resolved_size = size if (size and size != "auto") else ASPECT_TO_SIZE_MAP.get(aspect_ratio, "1024x1024")
+        payload["size"] = resolved_size
+
+        if quality and quality != "auto":
+            payload["quality"] = quality
+        if background and background != "auto":
+            payload["background"] = background
+        if output_format and output_format != "auto":
+            payload["output_format"] = output_format
+        if num_outputs > 1:
+            payload["n"] = num_outputs
+    else:
+        # Standard image model schema: aspect_ratio, negative_prompt, etc.
+        if aspect_ratio:
+            payload["aspect_ratio"] = aspect_ratio
+        if size and size != "auto":
+            payload["size"] = size
+        if negative_prompt:
+            payload["negative_prompt"] = negative_prompt
+        if strength is not None and strength > 0:
+            payload["strength"] = strength
+        if output_format and output_format != "auto":
+            payload["output_format"] = output_format
+
+    # Merge custom user extra JSON parameters if provided
+    if extra_params and isinstance(extra_params, dict):
+        payload.update(extra_params)
+
+    # Sanitize payload: remove keys with "auto" or None
+    clean_payload = {}
+    for k, v in payload.items():
+        if v is not None and v != "auto":
+            clean_payload[k] = v
+
+    return clean_payload
+
+
 def generate_image(
     cfg: P2PProviderCfg,
     images: list[Image.Image],
@@ -254,6 +339,11 @@ def generate_image(
     aspect_ratio: str = "1:1",
     strength: float = 0.65,
     num_outputs: int = 1,
+    size: str = "auto",
+    quality: str = "auto",
+    background: str = "auto",
+    output_format: str = "auto",
+    extra_params: Optional[dict] = None,
     timeout: int = 180,
 ) -> list[Image.Image]:
     """Generate new image(s) using Cloud Aggregator API from reference images and prompt."""
@@ -283,21 +373,20 @@ def generate_image(
             gen_url = f"{base_url}/model/generateImage"
             pred_base = f"{base_url}/model/prediction"
 
-        payload: dict = {
-            "model": cfg.model,
-            "prompt": prompt,
-        }
-        if negative_prompt:
-            payload["negative_prompt"] = negative_prompt
-        if aspect_ratio:
-            payload["aspect_ratio"] = aspect_ratio
-
-        if images:
-            img_list = []
-            for img in images:
-                b64, mime = encode_image_b64(img)
-                img_list.append(f"data:{mime};base64,{b64}")
-            payload["images"] = img_list
+        payload = build_atlas_payload(
+            cfg=cfg,
+            images=images,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            aspect_ratio=aspect_ratio,
+            strength=strength,
+            num_outputs=num_outputs,
+            size=size,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            extra_params=extra_params,
+        )
 
         try:
             resp = requests.post(gen_url, headers=headers, json=payload, timeout=60)
@@ -363,11 +452,15 @@ def generate_image(
             "return_binary": False,
             "aspect_ratio": aspect_ratio,
         }
+        if output_format and output_format != "auto":
+            payload["output_format"] = output_format
         if images:
             # Venice image-to-image uses first reference image
             b64, _ = encode_image_b64(images[0])
             payload["image"] = b64
             payload["strength"] = strength
+        if extra_params and isinstance(extra_params, dict):
+            payload.update(extra_params)
 
         try:
             resp = requests.post(target_url, headers=headers, json=payload, timeout=timeout)
@@ -397,6 +490,12 @@ def generate_image(
         if negative_prompt:
             prompt_instruction += f"Negative prompt: {negative_prompt}\n"
         prompt_instruction += f"Aspect ratio: {aspect_ratio}\n"
+        if size and size != "auto":
+            prompt_instruction += f"Size: {size}\n"
+        if quality and quality != "auto":
+            prompt_instruction += f"Quality: {quality}\n"
+        if background and background != "auto":
+            prompt_instruction += f"Background: {background}\n"
 
         user_content = [{"type": "text", "text": prompt_instruction}]
 
@@ -418,6 +517,8 @@ def generate_image(
             ],
             "modalities": ["image", "text"],
         }
+        if extra_params and isinstance(extra_params, dict):
+            payload.update(extra_params)
 
         try:
             resp = requests.post(target_url, headers=headers, json=payload, timeout=timeout)
@@ -449,6 +550,15 @@ def generate_image(
         "n": num_outputs,
         "response_format": "b64_json",
     }
+    if size and size != "auto":
+        payload["size"] = size
+    elif aspect_ratio:
+        payload["size"] = ASPECT_TO_SIZE_MAP.get(aspect_ratio, "1024x1024")
+    if quality and quality != "auto":
+        payload["quality"] = quality
+    if extra_params and isinstance(extra_params, dict):
+        payload.update(extra_params)
+
     try:
         resp = requests.post(target_url, headers=headers, json=payload, timeout=timeout)
     except Exception as exc:

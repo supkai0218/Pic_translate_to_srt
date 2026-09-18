@@ -1,0 +1,61 @@
+{
+  "selected_provider": "Atlas Cloud",
+  "providers": [
+    {
+      "name": "Atlas Cloud",
+      "api_url": "https://api.atlascloud.ai/api/v1/model/generateImage",
+      "models": [
+        "openai/gpt-image-2.5-flare/edit",
+        "google/nano-banana-2-lite/reference-to-image",
+        "bytedance/seedream-v5.0-pro/edit",
+        "alibaba/wan-2.7-pro/image-edit",
+        "openai/gpt-image-2/edit",
+        "google/nano-banana-pro/edit-developer"
+      ],
+      "selected_model": "openai/gpt-image-2.5-flare/edit",
+      "api_key": "",
+      "api_key_env": "API_KEY_ATLAS_CLOUD"
+    },
+    {
+      "name": "OpenRouter",
+      "api_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "api_key": "",
+      "models": [
+        "black-forest-labs/flux-1-dev",
+        "black-forest-labs/flux-1-schnell",
+        "recraft-ai/recraft-v20",
+        "stabilityai/stable-diffusion-3.5-large"
+      ],
+      "selected_model": "black-forest-labs/flux-1-dev",
+      "provider_type": "openrouter"
+    },
+    {
+      "name": "Venice AI",
+      "api_url": "https://api.venice.ai/api/v1",
+      "api_key_env": "VENICE_API_KEY",
+      "api_key": "",
+      "models": [
+        "flux-dev-uncensored",
+        "flux-dev",
+        "stable-diffusion-3.5"
+      ],
+      "selected_model": "flux-dev-uncensored",
+      "provider_type": "venice"
+    }
+  ],
+  "drawing_prompts": [
+    {
+      "id": "draw_turnaround_5views",
+      "name": "人物五視角",
+      "positive": "根據上傳的同一位人物多張照片，提高畫質生成一張 **16:9 橫幅全身五視角人物參考圖**。\n畫面從左到右依序為：0°正面、45°右前、90°右側、120°右後、180°背面。\n五個視角必須是同一人，臉型、髮型、身形、服裝、鞋子與配件完全一致。\n人物全身站立，比例一致，等距排列，儘量放大，空白處儘量少，不裁切頭頂或鞋子。\n背景為乾淨淺灰攝影棚背景，真實攝影風格，像專業角色 turnaround sheet。\n每個人物下方標示：0° FRONT VIEW、45° THREE-QUARTER RIGHT VIEW、90° RIGHT SIDE VIEW、120° RIGHT-BACK VIEW、180° BACK VIEW。\n\n**Aspect ratio：16:9**\n**Style：photorealistic / studio reference / character turnaround sheet**\n**Framing：full body, large subject, minimal empty space**",
+      "negative": "不要不同人物、不要不同服裝、不要裁切、不要多於或少於五人、不要卡通風、不要姿勢誇張、不要背景雜亂、不要肢體變形。"
+    }
+  ],
+  "active_prompt_id": "draw_turnaround_5views",
+  "default_params": {
+    "image_strength": 0.65,
+    "aspect_ratio": "1:1",
+    "samples": 1
+  }
+}

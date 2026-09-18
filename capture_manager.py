@@ -96,17 +96,82 @@ def save_captured_image(
     return target
 
 
+def simplify_model_name(model_name: str) -> str:
+    """Simplify model ID string into concise, safe filename token.
+
+    Examples:
+        'openai/gpt-image-2.5-flare/edit' -> 'gpt-image-2.5-flare'
+        'google/nano-banana-2-lite/reference-to-image' -> 'nano-banana-2-lite'
+        'black-forest-labs/flux-1-dev' -> 'flux-1-dev'
+    """
+    if not model_name:
+        return "ai_model"
+    parts = [p.strip() for p in model_name.split("/") if p.strip()]
+    if not parts:
+        return sanitize_filename_part(model_name, max_len=30)
+
+    # Known task-specific keywords to strip from endpoint paths
+    task_keywords = ("edit", "generate", "to-image", "to-video", "sequential")
+
+    candidate = parts[-1]
+    if len(parts) >= 2 and any(k in candidate.lower() for k in task_keywords):
+        candidate = parts[-2]
+    elif len(parts) >= 2:
+        candidate = parts[-1]
+
+    return sanitize_filename_part(candidate, max_len=30)
+
+
+def save_edited_image(
+    img: Image.Image,
+    original_path: str | Path = "",
+) -> Path:
+    """Save rotated or flipped image into \\captured with '{original_stem}_edit.jpg'.
+
+    Prevents repetitive chain suffixes like '_edit_edit_edit' by normalizing to clean stem.
+    """
+    cap_dir = get_captured_dir()
+
+    if original_path:
+        orig_stem = Path(original_path).stem
+        # Clean off existing _edit or _edit_X suffix
+        clean_stem = re.sub(r"_edit(_\d+)?$", "", orig_stem)
+        safe_stem = sanitize_filename_part(clean_stem, max_len=50)
+    else:
+        safe_stem = "captured"
+
+    base_name = f"{safe_stem}_edit"
+    target = cap_dir / f"{base_name}.jpg"
+
+    counter = 1
+    while target.exists():
+        target = cap_dir / f"{base_name}_{counter}.jpg"
+        counter += 1
+
+    if img.mode not in ("RGB", "L"):
+        save_img = img.convert("RGB")
+    else:
+        save_img = img
+
+    save_img.save(target, format="JPEG", quality=95)
+    return target
+
+
 def save_generated_image(
     img: Image.Image,
     prompt_name: str = "",
+    model_name: str = "",
     index: int = 1,
 ) -> Path:
-    """Save AI-generated image into \\generated directory."""
+    """Save AI-generated image into \\generated directory with naming
+    '{prompt範本名稱}_{模型名稱}_YYYYMMDD_hhmm.png'.
+    """
     gen_dir = get_generated_dir()
-    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_prompt = sanitize_filename_part(prompt_name, max_len=30) if prompt_name else "ai_gen"
+    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    safe_prompt = sanitize_filename_part(prompt_name, max_len=30) if prompt_name else "custom"
+    safe_model = simplify_model_name(model_name)
 
-    base_name = f"{now_str}_{safe_prompt}_{index}"
+    base_name = f"{safe_prompt}_{safe_model}_{now_str}"
     target = gen_dir / f"{base_name}.png"
 
     counter = 1

@@ -155,7 +155,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.01)")
+        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.02)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -4148,25 +4148,90 @@ class App(ctk.CTk):
 
         # Parameters: Strength & Aspect Ratio
         param_row = ctk.CTkFrame(right_scroll, fg_color="transparent")
-        param_row.pack(fill="x", pady=(2, 6))
+        param_row.pack(fill="x", pady=(2, 4))
 
         ctk.CTkLabel(param_row, text="強度(重繪)：", font=FONT_SMALL).pack(side="left")
         self._p2p_strength_var = ctk.DoubleVar(value=self._p2p_settings.get("default_params", {}).get("image_strength", 0.65))
         self._p2p_strength_slider = ctk.CTkSlider(
             param_row, from_=0.10, to=1.00, variable=self._p2p_strength_var,
-            width=100, height=14, command=lambda v: self._p2p_strength_label.configure(text=f"{float(v):.2f}")
+            width=90, height=14, command=lambda v: self._p2p_strength_label.configure(text=f"{float(v):.2f}")
         )
         self._p2p_strength_slider.pack(side="left", padx=(2, 4))
-        self._p2p_strength_label = ctk.CTkLabel(param_row, text=f"{self._p2p_strength_var.get():.2f}", font=FONT_SMALL, width=32)
-        self._p2p_strength_label.pack(side="left", padx=(0, 8))
+        self._p2p_strength_label = ctk.CTkLabel(param_row, text=f"{self._p2p_strength_var.get():.2f}", font=FONT_SMALL, width=28)
+        self._p2p_strength_label.pack(side="left", padx=(0, 6))
 
         ctk.CTkLabel(param_row, text="比例：", font=FONT_SMALL).pack(side="left")
         self._p2p_aspect_var = ctk.StringVar(value=self._p2p_settings.get("default_params", {}).get("aspect_ratio", "1:1"))
         self._p2p_aspect_seg = ctk.CTkSegmentedButton(
-            param_row, values=["1:1", "16:9", "9:16", "4:3"],
+            param_row, values=["1:1", "16:9", "9:16", "4:3", "3:2"],
             variable=self._p2p_aspect_var, height=24, font=FONT_SMALL
         )
         self._p2p_aspect_seg.pack(side="left", fill="x", expand=True)
+
+        # Advanced Drawing Parameters Collapsible Panel (v2.02)
+        self._p2p_adv_open = False
+        self._p2p_adv_toggle_btn = ctk.CTkButton(
+            right_scroll, text="⚙️ 展開進階繪圖參數 (Size / Quality / Format...) ▼",
+            height=22, font=FONT_SMALL, fg_color="transparent", text_color=("#1f6aa5", "#64b5f6"),
+            hover_color=("gray85", "gray25"), anchor="w", command=self._toggle_p2p_advanced_params
+        )
+        self._p2p_adv_toggle_btn.pack(fill="x", pady=(2, 2))
+
+        self._p2p_adv_frame = ctk.CTkFrame(right_scroll, fg_color=("gray88", "gray18"), corner_radius=6)
+        # Inside adv_frame:
+        adv_row1 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row1.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(adv_row1, text="解析度/尺寸：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        self._p2p_size_var = ctk.StringVar(value="auto")
+        self._p2p_size_menu = ctk.CTkOptionMenu(
+            adv_row1, values=["auto", "1024x1024", "1536x1024", "2048x1152", "1152x2048", "2560x1088", "3840x2160", "1024x768", "768x1024"],
+            variable=self._p2p_size_var, font=FONT_SMALL, height=24
+        )
+        self._p2p_size_menu.pack(side="left", fill="x", expand=True)
+
+        adv_row2 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row2.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(adv_row2, text="畫質等級：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        self._p2p_quality_var = ctk.StringVar(value="auto")
+        self._p2p_quality_menu = ctk.CTkOptionMenu(
+            adv_row2, values=["auto", "low", "medium", "high", "xhigh", "max"],
+            variable=self._p2p_quality_var, font=FONT_SMALL, height=24, width=95
+        )
+        self._p2p_quality_menu.pack(side="left", padx=(0, 6))
+
+        ctk.CTkLabel(adv_row2, text="背景：", font=FONT_SMALL).pack(side="left")
+        self._p2p_bg_var = ctk.StringVar(value="auto")
+        self._p2p_bg_menu = ctk.CTkOptionMenu(
+            adv_row2, values=["auto", "opaque", "transparent"],
+            variable=self._p2p_bg_var, font=FONT_SMALL, height=24
+        )
+        self._p2p_bg_menu.pack(side="left", fill="x", expand=True)
+
+        adv_row3 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row3.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(adv_row3, text="輸出格式：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        self._p2p_format_var = ctk.StringVar(value="auto")
+        self._p2p_format_menu = ctk.CTkOptionMenu(
+            adv_row3, values=["auto", "png", "jpeg", "webp"],
+            variable=self._p2p_format_var, font=FONT_SMALL, height=24, width=95
+        )
+        self._p2p_format_menu.pack(side="left", padx=(0, 6))
+
+        ctk.CTkLabel(adv_row3, text="張數：", font=FONT_SMALL).pack(side="left")
+        self._p2p_count_var = ctk.StringVar(value="1")
+        self._p2p_count_menu = ctk.CTkOptionMenu(
+            adv_row3, values=["1", "2", "3", "4"],
+            variable=self._p2p_count_var, font=FONT_SMALL, height=24
+        )
+        self._p2p_count_menu.pack(side="left", fill="x", expand=True)
+
+        adv_row4 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row4.pack(fill="x", padx=8, pady=(2, 6))
+        ctk.CTkLabel(adv_row4, text="自訂JSON：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        self._p2p_extra_json_entry = ctk.CTkEntry(
+            adv_row4, placeholder_text='如: {"seed": 42}', font=FONT_SMALL, height=24
+        )
+        self._p2p_extra_json_entry.pack(side="left", fill="x", expand=True)
 
         # Generate button
         self._p2p_gen_btn = ctk.CTkButton(
@@ -4388,13 +4453,26 @@ class App(ctk.CTk):
         if not self._active_edit_img:
             messagebox.showinfo("提示", "目前沒有正在編輯的圖片。")
             return
-        saved_p = capture_manager.save_captured_image(
+        orig_p = getattr(self, "_active_p2p_image_path", "")
+        saved_p = capture_manager.save_edited_image(
             img=self._active_edit_img,
-            custom_name="edited",
+            original_path=orig_p,
         )
         self._refresh_p2p_gallery()
         self._set_active_p2p_image(str(saved_p))
         messagebox.showinfo("儲存成功", f"編輯後的圖片已另存為：\n{saved_p.name}")
+
+    def _toggle_p2p_advanced_params(self):
+        if not hasattr(self, "_p2p_adv_frame"):
+            return
+        if self._p2p_adv_open:
+            self._p2p_adv_frame.pack_forget()
+            self._p2p_adv_open = False
+            self._p2p_adv_toggle_btn.configure(text="⚙️ 展開進階繪圖參數 (Size / Quality / Format...) ▼")
+        else:
+            self._p2p_adv_frame.pack(after=self._p2p_adv_toggle_btn, fill="x", pady=(0, 4))
+            self._p2p_adv_open = True
+            self._p2p_adv_toggle_btn.configure(text="⚙️ 收合進階繪圖參數 ▲")
 
     def _render_active_p2p_canvas(self):
         if not hasattr(self, "_p2p_edit_canvas") or not self._active_edit_img:
@@ -4501,6 +4579,29 @@ class App(ctk.CTk):
         aspect = self._p2p_aspect_var.get()
         strength = float(self._p2p_strength_var.get())
 
+        # Collect advanced parameters (v2.02)
+        adv_size = self._p2p_size_var.get().strip() if hasattr(self, "_p2p_size_var") else "auto"
+        adv_quality = self._p2p_quality_var.get().strip() if hasattr(self, "_p2p_quality_var") else "auto"
+        adv_bg = self._p2p_bg_var.get().strip() if hasattr(self, "_p2p_bg_var") else "auto"
+        adv_fmt = self._p2p_format_var.get().strip() if hasattr(self, "_p2p_format_var") else "auto"
+        try:
+            num_outputs = int(self._p2p_count_var.get()) if hasattr(self, "_p2p_count_var") else 1
+        except Exception:
+            num_outputs = 1
+
+        adv_extra = None
+        if hasattr(self, "_p2p_extra_json_entry"):
+            extra_txt = self._p2p_extra_json_entry.get().strip()
+            if extra_txt:
+                import json
+                try:
+                    adv_extra = json.loads(extra_txt)
+                    if not isinstance(adv_extra, dict):
+                        raise ValueError("自訂參數必須為 JSON 物件 (字典)，例如 {\"seed\": 42}")
+                except Exception as je:
+                    messagebox.showerror("自訂 JSON 格式錯誤", f"進階自訂 JSON 參數解析失敗：\n{je}")
+                    return
+
         self._p2p_busy = True
         self._p2p_gen_btn.configure(state="disabled", text="⏳ AI 繪圖中...")
         self._p2p_status_label.configure(text=f"正在請求 {cfg.name} 生成新圖，請稍候...")
@@ -4514,12 +4615,19 @@ class App(ctk.CTk):
                     negative_prompt=neg_prompt,
                     aspect_ratio=aspect,
                     strength=strength,
+                    num_outputs=num_outputs,
+                    size=adv_size,
+                    quality=adv_quality,
+                    background=adv_bg,
+                    output_format=adv_fmt,
+                    extra_params=adv_extra,
                 )
                 if imgs:
                     self._current_gen_img = imgs[0]
                     saved_p = capture_manager.save_generated_image(
                         self._current_gen_img,
                         prompt_name=self._p2p_preset_var.get(),
+                        model_name=cfg.model,
                     )
                     self.after(0, lambda: self._on_p2p_success(saved_p))
                 else:
@@ -4563,11 +4671,19 @@ class App(ctk.CTk):
     def _save_p2p_result(self):
         if not self._current_gen_img:
             return
+        prompt_name = self._p2p_preset_var.get() if hasattr(self, "_p2p_preset_var") else "custom"
+        model_name = self._p2p_model_var.get() if hasattr(self, "_p2p_model_var") else "model"
+        safe_prompt = capture_manager.sanitize_filename_part(prompt_name, max_len=30) if prompt_name else "custom"
+        safe_model = capture_manager.simplify_model_name(model_name)
+        import datetime
+        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        suggested_name = f"{safe_prompt}_{safe_model}_{now_str}.png"
+
         target = filedialog.asksaveasfilename(
             defaultextension=".png",
             filetypes=[("PNG 圖片", "*.png"), ("JPEG 圖片", "*.jpg")],
             initialdir=str(capture_manager.get_generated_dir()),
-            initialfile="ai_generated.png",
+            initialfile=suggested_name,
         )
         if target:
             self._current_gen_img.save(target)
