@@ -23,6 +23,9 @@ else:
     BASE_DIR = Path(__file__).resolve().parent
 
 SETTINGS_FILE = BASE_DIR / "settings.json"
+SETTINGS_P2P_FILE = BASE_DIR / "settings_p2p.json"
+CAPTURED_DIR = BASE_DIR / "captured"
+GENERATED_DIR = BASE_DIR / "generated"
 DOTENV_PATH = BASE_DIR / ".env"
 
 # populate os.environ from .env (no-op if the file is absent)
@@ -78,6 +81,7 @@ DEFAULT_KEYBINDINGS: dict = {
     "add_task": "Return",
     "toggle_fullscreen": "F11",
     "hot_reload_sub": "F5",
+    "quick_capture": "c",
 }
 
 # 內建常用供應商範本 (Presets)
@@ -506,3 +510,272 @@ def resolve_prompt(provider_name: str, model_name: str, settings: dict | None = 
             return p, f"[公版] {p.get('name', '未命名')}"
 
     return DEFAULT_PROMPT_PROFILES[0], "[公版] 預設通用公版"
+
+
+# ====================================================================== #
+#  v2.01 Pic-to-Pic (P2P) Image Generation Settings Management
+# ====================================================================== #
+
+DEFAULT_P2P_PROVIDERS: list[dict] = [
+    {
+        "name": "OpenRouter",
+        "api_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "api_key": "",
+        "models": [
+            "black-forest-labs/flux-1-dev",
+            "black-forest-labs/flux-1-schnell",
+            "recraft-ai/recraft-v20",
+            "stabilityai/stable-diffusion-3.5-large",
+        ],
+        "selected_model": "black-forest-labs/flux-1-dev",
+        "provider_type": "openrouter",
+    },
+    {
+        "name": "Venice AI",
+        "api_url": "https://api.venice.ai/api/v1",
+        "api_key_env": "VENICE_API_KEY",
+        "api_key": "",
+        "models": [
+            "flux-dev-uncensored",
+            "flux-dev",
+            "stable-diffusion-3.5",
+        ],
+        "selected_model": "flux-dev-uncensored",
+        "provider_type": "venice",
+    },
+    {
+        "name": "Atlas Cloud",
+        "api_url": "https://api.atlascloud.ai/v1",
+        "api_key_env": "ATLAS_API_KEY",
+        "api_key": "",
+        "models": [
+            "sdxl-turbo",
+            "flux-realism",
+        ],
+        "selected_model": "sdxl-turbo",
+        "provider_type": "atlas",
+    },
+]
+
+DEFAULT_DRAWING_PROMPTS: list[dict] = [
+    {
+        "id": "draw_anime",
+        "name": "動漫二次元風格",
+        "positive": "masterpiece, best quality, anime style, highly detailed illustration of {subject}, vibrant colors, dynamic lighting",
+        "negative": "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality",
+    },
+    {
+        "id": "draw_photo",
+        "name": "寫實攝影風格",
+        "positive": "photorealistic, 8k resolution, RAW photo, cinematic lighting, shot on 35mm lens, hyper-detailed texture of {subject}",
+        "negative": "cartoon, 3d render, anime, drawing, painting, bad lighting, blurry, distorted",
+    },
+    {
+        "id": "draw_cyberpunk",
+        "name": "賽博龐克風格",
+        "positive": "cyberpunk style, neon lights, night city, futuristic, highly detailed {subject}, cinematic atmosphere, 8k wallpaper",
+        "negative": "rustic, historical, daytime, washed out, low quality, cartoonish",
+    },
+    {
+        "id": "draw_sketch",
+        "name": "概念插畫與線稿",
+        "positive": "concept art, detailed sketch of {subject}, digital painting, trending on artstation, aesthetic composition",
+        "negative": "ugly, blurry, lowres, watermark, oversaturated",
+    },
+]
+
+DEFAULT_P2P_SETTINGS: dict = {
+    "selected_provider": "OpenRouter",
+    "providers": DEFAULT_P2P_PROVIDERS,
+    "drawing_prompts": DEFAULT_DRAWING_PROMPTS,
+    "active_prompt_id": "draw_anime",
+    "default_params": {
+        "image_strength": 0.65,
+        "aspect_ratio": "1:1",
+        "samples": 1,
+    },
+}
+
+
+def _migrate_p2p_secrets(settings: dict) -> bool:
+    """Migrate plaintext secrets from settings_p2p into .env."""
+    changed = False
+    for p in settings.get("providers", []):
+        env = p.get("api_key_env") or _env_var_name_for(p.get("name", ""))
+        p.setdefault("api_key_env", env)
+        if env != p.get("api_key_env"):
+            p["api_key_env"] = env
+            changed = True
+        key = (p.get("api_key") or "").strip()
+        if key:
+            set_key(str(DOTENV_PATH), env, key)
+            os.environ[env] = key
+            p["api_key"] = ""
+            changed = True
+    return changed
+
+
+def resolve_p2p_api_key(provider: dict) -> str:
+    """Resolve API key for a P2P provider from provider dict, .env, or os.environ."""
+    key = (provider.get("api_key") or "").strip()
+    if key:
+        return key
+    env = provider.get("api_key_env") or _env_var_name_for(provider.get("name", ""))
+    val = os.environ.get(env, "").strip()
+    if val:
+        return val
+    alt_env = f"API_KEY_{re.sub(r'[^A-Z0-9]', '_', provider.get('name', '').upper()).strip('_')}"
+    val = os.environ.get(alt_env, "").strip()
+    if val:
+        return val
+    name_l = provider.get("name", "").lower()
+    if "atlas" in name_l:
+        return (
+            os.environ.get("API_KEY_ATLAS", "").strip()
+            or os.environ.get("API_KEY_ATLAS_CLOUD", "").strip()
+            or os.environ.get("ATLAS_API_KEY", "").strip()
+        )
+    return ""
+
+
+def load_p2p_settings() -> dict:
+    """Load settings_p2p.json, merging defaults and populating API keys."""
+    if not SETTINGS_P2P_FILE.exists():
+        save_p2p_settings(DEFAULT_P2P_SETTINGS)
+        data = dict(DEFAULT_P2P_SETTINGS)
+    else:
+        try:
+            with open(SETTINGS_P2P_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
+
+    settings = _deep_merge(DEFAULT_P2P_SETTINGS, data)
+    migrated = _migrate_p2p_secrets(settings)
+    if migrated:
+        save_p2p_settings(settings)
+
+    # In-memory resolve API keys
+    for p in settings.get("providers", []):
+        p["api_key"] = resolve_p2p_api_key(p)
+
+    return settings
+
+
+def save_p2p_settings(settings: dict) -> None:
+    """Persist settings_p2p.json, stripping api_key to keep plaintext out of disk."""
+    clean = copy.deepcopy(settings)
+    for p in clean.get("providers", []):
+        p["api_key"] = ""
+    with open(SETTINGS_P2P_FILE, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2, ensure_ascii=False)
+
+
+def upsert_drawing_prompt(prompt: dict) -> None:
+    s = load_p2p_settings()
+    prompts = s.setdefault("drawing_prompts", [])
+    pid = prompt.get("id", "").strip()
+    if not pid:
+        pid = f"draw_{uuid.uuid4().hex[:8]}"
+        prompt["id"] = pid
+    for i, p in enumerate(prompts):
+        if p.get("id") == pid:
+            prompts[i] = prompt
+            break
+    else:
+        prompts.append(prompt)
+    save_p2p_settings(s)
+
+
+def delete_drawing_prompt(prompt_id: str) -> None:
+    s = load_p2p_settings()
+    prompts = [p for p in s.get("drawing_prompts", []) if p.get("id") != prompt_id]
+    s["drawing_prompts"] = prompts
+    if s.get("active_prompt_id") == prompt_id:
+        s["active_prompt_id"] = prompts[0]["id"] if prompts else ""
+    save_p2p_settings(s)
+
+
+def upsert_p2p_provider(provider: dict) -> None:
+    """Insert or update a P2P provider keyed by name; persist. Any api_key is
+    written to .env (never to settings_p2p.json)."""
+    s = load_p2p_settings()
+    providers = s.setdefault("providers", [])
+    name = provider.get("name", "").strip()
+    if not name:
+        return
+    env = provider.get("api_key_env") or _env_var_name_for(name)
+    provider["api_key_env"] = env
+    key = (provider.get("api_key") or "").strip()
+    if key:  # a real key was supplied → store in .env only
+        set_key(str(DOTENV_PATH), env, key)
+        os.environ[env] = key
+    provider["api_key"] = ""  # never persist the secret in settings_p2p.json
+
+    # ensure models and selected_model
+    models = provider.get("models")
+    if not models:
+        m = provider.get("model", "").strip()
+        provider["models"] = [m] if m else ["black-forest-labs/flux-1-dev"]
+    if not provider.get("selected_model"):
+        provider["selected_model"] = provider["models"][0]
+
+    for i, p in enumerate(providers):
+        if p.get("name") == name:
+            providers[i] = provider
+            break
+    else:
+        providers.append(provider)
+
+    if provider.get("is_default") or s.get("selected_provider") == name:
+        s["selected_provider"] = name
+    elif not s.get("selected_provider"):
+        s["selected_provider"] = name
+
+    save_p2p_settings(s)
+
+
+def delete_p2p_provider(name: str) -> None:
+    """Delete a P2P provider by name and persist."""
+    s = load_p2p_settings()
+    providers = [p for p in s.get("providers", []) if p.get("name") != name]
+    s["providers"] = providers
+    if s.get("selected_provider") == name:
+        s["selected_provider"] = providers[0]["name"] if providers else ""
+    save_p2p_settings(s)
+
+
+def add_model_to_p2p_provider(provider_name: str, model_name: str) -> None:
+    s = load_p2p_settings()
+    for p in s.get("providers", []):
+        if p.get("name") == provider_name:
+            models = p.setdefault("models", [])
+            if model_name not in models:
+                models.append(model_name)
+            p["selected_model"] = model_name
+            break
+    save_p2p_settings(s)
+
+
+def delete_model_from_p2p_provider(provider_name: str, model_name: str) -> None:
+    s = load_p2p_settings()
+    for p in s.get("providers", []):
+        if p.get("name") == provider_name:
+            models = [m for m in p.get("models", []) if m != model_name]
+            p["models"] = models
+            if p.get("selected_model") == model_name:
+                p["selected_model"] = models[0] if models else ""
+            break
+    save_p2p_settings(s)
+
+
+def select_p2p_provider_model(provider_name: str, model_name: str) -> None:
+    s = load_p2p_settings()
+    for p in s.get("providers", []):
+        if p.get("name") == provider_name:
+            p["selected_model"] = model_name
+            break
+    save_p2p_settings(s)
+
+

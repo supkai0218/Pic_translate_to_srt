@@ -16,6 +16,7 @@ ENV/
 
 # Local configuration with secrets / machine-specific paths
 settings.json
+settings_p2p.json
 
 # IDE/editor cache
 .vscode/
@@ -41,3 +42,5 @@ build/
 *.spec
 vlc/
 vlc_core/
+captured/
+generated/

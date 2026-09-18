@@ -19,7 +19,10 @@ from typing import Optional
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
+import capture_manager
 import config
+import image_gen_engine
+from image_gen_engine import P2PError, P2PProviderCfg, test_p2p_connection, generate_image
 import monitor_utils
 import srt_utils
 from llm_engine import LLMError, ProviderCfg, test_connection, translate_image
@@ -58,6 +61,7 @@ KEY_DISPLAY_MAP = {
     "delete": "Delete",
     "f11": "F11 (全螢幕)",
     "f5": "F5 (熱重載)",
+    "c": "C (快速截圖)",
 }
 
 
@@ -89,6 +93,7 @@ KEYBINDING_ACTIONS = [
     ("add_task", "➕ 新增至任務清單"),
     ("toggle_fullscreen", "切換全螢幕 (全螢幕/退出)"),
     ("hot_reload_sub", "重新載入字幕 (Hot Reload)"),
+    ("quick_capture", "📷 擷取畫面至素材庫"),
 ]
 
 
@@ -127,6 +132,7 @@ class SubtitleTask:
     status: str = "待處理"                          # "待處理" | "翻譯中" | "已完成" | "失敗"
     translation: str = ""
     error_msg: str = ""
+    image_path: Optional[str] = None               # v2.01: local saved path in \captured
 
     @property
     def duration(self) -> float:
@@ -149,7 +155,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 → SRT 產生器 (v1.11)")
+        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.01)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -245,18 +251,50 @@ class App(ctk.CTk):
         self._srt_entries: list[dict] = []
         self._busy: bool = False
 
-        # Tabs
+        # v2.01 Pic-to-Pic (P2P) Runtime State
+        self._p2p_settings = config.load_p2p_settings()
+        self._captured_images: list[dict] = []
+        self._selected_captured_paths: set[str] = set()
+        self._active_edit_path: Optional[str] = None
+        self._active_edit_img: Optional[Image.Image] = None
+        self._original_active_img: Optional[Image.Image] = None
+        self._edit_rotation: int = 0
+        self._edit_flip_h: bool = False
+        self._p2p_generated_images: list[Image.Image] = []
+        self._current_gen_img: Optional[Image.Image] = None
+        self._p2p_busy: bool = False
+        self._p2p_gallery_checkboxes: dict = {}
+        self._p2p_current_models: list[str] = []
+
+        # Tabs (v2.01 Refined Hierarchical Structure)
         self.tabs = ctk.CTkTabview(self, anchor="nw", command=self._on_tab_change)
         self.tabs.pack(fill="both", expand=True, padx=10, pady=(8, 10))
         self.tabs.add("  影音播放器  ")
-        self.tabs.add("  影片與字幕任務  ")
+        self.tabs.add("  影片截圖視窗  ")
+        self.tabs.add("  截圖翻譯字幕任務  ")
+        self.tabs.add("  圖生圖任務  ")
         self.tabs.add("  按鈕與快捷鍵設定  ")
-        self.tabs.add("  API 設定  ")
-        self.tabs.add("  Prompt 設定  ")
-        self.tabs.add("  執行  ")
 
-        # Lazy Tab Construction (v1.11 startup delay optimization)
+        # Sub-tabview for OCR (API & Prompt settings):
+        self.ocr_tabs = ctk.CTkTabview(self.tabs.tab("  截圖翻譯字幕任務  "), anchor="nw", command=self._on_ocr_subtab_change)
+        self.ocr_tabs.pack(fill="both", expand=True, padx=4, pady=4)
+        self.ocr_tabs.add("  翻譯字幕 API 設定  ")
+        self.ocr_tabs.add("  翻譯字幕 Prompt 設定  ")
+
+        # Sub-tabview for P2P:
+        self.p2p_tabs = ctk.CTkTabview(self.tabs.tab("  圖生圖任務  "), anchor="nw", command=self._on_p2p_subtab_change)
+        self.p2p_tabs.pack(fill="both", expand=True, padx=4, pady=4)
+        self.p2p_tabs.add("  編輯及預覽視窗  ")
+        self.p2p_tabs.add("  圖生圖 API 設定  ")
+        self.p2p_tabs.add("  圖生圖 Prompt 設定  ")
+
+        # Setup tab redirection wrappers for backwards compatibility
+        self._setup_tab_compatibility()
+
+        # Lazy Tab Construction (v1.11 & v2.01 startup delay optimization)
         self._built_tabs: set[str] = set()
+        self._built_ocr_subtabs: set[str] = set()
+        self._built_p2p_subtabs: set[str] = set()
         self._build_player_tab(self.tabs.tab("  影音播放器  "))
         self._built_tabs.add("  影音播放器  ")
         self._refresh_step_buttons()
@@ -411,6 +449,19 @@ class App(ctk.CTk):
             command=self._on_player_step_forward_large)
         self._player_btn_step_forward_large.pack(side="left")
 
+        # Quick capture and ROI navigation buttons (v2.01)
+        self._player_btn_roi = ctk.CTkButton(
+            btn_row, text="✂️ 前往影片截圖(ROI)", width=150, height=28, font=FONT_SMALL,
+            fg_color="#1f6aa5", hover_color="#144d75",
+            command=self._nav_to_video_capture)
+        self._player_btn_roi.pack(side="right", padx=(6, 0))
+
+        self._player_btn_capture = ctk.CTkButton(
+            btn_row, text="📷 截圖至素材庫", width=118, height=28, font=FONT_SMALL,
+            fg_color="#2e7d32", hover_color="#1b5e20",
+            command=self._quick_capture)
+        self._player_btn_capture.pack(side="right", padx=(6, 0))
+
         # Row 3: Audio, Zoom & Fullscreen
         audio_row = ctk.CTkFrame(ctl_frame, fg_color="transparent")
         audio_row.pack(fill="x", pady=(2, 2))
@@ -543,36 +594,150 @@ class App(ctk.CTk):
         tip_label.pack(fill="x", padx=10, pady=(2, 6))
 
     # ------------------------------------------------------------------ #
-    #  Tab Change & Dual-Tab Sync Methods
+    #  Tab Change & Dual-Tab Sync Methods (v2.01 Refined Architecture)
     # ------------------------------------------------------------------ #
+    def _setup_tab_compatibility(self):
+        orig_set = self.tabs.set
+        orig_tab = self.tabs.tab
+
+        def custom_set(name: str):
+            if name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
+                orig_set("  影片截圖視窗  ")
+                self._ensure_tab_built("  影片截圖視窗  ")
+            elif name in ("  API 設定  ", "  翻譯字幕 API 設定  "):
+                orig_set("  截圖翻譯字幕任務  ")
+                if hasattr(self, "ocr_tabs"):
+                    self.ocr_tabs.set("  翻譯字幕 API 設定  ")
+                self._ensure_tab_built("  翻譯字幕 API 設定  ")
+            elif name in ("  Prompt 設定  ", "  翻譯字幕 Prompt 設定  "):
+                orig_set("  截圖翻譯字幕任務  ")
+                if hasattr(self, "ocr_tabs"):
+                    self.ocr_tabs.set("  翻譯字幕 Prompt 設定  ")
+                self._ensure_tab_built("  翻譯字幕 Prompt 設定  ")
+            elif name in ("  圖生圖任務  ", "  編輯及預覽視窗  "):
+                orig_set("  圖生圖任務  ")
+                if hasattr(self, "p2p_tabs"):
+                    self.p2p_tabs.set("  編輯及預覽視窗  ")
+                self._ensure_tab_built("  編輯及預覽視窗  ")
+            elif name == "  圖生圖 API 設定  ":
+                orig_set("  圖生圖任務  ")
+                if hasattr(self, "p2p_tabs"):
+                    self.p2p_tabs.set("  圖生圖 API 設定  ")
+                self._ensure_tab_built("  圖生圖 API 設定  ")
+            elif name == "  圖生圖 Prompt 設定  ":
+                orig_set("  圖生圖任務  ")
+                if hasattr(self, "p2p_tabs"):
+                    self.p2p_tabs.set("  圖生圖 Prompt 設定  ")
+                self._ensure_tab_built("  圖生圖 Prompt 設定  ")
+            else:
+                orig_set(name)
+                self._on_tab_change()
+
+        def custom_tab(name: str):
+            if name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
+                return orig_tab("  影片截圖視窗  ")
+            elif name in ("  API 設定  ", "  翻譯字幕 API 設定  "):
+                return self.ocr_tabs.tab("  翻譯字幕 API 設定  ")
+            elif name in ("  Prompt 設定  ", "  翻譯字幕 Prompt 設定  "):
+                return self.ocr_tabs.tab("  翻譯字幕 Prompt 設定  ")
+            elif name in ("  編輯及預覽視窗  ",):
+                return self.p2p_tabs.tab("  編輯及預覽視窗  ")
+            elif name in ("  圖生圖 API 設定  ",):
+                return self.p2p_tabs.tab("  圖生圖 API 設定  ")
+            elif name in ("  圖生圖 Prompt 設定  ",):
+                return self.p2p_tabs.tab("  圖生圖 Prompt 設定  ")
+            return orig_tab(name)
+
+        self.tabs.set = custom_set
+        self.tabs.tab = custom_tab
+
+    def _on_ocr_subtab_change(self):
+        sub_name = self.ocr_tabs.get()
+        self._ensure_ocr_subtab_built(sub_name)
+
+    def _on_p2p_subtab_change(self):
+        sub_name = self.p2p_tabs.get()
+        self._ensure_p2p_subtab_built(sub_name)
+
+    def _ensure_ocr_subtab_built(self, sub_name: str):
+        if not hasattr(self, "_built_ocr_subtabs"):
+            self._built_ocr_subtabs = set()
+        if sub_name in self._built_ocr_subtabs:
+            return
+        self._built_ocr_subtabs.add(sub_name)
+
+        if sub_name == "  翻譯字幕 API 設定  ":
+            self._build_api_tab(self.ocr_tabs.tab("  翻譯字幕 API 設定  "))
+            self._sync_api_form()
+        elif sub_name == "  翻譯字幕 Prompt 設定  ":
+            self._build_prompt_tab(self.ocr_tabs.tab("  翻譯字幕 Prompt 設定  "))
+            self._sync_prompt_form()
+            self._refresh_prompt_tab_providers()
+
+    def _ensure_p2p_subtab_built(self, sub_name: str):
+        if not hasattr(self, "_built_p2p_subtabs"):
+            self._built_p2p_subtabs = set()
+        if sub_name in self._built_p2p_subtabs:
+            return
+        self._built_p2p_subtabs.add(sub_name)
+
+        if sub_name == "  編輯及預覽視窗  ":
+            self._build_p2p_editor_tab(self.p2p_tabs.tab("  編輯及預覽視窗  "))
+            self._refresh_p2p_gallery()
+            self._sync_p2p_prompt_controls()
+        elif sub_name == "  圖生圖 API 設定  ":
+            self._build_p2p_api_tab(self.p2p_tabs.tab("  圖生圖 API 設定  "))
+            self._sync_p2p_api_form()
+        elif sub_name == "  圖生圖 Prompt 設定  ":
+            self._build_p2p_prompt_tab(self.p2p_tabs.tab("  圖生圖 Prompt 設定  "))
+            self._sync_p2p_prompt_form()
+
     def _ensure_tab_built(self, tab_name: str):
         if not hasattr(self, "_built_tabs"):
             self._built_tabs = set()
         if tab_name in self._built_tabs:
             return
         self._built_tabs.add(tab_name)
-        if tab_name == "  影片與字幕任務  ":
-            self._build_video_tab(self.tabs.tab("  影片與字幕任務  "))
+
+        if tab_name == "  影音播放器  ":
+            self._build_player_tab(self.tabs.tab("  影音播放器  "))
+            self._refresh_step_buttons()
+        elif tab_name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
+            self._built_tabs.update(["  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "])
+            self._build_video_tab(self.tabs.tab("  影片截圖視窗  "))
             self._refresh_step_buttons()
             self._sync_video_tab_ui()
             self._render_tasks_list()
+            self._refresh_run_tab_summary()
+        elif tab_name == "  截圖翻譯字幕任務  ":
+            self._built_tabs.add("  截圖翻譯字幕任務  ")
+            if hasattr(self, "ocr_tabs"):
+                self._ensure_ocr_subtab_built(self.ocr_tabs.get())
+        elif tab_name in ("  API 設定  ", "  翻譯字幕 API 設定  "):
+            self._built_tabs.update(["  API 設定  ", "  翻譯字幕 API 設定  "])
+            self._ensure_ocr_subtab_built("  翻譯字幕 API 設定  ")
+        elif tab_name in ("  Prompt 設定  ", "  翻譯字幕 Prompt 設定  "):
+            self._built_tabs.update(["  Prompt 設定  ", "  翻譯字幕 Prompt 設定  "])
+            self._ensure_ocr_subtab_built("  翻譯字幕 Prompt 設定  ")
+        elif tab_name in ("  圖生圖任務  ", "  編輯及預覽視窗  "):
+            self._built_tabs.update(["  圖生圖任務  ", "  編輯及預覽視窗  "])
+            self._ensure_p2p_subtab_built("  編輯及預覽視窗  ")
+        elif tab_name == "  圖生圖 API 設定  ":
+            self._built_tabs.add("  圖生圖 API 設定  ")
+            self._ensure_p2p_subtab_built("  圖生圖 API 設定  ")
+        elif tab_name == "  圖生圖 Prompt 設定  ":
+            self._built_tabs.add("  圖生圖 Prompt 設定  ")
+            self._ensure_p2p_subtab_built("  圖生圖 Prompt 設定  ")
         elif tab_name == "  按鈕與快捷鍵設定  ":
             self._build_keybindings_tab(self.tabs.tab("  按鈕與快捷鍵設定  "))
             self._refresh_step_buttons()
-        elif tab_name == "  API 設定  ":
-            self._build_api_tab(self.tabs.tab("  API 設定  "))
-            self._sync_api_form()
-        elif tab_name == "  Prompt 設定  ":
-            self._build_prompt_tab(self.tabs.tab("  Prompt 設定  "))
-            self._sync_prompt_form()
-            self._refresh_prompt_tab_providers()
-        elif tab_name == "  執行  ":
-            self._build_run_tab(self.tabs.tab("  執行  "))
-            self._refresh_run_tab_summary()
 
     def _switch_to_tab(self, name: str):
+        self._active_tab_name = name
         self.tabs.set(name)
+        self._ensure_tab_built(name)
         self._on_tab_change()
+        self._active_tab_name = name
 
     def _on_tab_change(self):
         tab_name = self.tabs.get()
@@ -591,7 +756,7 @@ class App(ctk.CTk):
             self._populate_sub_treeview()
             self._sync_subtitle_highlight()
 
-        elif tab_name == "  影片與字幕任務  ":
+        elif tab_name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
             if self._vlc_player:
                 if hasattr(self, "_sub_render_var"):
                     self._vlc_player.set_subtitle_visible(self._sub_render_var.get())
@@ -605,6 +770,8 @@ class App(ctk.CTk):
             if self._video_engine:
                 self._seek_to(self._current_sec)
             self._sync_video_tab_ui()
+            self._render_tasks_list()
+            self._refresh_run_tab_summary()
 
         elif tab_name == "  執行  ":
             self._refresh_run_tab_summary()
@@ -882,6 +1049,15 @@ class App(ctk.CTk):
     def _on_player_step_forward_large(self):
         sec = float(self._step_settings.get("step_forward_large_sec", 5.0))
         self._player_step_time(sec)
+
+    def _nav_to_video_capture(self):
+        """Navigate from Player directly to Video Capture (ROI) tab at current timestamp."""
+        self._stop_play()
+        if self._video_path and not self._video_engine:
+            self._load_video(self._video_path)
+        self._switch_to_tab("  影片截圖視窗  ")
+        self._seek_to(self._current_sec)
+        self._sync_video_tab_ui()
 
     # ------------------------------------------------------------------ #
     #  Window Scale & Fullscreen Controls
@@ -1279,10 +1455,16 @@ class App(ctk.CTk):
         # Row 1 of top bar: Video
         v_row = ctk.CTkFrame(top_bar, fg_color="transparent")
         v_row.pack(fill="x", padx=8, pady=(6, 4))
-        ctk.CTkButton(v_row, text="選擇影片", width=110, height=30,
+        ctk.CTkButton(v_row, text="選擇影片", width=105, height=30,
                       font=FONT_BODY, command=self._pick_video).pack(side="left")
         self._video_label = ctk.CTkLabel(v_row, text="（尚未載入影片）", font=FONT_BODY, anchor="w")
         self._video_label.pack(side="left", fill="x", expand=True, padx=(8, 8))
+
+        ctk.CTkButton(v_row, text="🎬 影音播放器", width=105, height=28, font=FONT_SMALL,
+                      command=lambda: self.tabs.set("  影音播放器  ")).pack(side="right", padx=(4, 0))
+        ctk.CTkButton(v_row, text="🎨 前往圖生圖", width=105, height=28, font=FONT_SMALL,
+                      fg_color="#1f6aa5", hover_color="#144d75",
+                      command=lambda: self.tabs.set("  圖生圖任務  ")).pack(side="right", padx=(4, 0))
         self._video_spec_label = ctk.CTkLabel(v_row, text="", font=FONT_SMALL,
                                              text_color=("gray40", "#9aa0a6"), anchor="e")
         self._video_spec_label.pack(side="right", padx=(0, 4))
@@ -1467,11 +1649,23 @@ class App(ctk.CTk):
         ctk.CTkButton(roi_row, text="套用上次框選", width=95, height=26, font=FONT_SMALL,
                       command=self._apply_last_roi).pack(side="left", padx=(0, 8))
 
-        # Add Task Button
-        self._add_task_btn = ctk.CTkButton(task_cfg_box, text="➕ 新增至任務清單", height=34,
-                                           font=FONT_SUBTITLE, fg_color="#2e7d32", hover_color="#1b5e20",
-                                           command=self._add_task)
-        self._add_task_btn.pack(fill="x", padx=8, pady=(0, 8))
+        # Dual Action Buttons: Subtitle OCR vs. P2P Capture (v2.01)
+        action_btn_row = ctk.CTkFrame(task_cfg_box, fg_color="transparent")
+        action_btn_row.pack(fill="x", padx=8, pady=(0, 8))
+
+        self._add_task_btn = ctk.CTkButton(
+            action_btn_row, text="➕ 新增至字幕翻譯任務", height=34,
+            font=FONT_SUBTITLE, fg_color="#2e7d32", hover_color="#1b5e20",
+            command=self._add_task
+        )
+        self._add_task_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        self._capture_p2p_btn = ctk.CTkButton(
+            action_btn_row, text="🎨 截取範圍至圖生圖素材庫", height=34,
+            font=FONT_SUBTITLE, fg_color="#1f6aa5", hover_color="#144d75",
+            command=self._capture_to_p2p_gallery
+        )
+        self._capture_p2p_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         # Right Column: Tasks List
         right_col = ctk.CTkFrame(main_box)
@@ -1490,10 +1684,52 @@ class App(ctk.CTk):
         self._task_scroll = ctk.CTkScrollableFrame(right_col)
         self._task_scroll.pack(fill="both", expand=True, padx=10, pady=(2, 6))
 
-        # Bottom shortcut button
-        goto_run_btn = ctk.CTkButton(right_col, text="前往執行翻譯與匯出 →", height=34,
-                                     font=FONT_BODY, command=lambda: self._switch_to_tab("  執行  "))
-        goto_run_btn.pack(fill="x", padx=10, pady=(4, 8))
+        # Quick execution & SRT export card in execution tab (v2.01)
+        run_card = ctk.CTkFrame(right_col, fg_color=("gray85", "gray18"))
+        run_card.pack(fill="x", padx=10, pady=(2, 4))
+
+        self._run_prov_model_label = ctk.CTkLabel(
+            run_card, text="🔹 供應商：— ｜ 模型：—", font=FONT_SMALL, anchor="w"
+        )
+        self._run_prov_model_label.pack(fill="x", padx=8, pady=(4, 1))
+
+        self._run_prompt_label = ctk.CTkLabel(
+            run_card, text="🔹 套用 Prompt：—", font=FONT_SMALL, anchor="w"
+        )
+        self._run_prompt_label.pack(fill="x", padx=8, pady=(1, 4))
+
+        run_btn_row = ctk.CTkFrame(run_card, fg_color="transparent")
+        run_btn_row.pack(fill="x", padx=8, pady=(2, 4))
+
+        self._run_btn = ctk.CTkButton(
+            run_btn_row, text="開始 OCR 翻譯", height=30, font=FONT_BODY,
+            fg_color="#1f6aa5", hover_color="#144870", command=self._start_ocr
+        )
+        self._run_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        self._insert_btn = ctk.CTkButton(
+            run_btn_row, text="儲存為 SRT 檔案", height=30, font=FONT_BODY,
+            state="disabled", fg_color="#2e7d32", hover_color="#1b5e20",
+            command=self._insert_and_save
+        )
+        self._insert_btn.pack(side="right", fill="x", expand=True, padx=(4, 0))
+
+        self._progress = ctk.CTkProgressBar(run_card)
+        self._progress.set(0)
+        self._progress.pack(fill="x", padx=8, pady=(4, 4))
+
+        # Log & Preview
+        log_box = ctk.CTkFrame(right_col, fg_color="transparent")
+        log_box.pack(fill="both", expand=True, padx=10, pady=(0, 2))
+        self._log = ctk.CTkTextbox(log_box, height=85, font=FONT_MONO)
+        self._log.pack(fill="both", expand=True)
+
+        self._preview_scroll = ctk.CTkScrollableFrame(right_col, height=75)
+        self._preview_scroll.pack(fill="x", padx=10, pady=(0, 4))
+
+    def _build_ocr_exec_tab(self, parent):
+        """v2.01: Consolidated Subtitle OCR Execution Window."""
+        self._build_video_tab(parent)
 
     # ------------------------------------------------------------------ #
     #  Video Loading & Playback Engine Methods
@@ -1626,15 +1862,23 @@ class App(ctk.CTk):
         self._end_sec = min(2.0, effective_dur) if effective_dur > 0 else 2.0
         self._update_range_inputs()
 
+        # Reset crop ROI and start frame for the newly loaded video
+        self._start_frame_img = None
+        self._crop_box = None
+        if hasattr(self, "_canvas") and getattr(self, "_rect_id", None):
+            self._canvas.delete(self._rect_id)
+            self._rect_id = None
+        self._update_crop_preview()
+
         # Remove hint and seek to first frame
         if hasattr(self, "_canvas") and hasattr(self, "_hint_text_id"):
             self._canvas.delete(self._hint_text_id)
-        if self._active_tab_name == "  影片與字幕任務  ":
+        if self._active_tab_name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
             self._show_canvas_display()
         self._seek_to(0.0)
 
     def _show_vlc_display(self):
-        if self._active_display_mode != "vlc":
+        if hasattr(self, "_canvas") and hasattr(self, "_vlc_frame"):
             self._canvas.pack_forget()
             self._vlc_frame.pack(fill="both", expand=True)
             self._vlc_frame.update_idletasks()
@@ -1643,7 +1887,7 @@ class App(ctk.CTk):
             self._active_display_mode = "vlc"
 
     def _show_canvas_display(self):
-        if self._active_display_mode != "canvas":
+        if hasattr(self, "_canvas") and hasattr(self, "_vlc_frame"):
             self._vlc_frame.pack_forget()
             self._canvas.pack(fill="both", expand=True)
             self._canvas.update_idletasks()
@@ -1665,6 +1909,7 @@ class App(ctk.CTk):
             self._current_sec = sec
             self._render_current_frame()
             self._update_time_labels()
+            self._update_crop_preview()
         if self._vlc_player:
             self._vlc_player.set_time(sec)
 
@@ -1789,7 +2034,7 @@ class App(ctk.CTk):
         if self._vlc_player:
             if self._is_fullscreen and hasattr(self, "_fullscreen_frame") and self._fullscreen_frame:
                 self._vlc_player.bind_window(self._fullscreen_frame.winfo_id())
-            elif self._active_tab_name == "  影片與字幕任務  ":
+            elif self._active_tab_name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
                 self._show_vlc_display()
             else:
                 if hasattr(self, "_player_vlc_frame"):
@@ -1825,7 +2070,7 @@ class App(ctk.CTk):
             if vlc_t > 0:
                 self._current_sec = vlc_t
 
-        if self._active_tab_name == "  影片與字幕任務  ":
+        if self._active_tab_name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
             self._show_canvas_display()
             if self._video_engine:
                 self._seek_to(self._current_sec)
@@ -2188,8 +2433,7 @@ class App(ctk.CTk):
         if (vx1 - vx0) > 5 and (vy1 - vy0) > 5:
             self._crop_box = (vx0, vy0, vx1, vy1)
             self._last_crop_box = self._crop_box
-            # If start_frame_img not set yet, initialize it with current frame
-            if self._start_frame_img is None:
+            if self._current_frame_img:
                 self._start_frame_img = self._current_frame_img.copy()
             self._update_crop_preview()
 
@@ -2227,8 +2471,8 @@ class App(ctk.CTk):
         self._draw_crop_box_on_canvas(self._crop_box)
         self._update_crop_preview()
 
-    def _get_crop_image(self) -> Image.Image:
-        source_img = self._start_frame_img or self._current_frame_img
+    def _get_crop_image(self, source_override: Optional[Image.Image] = None) -> Image.Image:
+        source_img = source_override or self._current_frame_img or self._start_frame_img
         if not source_img:
             return Image.new("RGB", (320, 180), color=(30, 30, 30))
         if self._crop_box:
@@ -2256,8 +2500,99 @@ class App(ctk.CTk):
             self._roi_label.configure(text="翻譯範圍：全畫面 (預設)")
 
     # ------------------------------------------------------------------ #
-    #  Task Management
+    #  Task Management & Quick Capture (v2.01)
     # ------------------------------------------------------------------ #
+    def _quick_capture(self):
+        if not self._video_engine:
+            messagebox.showinfo("提示", "請先載入影片再進行截圖。")
+            return
+
+        target_frame = self._current_frame_img
+        if not target_frame and self._video_engine:
+            ok, frame = self._video_engine.seek_time(self._current_sec)
+            if ok and frame:
+                target_frame = frame
+                self._current_frame_img = frame
+
+        img = None
+        if self._crop_box:
+            img = self._get_crop_image(source_override=target_frame)
+        elif target_frame:
+            img = target_frame.copy()
+        else:
+            img = Image.new("RGB", (640, 360), color=(30, 30, 30))
+
+        is_crop = bool(self._crop_box)
+        saved_path = capture_manager.save_captured_image(
+            img=img,
+            video_path=self._video_path,
+            sec=self._current_sec,
+            is_crop=is_crop,
+            crop_box=self._crop_box,
+        )
+
+        msg = f"📷 已截圖並儲存至：{saved_path.name}"
+        if hasattr(self, "_log_line"):
+            self._log_line(msg)
+        if hasattr(self, "_player_video_spec_label"):
+            self._player_video_spec_label.configure(text=f"已截圖：{saved_path.name}")
+            self.after(3000, lambda: self._sync_player_ui() if hasattr(self, "_sync_player_ui") else None)
+
+        if hasattr(self, "_refresh_p2p_gallery"):
+            self._refresh_p2p_gallery()
+
+    def _capture_to_p2p_gallery(self):
+        r"""Capture current ROI (or full frame) directly into \captured for P2P generation,
+        WITHOUT creating a subtitle OCR task. Prompts user to jump to P2P Editor."""
+        if not self._video_engine:
+            messagebox.showinfo("提示", "請先載入影片再進行截圖。")
+            return
+
+        target_frame = self._current_frame_img
+        if not target_frame and self._video_engine:
+            ok, frame = self._video_engine.seek_time(self._current_sec)
+            if ok and frame:
+                target_frame = frame
+                self._current_frame_img = frame
+
+        img = None
+        if self._crop_box:
+            img = self._get_crop_image(source_override=target_frame)
+        elif target_frame:
+            img = target_frame.copy()
+        else:
+            img = Image.new("RGB", (640, 360), color=(30, 30, 30))
+
+        is_crop = bool(self._crop_box)
+        saved_path = capture_manager.save_captured_image(
+            img=img,
+            video_path=self._video_path,
+            sec=self._current_sec,
+            is_crop=is_crop,
+            crop_box=self._crop_box,
+        )
+
+        msg = f"🎨 已截取範圍並存入圖生圖素材庫：{saved_path.name}"
+        if hasattr(self, "_log_line"):
+            self._log_line(msg)
+        if hasattr(self, "_player_video_spec_label"):
+            self._player_video_spec_label.configure(text=f"已截圖至素材庫：{saved_path.name}")
+            self.after(3000, lambda: self._sync_player_ui() if hasattr(self, "_sync_player_ui") else None)
+
+        if hasattr(self, "_refresh_p2p_gallery"):
+            self._refresh_p2p_gallery()
+        if hasattr(self, "_set_active_p2p_image"):
+            self._set_active_p2p_image(str(saved_path))
+
+        if messagebox.askyesno(
+            "截圖成功",
+            f"已成功截取圖片至 \\captured 素材庫！\n檔名：{saved_path.name}\n\n是否立即前往【圖生圖任務 -> 編輯及預覽視窗】？"
+        ):
+            self.tabs.set("  圖生圖任務  ")
+            if hasattr(self, "p2p_tabs"):
+                self.p2p_tabs.set("  編輯及預覽視窗  ")
+            self._ensure_p2p_subtab_built("  編輯及預覽視窗  ")
+
     def _add_task(self):
         if not self._video_engine:
             messagebox.showwarning("尚未載入影片", "請先選擇並載入影片檔案。")
@@ -2274,7 +2609,23 @@ class App(ctk.CTk):
                 self._seek_to(self._start_sec)
                 self._start_frame_img = self._current_frame_img.copy() if self._current_frame_img else Image.new("RGB", (640, 360))
 
-        crop_img = self._get_crop_image()
+        crop_img = self._get_crop_image(source_override=self._start_frame_img)
+
+        # v2.01: Save captured crop image into \captured directory
+        saved_img_path = None
+        try:
+            saved_p = capture_manager.save_captured_image(
+                img=crop_img,
+                video_path=self._video_path,
+                sec=self._start_sec,
+                is_crop=bool(self._crop_box),
+                crop_box=self._crop_box,
+            )
+            saved_img_path = str(saved_p)
+            if hasattr(self, "_refresh_p2p_gallery"):
+                self._refresh_p2p_gallery()
+        except Exception:
+            pass
 
         task = SubtitleTask(
             id=self._next_task_id,
@@ -2283,7 +2634,8 @@ class App(ctk.CTk):
             start_frame_img=self._start_frame_img.copy(),
             crop_box=self._crop_box,
             crop_img=crop_img.copy(),
-            status="待處理"
+            status="待處理",
+            image_path=saved_img_path,
         )
         self._next_task_id += 1
         self._tasks.append(task)
@@ -2715,6 +3067,8 @@ class App(ctk.CTk):
             self._apply_last_roi()
         elif matched_action == "add_task":
             self._add_task()
+        elif matched_action == "quick_capture":
+            self._quick_capture()
 
         return "break"
 
@@ -2760,6 +3114,8 @@ class App(ctk.CTk):
         ctk.CTkButton(switch_row, text="刪除供應商", width=95, height=30, font=FONT_BODY,
                       fg_color="#b23b3b", hover_color="#8a2e2e",
                       command=self._delete_current_provider).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(switch_row, text="🎬 前往影片截圖視窗", width=155, height=30, font=FONT_SMALL,
+                      command=lambda: self.tabs.set("  影片截圖視窗  ")).pack(side="right")
 
         # 供應商詳細資料表單
         form = ctk.CTkFrame(parent)
@@ -3644,6 +4000,1007 @@ class App(ctk.CTk):
             f"已成功儲存 SRT 字幕：\n{out}\n共包含 {len(entries)} 條字幕。"
         )
         self._log_line(f"已另存：{out}（共 {len(entries)} 條字幕）")
+
+    # ================================================================== #
+    #  v2.01 Pic-to-Pic (P2P) AI Image-to-Image Generation Subsystem
+    # ================================================================== #
+
+    # ------------------------------------------------------------------ #
+    #  P2P Tab 1: Edit & Preview Window (_build_p2p_editor_tab)
+    # ------------------------------------------------------------------ #
+    def _build_p2p_editor_tab(self, parent):
+        paned = tk.PanedWindow(
+            parent, orient="horizontal", sashrelief="raised", sashwidth=6,
+            bg="#252526", bd=0, opaqueresize=True
+        )
+        paned.pack(fill="both", expand=True, padx=6, pady=6)
+
+        left_col = ctk.CTkFrame(paned)
+        mid_col = ctk.CTkFrame(paned)
+        right_col = ctk.CTkFrame(paned)
+
+        paned.add(left_col, minsize=260, stretch="always")
+        paned.add(mid_col, minsize=380, stretch="always")
+        paned.add(right_col, minsize=380, stretch="always")
+
+        # --- Left Column: \captured Gallery ---
+        ctk.CTkLabel(left_col, text="📁 截圖素材庫 (\\captured)", font=FONT_SUBTITLE, anchor="w").pack(
+            fill="x", padx=10, pady=(8, 4))
+
+        ctk.CTkButton(
+            left_col, text="🎬 前往影片截圖視窗 (ROI)", height=28, font=FONT_SMALL,
+            fg_color="#1f6aa5", hover_color="#144d75",
+            command=lambda: self.tabs.set("  影片截圖視窗  ")
+        ).pack(fill="x", padx=10, pady=(0, 6))
+
+        top_btns = ctk.CTkFrame(left_col, fg_color="transparent")
+        top_btns.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkButton(top_btns, text="🔄 重新整理", width=80, height=26, font=FONT_SMALL,
+                      command=self._refresh_p2p_gallery).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(top_btns, text="📂 開啟資料夾", width=95, height=26, font=FONT_SMALL,
+                      command=self._open_captured_folder).pack(side="left")
+
+        sel_btns = ctk.CTkFrame(left_col, fg_color="transparent")
+        sel_btns.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkButton(sel_btns, text="☑ 全選", width=55, height=24, font=FONT_SMALL,
+                      command=self._select_all_captured).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(sel_btns, text="☐ 全不選", width=65, height=24, font=FONT_SMALL,
+                      command=self._deselect_all_captured).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(sel_btns, text="🗑️ 刪除", width=70, height=24, font=FONT_SMALL,
+                      fg_color="#b23b3b", hover_color="#8a2e2e",
+                      command=self._delete_selected_captured).pack(side="right")
+
+        self._p2p_gallery_count_label = ctk.CTkLabel(
+            left_col, text="共 0 張 ｜ 已勾選 0 張", font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w"
+        )
+        self._p2p_gallery_count_label.pack(fill="x", padx=10, pady=(0, 4))
+
+        self._p2p_gallery_scroll = ctk.CTkScrollableFrame(left_col)
+        self._p2p_gallery_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+        # --- Middle Column: Image Edit Canvas & Tools ---
+        ctk.CTkLabel(mid_col, text="🖌️ 參考圖微調與旋轉", font=FONT_SUBTITLE, anchor="w").pack(
+            fill="x", padx=10, pady=(8, 4))
+
+        edit_bar1 = ctk.CTkFrame(mid_col, fg_color="transparent")
+        edit_bar1.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkButton(edit_bar1, text="⟲ 逆轉 90°", width=80, height=28, font=FONT_SMALL,
+                      command=lambda: self._rotate_p2p_image(270)).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(edit_bar1, text="⟳ 順轉 90°", width=80, height=28, font=FONT_SMALL,
+                      command=lambda: self._rotate_p2p_image(90)).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(edit_bar1, text="180° 旋轉", width=75, height=28, font=FONT_SMALL,
+                      command=lambda: self._rotate_p2p_image(180)).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(edit_bar1, text="⇄ 水平翻轉", width=80, height=28, font=FONT_SMALL,
+                      command=self._flip_p2p_image).pack(side="left")
+
+        edit_bar2 = ctk.CTkFrame(mid_col, fg_color="transparent")
+        edit_bar2.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkButton(edit_bar2, text="↺ 重設原圖", width=80, height=26, font=FONT_SMALL,
+                      command=self._reset_p2p_image).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(edit_bar2, text="💾 另存為新素材", width=110, height=26, font=FONT_SMALL,
+                      fg_color="#2e7d32", hover_color="#1b5e20",
+                      command=self._save_p2p_edited_as_new).pack(side="left")
+
+        self._p2p_edit_info_label = ctk.CTkLabel(
+            mid_col, text="請從左側點選一張圖片進入微調編輯", font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w"
+        )
+        self._p2p_edit_info_label.pack(fill="x", padx=10, pady=(0, 4))
+
+        self._p2p_edit_canvas_box = ctk.CTkFrame(mid_col, fg_color="black")
+        self._p2p_edit_canvas_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        self._p2p_edit_canvas = tk.Canvas(self._p2p_edit_canvas_box, bg="#141414", highlightthickness=0)
+        self._p2p_edit_canvas.pack(fill="both", expand=True)
+        self._p2p_edit_canvas.bind("<Configure>", lambda _e: self._render_active_p2p_canvas())
+
+        # --- Right Column: AI Generation Controls & Output ---
+        ctk.CTkLabel(right_col, text="🚀 雲端聚合以圖生圖", font=FONT_SUBTITLE, anchor="w").pack(
+            fill="x", padx=10, pady=(8, 4))
+
+        right_scroll = ctk.CTkScrollableFrame(right_col)
+        right_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+        # Provider & Model selection row
+        prov_row = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        prov_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(prov_row, text="服務商：", font=FONT_SMALL).pack(side="left")
+        providers = [p.get("name", "") for p in self._p2p_settings.get("providers", [])] or ["OpenRouter"]
+        self._p2p_prov_var = ctk.StringVar(value=self._p2p_settings.get("selected_provider") or providers[0])
+        self._p2p_prov_menu = ctk.CTkOptionMenu(
+            prov_row, values=providers, variable=self._p2p_prov_var, font=FONT_SMALL,
+            width=130, height=26, command=self._on_p2p_provider_change
+        )
+        self._p2p_prov_menu.pack(side="left", padx=(2, 8))
+
+        ctk.CTkLabel(prov_row, text="模型：", font=FONT_SMALL).pack(side="left")
+        self._p2p_model_var = ctk.StringVar(value="")
+        self._p2p_model_menu = ctk.CTkOptionMenu(
+            prov_row, values=["default"], variable=self._p2p_model_var, font=FONT_SMALL,
+            width=160, height=26
+        )
+        self._p2p_model_menu.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        # Prompt preset row
+        preset_row = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        preset_row.pack(fill="x", pady=(4, 4))
+        ctk.CTkLabel(preset_row, text="Prompt 範本：", font=FONT_SMALL).pack(side="left")
+        presets = [p.get("name", "") for p in self._p2p_settings.get("drawing_prompts", [])] or ["未設定"]
+        self._p2p_preset_var = ctk.StringVar(value=presets[0])
+        self._p2p_preset_menu = ctk.CTkOptionMenu(
+            preset_row, values=presets, variable=self._p2p_preset_var, font=FONT_SMALL,
+            height=26, command=self._on_p2p_preset_change
+        )
+        self._p2p_preset_menu.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        # Positive Prompt
+        ctk.CTkLabel(right_scroll, text="📝 正向提示詞 (Prompt)：", font=FONT_SMALL, anchor="w").pack(
+            fill="x", pady=(4, 1))
+        self._p2p_pos_prompt_box = ctk.CTkTextbox(right_scroll, height=65, font=FONT_BODY)
+        self._p2p_pos_prompt_box.pack(fill="x", pady=(0, 4))
+
+        # Negative Prompt
+        ctk.CTkLabel(right_scroll, text="🚫 負向提示詞 (Negative Prompt)：", font=FONT_SMALL, anchor="w").pack(
+            fill="x", pady=(2, 1))
+        self._p2p_neg_prompt_box = ctk.CTkTextbox(right_scroll, height=45, font=FONT_SMALL)
+        self._p2p_neg_prompt_box.pack(fill="x", pady=(0, 4))
+
+        # Parameters: Strength & Aspect Ratio
+        param_row = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        param_row.pack(fill="x", pady=(2, 6))
+
+        ctk.CTkLabel(param_row, text="強度(重繪)：", font=FONT_SMALL).pack(side="left")
+        self._p2p_strength_var = ctk.DoubleVar(value=self._p2p_settings.get("default_params", {}).get("image_strength", 0.65))
+        self._p2p_strength_slider = ctk.CTkSlider(
+            param_row, from_=0.10, to=1.00, variable=self._p2p_strength_var,
+            width=100, height=14, command=lambda v: self._p2p_strength_label.configure(text=f"{float(v):.2f}")
+        )
+        self._p2p_strength_slider.pack(side="left", padx=(2, 4))
+        self._p2p_strength_label = ctk.CTkLabel(param_row, text=f"{self._p2p_strength_var.get():.2f}", font=FONT_SMALL, width=32)
+        self._p2p_strength_label.pack(side="left", padx=(0, 8))
+
+        ctk.CTkLabel(param_row, text="比例：", font=FONT_SMALL).pack(side="left")
+        self._p2p_aspect_var = ctk.StringVar(value=self._p2p_settings.get("default_params", {}).get("aspect_ratio", "1:1"))
+        self._p2p_aspect_seg = ctk.CTkSegmentedButton(
+            param_row, values=["1:1", "16:9", "9:16", "4:3"],
+            variable=self._p2p_aspect_var, height=24, font=FONT_SMALL
+        )
+        self._p2p_aspect_seg.pack(side="left", fill="x", expand=True)
+
+        # Generate button
+        self._p2p_gen_btn = ctk.CTkButton(
+            right_scroll, text="🎨 開始 AI 以圖生圖", height=34, font=FONT_SUBTITLE,
+            fg_color="#1f6aa5", hover_color="#144870", command=self._start_p2p_generate
+        )
+        self._p2p_gen_btn.pack(fill="x", pady=(4, 4))
+
+        self._p2p_status_label = ctk.CTkLabel(
+            right_scroll, text="準備就緒", font=FONT_SMALL, text_color=("gray40", "#9aa0a6")
+        )
+        self._p2p_status_label.pack(fill="x", pady=(0, 4))
+
+        # Output Canvas & Action buttons
+        ctk.CTkLabel(right_scroll, text="🖼️ AI 生成成果預覽：", font=FONT_SMALL, anchor="w").pack(
+            fill="x", pady=(4, 2))
+        self._p2p_result_box = ctk.CTkFrame(right_scroll, fg_color="black")
+        self._p2p_result_box.pack(fill="x", pady=(0, 4))
+
+        self._p2p_result_canvas = tk.Canvas(self._p2p_result_box, bg="#141414", height=220, highlightthickness=0)
+        self._p2p_result_canvas.pack(fill="both", expand=True)
+
+        res_btns = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        res_btns.pack(fill="x", pady=(2, 6))
+        self._p2p_save_btn = ctk.CTkButton(
+            res_btns, text="💾 另存至 \\generated", height=28, font=FONT_SMALL,
+            state="disabled", fg_color="#2e7d32", hover_color="#1b5e20",
+            command=self._save_p2p_result
+        )
+        self._p2p_save_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._p2p_reuse_btn = ctk.CTkButton(
+            res_btns, text="🔍 設為下一輪參考圖", height=28, font=FONT_SMALL,
+            state="disabled", command=self._use_result_as_input
+        )
+        self._p2p_reuse_btn.pack(side="right", fill="x", expand=True, padx=(4, 0))
+
+    # ------------------------------------------------------------------ #
+    #  P2P Gallery Operations
+    # ------------------------------------------------------------------ #
+    def _refresh_p2p_gallery(self):
+        if not hasattr(self, "_p2p_gallery_scroll"):
+            return
+        self._captured_images = capture_manager.list_captured_images()
+        self._render_p2p_gallery()
+
+    def _render_p2p_gallery(self):
+        for w in self._p2p_gallery_scroll.winfo_children():
+            w.destroy()
+        self._p2p_gallery_checkboxes.clear()
+
+        total = len(self._captured_images)
+        sel_count = len(self._selected_captured_paths)
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(text=f"共 {total} 張 ｜ 已勾選 {sel_count} 張")
+
+        if not self._captured_images:
+            empty_lbl = ctk.CTkLabel(
+                self._p2p_gallery_scroll, text="\\captured 目錄目前無圖片\n可於播放器按 C 鍵或點擊截圖",
+                font=FONT_SMALL, text_color=("gray40", "#9aa0a6")
+            )
+            empty_lbl.pack(pady=20)
+            return
+
+        self._thumb_cache = getattr(self, "_thumb_cache", {})
+
+        for item in self._captured_images:
+            p_str = str(item["path"])
+            row_frame = ctk.CTkFrame(self._p2p_gallery_scroll, fg_color=("gray85", "gray20"))
+            row_frame.pack(fill="x", pady=2, padx=2)
+
+            cb_var = ctk.BooleanVar(value=(p_str in self._selected_captured_paths))
+            self._p2p_gallery_checkboxes[p_str] = cb_var
+
+            cb = ctk.CTkCheckBox(
+                row_frame, text="", variable=cb_var, width=20,
+                command=lambda p=p_str: self._toggle_captured_selection(p)
+            )
+            cb.pack(side="left", padx=(6, 4))
+
+            # Thumbnail
+            thumb_tk = self._thumb_cache.get(p_str)
+            if not thumb_tk:
+                try:
+                    img = Image.open(item["path"])
+                    img.thumbnail((64, 36), Image.Resampling.BILINEAR)
+                    thumb_tk = ImageTk.PhotoImage(img)
+                    self._thumb_cache[p_str] = thumb_tk
+                except Exception:
+                    thumb_tk = None
+
+            if thumb_tk:
+                thumb_lbl = tk.Label(row_frame, image=thumb_tk, bg="#202020", cursor="hand2")
+                thumb_lbl.pack(side="left", padx=(0, 6), pady=3)
+                thumb_lbl.bind("<Button-1>", lambda _e, p=p_str: self._set_active_p2p_image(p))
+
+            info_col = ctk.CTkFrame(row_frame, fg_color="transparent")
+            info_col.pack(side="left", fill="x", expand=True)
+
+            name_lbl = ctk.CTkLabel(info_col, text=item["name"], font=FONT_SMALL, anchor="w", cursor="hand2")
+            name_lbl.pack(fill="x")
+            name_lbl.bind("<Button-1>", lambda _e, p=p_str: self._set_active_p2p_image(p))
+
+            time_lbl = ctk.CTkLabel(info_col, text=item.get("date_str", ""), font=("Consolas", 10),
+                                    text_color=("gray40", "#888"), anchor="w")
+            time_lbl.pack(fill="x")
+
+        # Automatically select first item if none active
+        if not self._active_edit_path and self._captured_images:
+            self._set_active_p2p_image(str(self._captured_images[0]["path"]))
+
+    def _open_captured_folder(self):
+        d = capture_manager.get_captured_dir()
+        try:
+            os.startfile(str(d))
+        except Exception as exc:
+            messagebox.showerror("開啟失敗", f"無法開啟目錄：{exc}")
+
+    def _select_all_captured(self):
+        for item in self._captured_images:
+            self._selected_captured_paths.add(str(item["path"]))
+        for var in self._p2p_gallery_checkboxes.values():
+            var.set(True)
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(
+                text=f"共 {len(self._captured_images)} 張 ｜ 已勾選 {len(self._selected_captured_paths)} 張"
+            )
+
+    def _deselect_all_captured(self):
+        self._selected_captured_paths.clear()
+        for var in self._p2p_gallery_checkboxes.values():
+            var.set(False)
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(
+                text=f"共 {len(self._captured_images)} 張 ｜ 已勾選 0 張"
+            )
+
+    def _toggle_captured_selection(self, p_str: str):
+        var = self._p2p_gallery_checkboxes.get(p_str)
+        if var and var.get():
+            self._selected_captured_paths.add(p_str)
+        else:
+            self._selected_captured_paths.discard(p_str)
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(
+                text=f"共 {len(self._captured_images)} 張 ｜ 已勾選 {len(self._selected_captured_paths)} 張"
+            )
+
+    def _delete_selected_captured(self):
+        if not self._selected_captured_paths:
+            messagebox.showinfo("提示", "請先勾選欲刪除的截圖。")
+            return
+        count = len(self._selected_captured_paths)
+        if not messagebox.askyesno("確認刪除", f"確定要從硬碟刪除這 {count} 張截圖嗎？此操作無法復原。"):
+            return
+        for p_str in list(self._selected_captured_paths):
+            try:
+                p = Path(p_str)
+                if p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+        self._selected_captured_paths.clear()
+        self._active_edit_path = None
+        self._active_edit_img = None
+        self._original_active_img = None
+        self._refresh_p2p_gallery()
+
+    def _set_active_p2p_image(self, p_str: str):
+        self._active_edit_path = p_str
+        self._edit_rotation = 0
+        self._edit_flip_h = False
+        try:
+            self._original_active_img = Image.open(p_str).convert("RGB")
+            self._active_edit_img = self._original_active_img.copy()
+        except Exception as exc:
+            messagebox.showerror("讀取失敗", f"無法載入圖片：{exc}")
+            return
+        self._selected_captured_paths.add(p_str)
+        if p_str in self._p2p_gallery_checkboxes:
+            self._p2p_gallery_checkboxes[p_str].set(True)
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(
+                text=f"共 {len(self._captured_images)} 張 ｜ 已勾選 {len(self._selected_captured_paths)} 張"
+            )
+        self._render_active_p2p_canvas()
+
+    # ------------------------------------------------------------------ #
+    #  P2P Image Editing Pipeline (Rotate & Flip)
+    # ------------------------------------------------------------------ #
+    def _rotate_p2p_image(self, deg: int):
+        if not self._original_active_img:
+            return
+        self._edit_rotation = (self._edit_rotation + deg) % 360
+        self._apply_edits_and_render()
+
+    def _flip_p2p_image(self):
+        if not self._original_active_img:
+            return
+        self._edit_flip_h = not self._edit_flip_h
+        self._apply_edits_and_render()
+
+    def _reset_p2p_image(self):
+        if not self._original_active_img:
+            return
+        self._edit_rotation = 0
+        self._edit_flip_h = False
+        self._apply_edits_and_render()
+
+    def _apply_edits_and_render(self):
+        if not self._original_active_img:
+            return
+        img = capture_manager.rotate_image(self._original_active_img, self._edit_rotation)
+        if self._edit_flip_h:
+            img = capture_manager.flip_image(img, horizontal=True)
+        self._active_edit_img = img
+        self._render_active_p2p_canvas()
+
+    def _save_p2p_edited_as_new(self):
+        if not self._active_edit_img:
+            messagebox.showinfo("提示", "目前沒有正在編輯的圖片。")
+            return
+        saved_p = capture_manager.save_captured_image(
+            img=self._active_edit_img,
+            custom_name="edited",
+        )
+        self._refresh_p2p_gallery()
+        self._set_active_p2p_image(str(saved_p))
+        messagebox.showinfo("儲存成功", f"編輯後的圖片已另存為：\n{saved_p.name}")
+
+    def _render_active_p2p_canvas(self):
+        if not hasattr(self, "_p2p_edit_canvas") or not self._active_edit_img:
+            return
+        cw = max(10, self._p2p_edit_canvas.winfo_width())
+        ch = max(10, self._p2p_edit_canvas.winfo_height())
+        iw, ih = self._active_edit_img.size
+
+        scale = min(cw / iw, ch / ih)
+        disp_w = max(1, int(iw * scale))
+        disp_h = max(1, int(ih * scale))
+
+        disp_img = self._active_edit_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
+        self._p2p_canvas_tk = ImageTk.PhotoImage(disp_img)
+        self._p2p_edit_canvas.delete("all")
+        self._p2p_edit_canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._p2p_canvas_tk)
+
+        if hasattr(self, "_p2p_edit_info_label"):
+            flip_str = "是" if self._edit_flip_h else "否"
+            self._p2p_edit_info_label.configure(
+                text=f"原尺寸: {iw}x{ih} ｜ 旋轉: {self._edit_rotation}° ｜ 水平翻轉: {flip_str}"
+            )
+
+    # ------------------------------------------------------------------ #
+    #  P2P Generation & Result Management
+    # ------------------------------------------------------------------ #
+    def _sync_p2p_prompt_controls(self):
+        if not hasattr(self, "_p2p_prov_menu"):
+            return
+        prov_list = [p.get("name", "") for p in self._p2p_settings.get("providers", [])]
+        if prov_list:
+            self._p2p_prov_menu.configure(values=prov_list)
+            cur = self._p2p_prov_var.get()
+            if cur not in prov_list:
+                self._p2p_prov_var.set(prov_list[0])
+            self._on_p2p_provider_change(self._p2p_prov_var.get())
+
+        preset_list = [p.get("name", "") for p in self._p2p_settings.get("drawing_prompts", [])]
+        if preset_list:
+            self._p2p_preset_menu.configure(values=preset_list)
+            cur_p = self._p2p_preset_var.get()
+            if cur_p not in preset_list:
+                self._p2p_preset_var.set(preset_list[0])
+            self._on_p2p_preset_change(self._p2p_preset_var.get())
+
+    def _on_p2p_provider_change(self, choice: str):
+        for p in self._p2p_settings.get("providers", []):
+            if p.get("name") == choice:
+                models = p.get("models") or ["default"]
+                if hasattr(self, "_p2p_model_menu"):
+                    self._p2p_model_menu.configure(values=models)
+                    sel_m = p.get("selected_model") or models[0]
+                    self._p2p_model_var.set(sel_m)
+                break
+
+    def _on_p2p_preset_change(self, choice: str):
+        for p in self._p2p_settings.get("drawing_prompts", []):
+            if p.get("name") == choice:
+                if hasattr(self, "_p2p_pos_prompt_box"):
+                    self._p2p_pos_prompt_box.delete("1.0", "end")
+                    self._p2p_pos_prompt_box.insert("1.0", p.get("positive", ""))
+                if hasattr(self, "_p2p_neg_prompt_box"):
+                    self._p2p_neg_prompt_box.delete("1.0", "end")
+                    self._p2p_neg_prompt_box.insert("1.0", p.get("negative", ""))
+                break
+
+    def _start_p2p_generate(self):
+        if self._p2p_busy:
+            return
+
+        selected_imgs: list[Image.Image] = []
+        for p_str in self._selected_captured_paths:
+            if p_str == self._active_edit_path and self._active_edit_img:
+                selected_imgs.append(self._active_edit_img.copy())
+            else:
+                try:
+                    selected_imgs.append(Image.open(p_str).convert("RGB"))
+                except Exception:
+                    pass
+
+        if not selected_imgs and self._active_edit_img:
+            selected_imgs.append(self._active_edit_img.copy())
+
+        if not selected_imgs:
+            messagebox.showwarning("缺少參考圖", "請先在左側勾選至少一張截圖作為參考素材。")
+            return
+
+        prov_name = self._p2p_prov_var.get()
+        target_prov = None
+        for p in self._p2p_settings.get("providers", []):
+            if p.get("name") == prov_name:
+                target_prov = dict(p)
+                break
+        if not target_prov:
+            messagebox.showwarning("未選定服務商", "請先選擇有效的圖生圖服務商。")
+            return
+
+        target_prov["selected_model"] = self._p2p_model_var.get()
+        cfg = P2PProviderCfg.from_dict(target_prov)
+        cfg.api_key = config.resolve_p2p_api_key(target_prov)
+
+        pos_prompt = self._p2p_pos_prompt_box.get("1.0", "end").strip()
+        neg_prompt = self._p2p_neg_prompt_box.get("1.0", "end").strip()
+        aspect = self._p2p_aspect_var.get()
+        strength = float(self._p2p_strength_var.get())
+
+        self._p2p_busy = True
+        self._p2p_gen_btn.configure(state="disabled", text="⏳ AI 繪圖中...")
+        self._p2p_status_label.configure(text=f"正在請求 {cfg.name} 生成新圖，請稍候...")
+
+        def work():
+            try:
+                imgs = generate_image(
+                    cfg=cfg,
+                    images=selected_imgs,
+                    prompt=pos_prompt,
+                    negative_prompt=neg_prompt,
+                    aspect_ratio=aspect,
+                    strength=strength,
+                )
+                if imgs:
+                    self._current_gen_img = imgs[0]
+                    saved_p = capture_manager.save_generated_image(
+                        self._current_gen_img,
+                        prompt_name=self._p2p_preset_var.get(),
+                    )
+                    self.after(0, lambda: self._on_p2p_success(saved_p))
+                else:
+                    raise P2PError("服務端未回傳圖片資料。")
+            except Exception as exc:
+                self.after(0, lambda e=exc: self._on_p2p_error(str(e)))
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_p2p_success(self, saved_path: Path):
+        self._p2p_busy = False
+        self._p2p_gen_btn.configure(state="normal", text="🎨 開始 AI 以圖生圖")
+        self._p2p_status_label.configure(text=f"✅ 生成成功！已存至：{saved_path.name}")
+        self._p2p_save_btn.configure(state="normal")
+        self._p2p_reuse_btn.configure(state="normal")
+        self._render_result_canvas()
+
+    def _on_p2p_error(self, err_msg: str):
+        self._p2p_busy = False
+        self._p2p_gen_btn.configure(state="normal", text="🎨 開始 AI 以圖生圖")
+        self._p2p_status_label.configure(text=f"❌ 生圖失敗：{err_msg[:60]}")
+        messagebox.showerror("生成失敗", f"AI 繪圖發生錯誤：\n{err_msg}")
+
+    def _render_result_canvas(self):
+        if not hasattr(self, "_p2p_result_canvas") or not self._current_gen_img:
+            return
+        cw = max(10, self._p2p_result_canvas.winfo_width())
+        ch = max(10, self._p2p_result_canvas.winfo_height())
+        iw, ih = self._current_gen_img.size
+
+        scale = min(cw / iw, ch / ih)
+        disp_w = max(1, int(iw * scale))
+        disp_h = max(1, int(ih * scale))
+
+        disp_img = self._current_gen_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
+        self._p2p_result_tk = ImageTk.PhotoImage(disp_img)
+        self._p2p_result_canvas.delete("all")
+        self._p2p_result_canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._p2p_result_tk)
+
+    def _save_p2p_result(self):
+        if not self._current_gen_img:
+            return
+        target = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG 圖片", "*.png"), ("JPEG 圖片", "*.jpg")],
+            initialdir=str(capture_manager.get_generated_dir()),
+            initialfile="ai_generated.png",
+        )
+        if target:
+            self._current_gen_img.save(target)
+            messagebox.showinfo("儲存完成", f"圖片已成功另存為：\n{target}")
+
+    def _use_result_as_input(self):
+        if not self._current_gen_img:
+            return
+        saved_p = capture_manager.save_captured_image(
+            img=self._current_gen_img,
+            custom_name="ai_ref",
+        )
+        self._refresh_p2p_gallery()
+        self._set_active_p2p_image(str(saved_p))
+        messagebox.showinfo("已設為參考圖", f"AI 生成圖已存入 \\captured 並設為當前編輯參考圖：\n{saved_p.name}")
+
+    # ------------------------------------------------------------------ #
+    #  P2P Tab 2: API Settings (_build_p2p_api_tab)
+    # ------------------------------------------------------------------ #
+    def _build_p2p_api_tab(self, parent):
+        ctk.CTkLabel(parent, text="圖生圖 API 設定 (settings_p2p.json)", font=FONT_TITLE, anchor="w").pack(
+            fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(parent, text="管理支援圖生圖的聚合 API 服務商與繪圖模型，API 金鑰將自動同步儲存於 .env 檔案。",
+                     font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w").pack(
+            fill="x", padx=14, pady=(0, 6))
+
+        card = ctk.CTkFrame(parent)
+        card.pack(fill="x", padx=14, pady=(0, 8))
+
+        row1 = ctk.CTkFrame(card, fg_color="transparent")
+        row1.pack(fill="x", padx=12, pady=(10, 6))
+        ctk.CTkLabel(row1, text="選擇服務商：", font=FONT_BODY).pack(side="left")
+
+        prov_names = [p.get("name", "") for p in self._p2p_settings.get("providers", [])]
+        self._p2p_api_prov_var = ctk.StringVar(value=prov_names[0] if prov_names else "")
+        self._p2p_api_prov_menu = ctk.CTkOptionMenu(
+            row1, values=prov_names or ["（無）"], variable=self._p2p_api_prov_var, font=FONT_BODY,
+            command=self._on_p2p_api_provider_select
+        )
+        self._p2p_api_prov_menu.pack(side="left", padx=(4, 10))
+
+        ctk.CTkButton(row1, text="➕ 新增服務商", width=110, height=28, font=FONT_SMALL,
+                      command=self._add_p2p_provider).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(row1, text="🗑️ 刪除服務商", width=95, height=28, font=FONT_SMALL,
+                      fg_color="#b23b3b", hover_color="#8a2e2e",
+                      command=self._delete_p2p_provider).pack(side="left")
+
+        # Form fields
+        form = ctk.CTkFrame(parent)
+        form.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        form.grid_columnconfigure(1, weight=1)
+
+        # Row 0: Name
+        ctk.CTkLabel(form, text="服務商名稱：", font=FONT_BODY, anchor="e").grid(
+            row=0, column=0, sticky="e", padx=(10, 8), pady=6
+        )
+        self._p2p_name_entry = ctk.CTkEntry(form, font=FONT_BODY)
+        self._p2p_name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=6)
+
+        # Row 1: API URL
+        ctk.CTkLabel(form, text="API 網址 (Base URL)：", font=FONT_BODY, anchor="e").grid(
+            row=1, column=0, sticky="e", padx=(10, 8), pady=6
+        )
+        self._p2p_url_entry = ctk.CTkEntry(form, font=FONT_BODY)
+        self._p2p_url_entry.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=6)
+
+        # Row 2: API Key + View .env
+        ctk.CTkLabel(form, text="API 金鑰 (API Key)：", font=FONT_BODY, anchor="e").grid(
+            row=2, column=0, sticky="e", padx=(10, 8), pady=6
+        )
+        key_row = ctk.CTkFrame(form, fg_color="transparent")
+        key_row.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=6)
+        self._p2p_key_entry = ctk.CTkEntry(key_row, show="●", font=FONT_BODY)
+        self._p2p_key_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._p2p_show_key_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            key_row, text="顯示", variable=self._p2p_show_key_var, width=50,
+            command=lambda: self._p2p_key_entry.configure(show="" if self._p2p_show_key_var.get() else "●")
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            key_row, text="檢視/編輯 .env (記事本)", width=175, height=28, font=FONT_SMALL,
+            command=config.open_env_in_editor
+        ).pack(side="left")
+
+        # Row 3: Key Hint
+        self._p2p_key_hint_var = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            form, textvariable=self._p2p_key_hint_var, font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w"
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=(10, 10), pady=(0, 4))
+
+        # Row 4: Dedicated Model Management Panel (Parity with Subtitle API)
+        model_group = ctk.CTkFrame(form, fg_color=("gray92", "gray20"))
+        model_group.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 8))
+        model_group.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(model_group, text="【繪圖模型清單管理】", font=FONT_BODY, anchor="w").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2)
+        )
+
+        ctk.CTkLabel(model_group, text="模型選擇：", font=FONT_BODY, anchor="e").grid(
+            row=1, column=0, sticky="e", padx=(10, 8), pady=4
+        )
+        self._p2p_selected_model_var = ctk.StringVar(value="（無）")
+        self._p2p_api_model_menu = ctk.CTkOptionMenu(
+            model_group, width=280, height=28, font=FONT_BODY,
+            values=["（無）"], variable=self._p2p_selected_model_var,
+            command=self._on_p2p_model_menu_select
+        )
+        self._p2p_api_model_menu.grid(row=1, column=1, sticky="w", pady=4)
+
+        model_btns = ctk.CTkFrame(model_group, fg_color="transparent")
+        model_btns.grid(row=1, column=2, sticky="w", padx=(10, 10), pady=4)
+        ctk.CTkButton(
+            model_btns, text="設為目前使用", width=105, height=28, font=FONT_SMALL,
+            command=self._set_current_p2p_model_active
+        ).pack(side="left")
+        ctk.CTkButton(
+            model_btns, text="刪除此模型", width=90, height=28, font=FONT_SMALL,
+            fg_color="#b23b3b", hover_color="#8a2e2e",
+            command=self._delete_current_p2p_model
+        ).pack(side="left", padx=(6, 0))
+
+        ctk.CTkLabel(model_group, text="新增模型：", font=FONT_BODY, anchor="e").grid(
+            row=2, column=0, sticky="e", padx=(10, 8), pady=(4, 8)
+        )
+        self._p2p_new_model_var = ctk.StringVar()
+        new_model_entry = ctk.CTkEntry(
+            model_group, textvariable=self._p2p_new_model_var, font=FONT_BODY,
+            placeholder_text="輸入繪圖模型名稱，例如 black-forest-labs/flux-1-schnell"
+        )
+        new_model_entry.grid(row=2, column=1, sticky="ew", pady=(4, 8))
+        ctk.CTkButton(
+            model_group, text="＋ 加入模型", width=105, height=28, font=FONT_SMALL,
+            command=self._add_p2p_model_to_current
+        ).grid(row=2, column=2, sticky="w", padx=(10, 10), pady=(4, 8))
+
+        # Bottom Buttons
+        btn_row = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_row.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkButton(btn_row, text="測試連線", width=120, height=32, font=FONT_BODY,
+                      command=self._test_p2p_api_connection).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_row, text="儲存服務商與模型", width=160, height=32, font=FONT_BODY,
+                      fg_color="#1f6aa5", command=self._save_p2p_api_settings).pack(side="left")
+        self._p2p_api_status_label = ctk.CTkLabel(btn_row, text="", font=FONT_SMALL, anchor="w")
+        self._p2p_api_status_label.pack(side="left", padx=10)
+
+    def _refresh_p2p_model_menu(self, keep: str | None = None):
+        models = self._p2p_current_models or ["（無）"]
+        if hasattr(self, "_p2p_api_model_menu"):
+            self._p2p_api_model_menu.configure(values=models)
+        sel = keep if keep in models else (models[0] if models != ["（無）"] else "（無）")
+        if hasattr(self, "_p2p_selected_model_var"):
+            self._p2p_selected_model_var.set(sel)
+
+    def _on_p2p_model_menu_select(self, val: str):
+        self._p2p_selected_model_var.set(val)
+
+    def _set_current_p2p_model_active(self):
+        m = self._p2p_selected_model_var.get().strip()
+        if not m or m == "（無）":
+            return
+        p_name = self._p2p_name_entry.get().strip()
+        if p_name:
+            config.select_p2p_provider_model(p_name, m)
+            self._p2p_settings = config.load_p2p_settings()
+            self._sync_p2p_prompt_controls()
+        self._p2p_api_status_label.configure(
+            text=f"✅ 已將「{m}」設為此服務商的目前使用模型。",
+            text_color=("#0a7d2c", "#5ec97a")
+        )
+
+    def _add_p2p_model_to_current(self):
+        m = self._p2p_new_model_var.get().strip()
+        if not m:
+            return
+        if m not in self._p2p_current_models:
+            self._p2p_current_models.append(m)
+        self._refresh_p2p_model_menu(keep=m)
+        self._p2p_new_model_var.set("")
+        self._save_p2p_api_settings()
+
+    def _delete_current_p2p_model(self):
+        m = self._p2p_selected_model_var.get().strip()
+        if not m or m == "（無）":
+            return
+        if len(self._p2p_current_models) <= 1:
+            messagebox.showwarning("無法刪除", "服務商至少需保留一個模型。")
+            return
+        self._p2p_current_models = [x for x in self._p2p_current_models if x != m]
+        new_sel = self._p2p_current_models[0]
+        self._refresh_p2p_model_menu(keep=new_sel)
+        self._save_p2p_api_settings()
+
+    def _sync_p2p_api_form(self):
+        prov_names = [p.get("name", "") for p in self._p2p_settings.get("providers", [])]
+        if hasattr(self, "_p2p_api_prov_menu") and prov_names:
+            self._p2p_api_prov_menu.configure(values=prov_names)
+            cur = self._p2p_api_prov_var.get()
+            if cur not in prov_names:
+                cur = prov_names[0]
+                self._p2p_api_prov_var.set(cur)
+            self._on_p2p_api_provider_select(cur)
+
+    def _on_p2p_api_provider_select(self, choice: str):
+        for p in self._p2p_settings.get("providers", []):
+            if p.get("name") == choice:
+                if hasattr(self, "_p2p_name_entry"):
+                    self._p2p_name_entry.delete(0, "end")
+                    self._p2p_name_entry.insert(0, p.get("name", ""))
+                    self._p2p_url_entry.delete(0, "end")
+                    self._p2p_url_entry.insert(0, p.get("api_url", ""))
+                    self._p2p_current_models = list(p.get("models") or [])
+                    sel_m = p.get("selected_model") or (self._p2p_current_models[0] if self._p2p_current_models else "")
+                    self._refresh_p2p_model_menu(keep=sel_m)
+                    self._p2p_key_entry.delete(0, "end")
+                    self._p2p_key_entry.insert(0, p.get("api_key", ""))
+                    env = p.get("api_key_env") or config._env_var_name_for(p.get("name", ""))
+                    if hasattr(self, "_p2p_key_hint_var"):
+                        self._p2p_key_hint_var.set(f"金鑰儲存於 .env：{env}")
+                break
+
+    def _save_p2p_api_settings(self):
+        name = self._p2p_name_entry.get().strip()
+        url = self._p2p_url_entry.get().strip()
+        if not name:
+            messagebox.showwarning("缺少名稱", "請先填入服務商「名稱」。")
+            return
+        if not url:
+            messagebox.showwarning("資料不完整", "API 網址為必填。")
+            return
+
+        models = list(self._p2p_current_models)
+        sel_m = self._p2p_selected_model_var.get().strip()
+        if sel_m and sel_m not in models and sel_m != "（無）":
+            models.append(sel_m)
+        if not models:
+            models = ["black-forest-labs/flux-1-dev"]
+        if not sel_m or sel_m == "（無）":
+            sel_m = models[0]
+
+        key = self._p2p_key_entry.get().strip()
+
+        provider = {
+            "name": name,
+            "api_url": url,
+            "models": models,
+            "selected_model": sel_m,
+            "api_key": key,
+        }
+
+        cur_choice = self._p2p_api_prov_var.get()
+        if self._p2p_settings.get("selected_provider") == cur_choice:
+            provider["is_default"] = True
+
+        config.upsert_p2p_provider(provider)
+        self._p2p_settings = config.load_p2p_settings()
+        self._p2p_api_prov_var.set(name)
+        self._sync_p2p_api_form()
+        self._sync_p2p_prompt_controls()
+        self._p2p_api_status_label.configure(
+            text=f"✅ 已儲存服務商「{name}」與模型設定（金鑰同步至 .env）",
+            text_color=("#0a7d2c", "#5ec97a")
+        )
+
+    def _test_p2p_api_connection(self):
+        url = self._p2p_url_entry.get().strip()
+        key = self._p2p_key_entry.get().strip()
+        name = self._p2p_name_entry.get().strip()
+        models = list(self._p2p_current_models)
+        sel_m = self._p2p_selected_model_var.get().strip() if hasattr(self, "_p2p_selected_model_var") else ""
+        cfg = P2PProviderCfg(name=name, api_url=url, api_key=key, model=sel_m or (models[0] if models else ""))
+        if not cfg.api_key:
+            cfg.api_key = config.resolve_p2p_api_key({"name": name, "api_key": ""})
+
+        self._p2p_api_status_label.configure(text="測試連線中...", text_color=("gray40", "#9aa0a6"))
+
+        def work():
+            ok, msg = test_p2p_connection(cfg)
+            color = ("#0a7d2c", "#5ec97a") if ok else ("#b23b3b", "#ff6b6b")
+            self.after(0, lambda: self._p2p_api_status_label.configure(text=f"{'✅' if ok else '❌'} {msg}", text_color=color))
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _add_p2p_provider(self):
+        new_name = f"NewProvider_{len(self._p2p_settings.get('providers', [])) + 1}"
+        new_p = {
+            "name": new_name,
+            "api_url": "https://openrouter.ai/api/v1",
+            "models": ["black-forest-labs/flux-1-dev"],
+            "selected_model": "black-forest-labs/flux-1-dev",
+            "api_key": "",
+        }
+        config.upsert_p2p_provider(new_p)
+        self._p2p_settings = config.load_p2p_settings()
+        self._p2p_api_prov_var.set(new_name)
+        self._sync_p2p_api_form()
+
+    def _delete_p2p_provider(self):
+        providers = self._p2p_settings.get("providers", [])
+        if len(providers) <= 1:
+            messagebox.showwarning("無法刪除", "至少需保留一個圖生圖服務商。")
+            return
+        cur = self._p2p_api_prov_var.get()
+        if not messagebox.askyesno("刪除確認", f"確定要刪除服務商「{cur}」嗎？"):
+            return
+        config.delete_p2p_provider(cur)
+        self._p2p_settings = config.load_p2p_settings()
+        rem = self._p2p_settings.get("providers", [])
+        if rem:
+            self._p2p_api_prov_var.set(rem[0]["name"])
+        self._sync_p2p_api_form()
+        self._sync_p2p_prompt_controls()
+        self._p2p_api_status_label.configure(
+            text=f"🗑️ 已刪除服務商「{cur}」",
+            text_color=("#b23b3b", "#ff6b6b")
+        )
+
+    # ------------------------------------------------------------------ #
+    #  P2P Tab 3: Prompt Settings (_build_p2p_prompt_tab)
+    # ------------------------------------------------------------------ #
+    def _build_p2p_prompt_tab(self, parent):
+        ctk.CTkLabel(parent, text="圖生圖 Prompt 設定 (繪圖提示詞庫)", font=FONT_TITLE, anchor="w").pack(
+            fill="x", padx=14, pady=(12, 4))
+
+        card = ctk.CTkFrame(parent)
+        card.pack(fill="x", padx=14, pady=(0, 8))
+
+        row1 = ctk.CTkFrame(card, fg_color="transparent")
+        row1.pack(fill="x", padx=12, pady=(10, 6))
+        ctk.CTkLabel(row1, text="選擇範本：", font=FONT_BODY).pack(side="left")
+
+        presets = [p.get("name", "") for p in self._p2p_settings.get("drawing_prompts", [])]
+        self._p2p_prompt_cfg_var = ctk.StringVar(value=presets[0] if presets else "")
+        self._p2p_prompt_cfg_menu = ctk.CTkOptionMenu(
+            row1, values=presets, variable=self._p2p_prompt_cfg_var, font=FONT_BODY,
+            command=self._on_p2p_prompt_select
+        )
+        self._p2p_prompt_cfg_menu.pack(side="left", padx=(4, 10))
+
+        ctk.CTkButton(row1, text="➕ 新增範本", width=100, height=28, font=FONT_SMALL,
+                      command=self._add_p2p_prompt_preset).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(row1, text="🗑️ 刪除", width=70, height=28, font=FONT_SMALL,
+                      fg_color="#b23b3b", hover_color="#8a2e2e",
+                      command=self._delete_p2p_prompt_preset).pack(side="left")
+
+        form = ctk.CTkFrame(parent)
+        form.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+        ctk.CTkLabel(form, text="範本名稱：", font=FONT_BODY, anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        self._p2p_preset_name_entry = ctk.CTkEntry(form, font=FONT_BODY)
+        self._p2p_preset_name_entry.pack(fill="x", padx=12, pady=(0, 6))
+
+        ctk.CTkLabel(form, text="正向提示詞 (Positive Prompt)：", font=FONT_BODY, anchor="w").pack(fill="x", padx=12, pady=(4, 2))
+        self._p2p_cfg_pos_box = ctk.CTkTextbox(form, height=100, font=FONT_BODY)
+        self._p2p_cfg_pos_box.pack(fill="x", padx=12, pady=(0, 6))
+
+        ctk.CTkLabel(form, text="負向提示詞 (Negative Prompt)：", font=FONT_BODY, anchor="w").pack(fill="x", padx=12, pady=(4, 2))
+        self._p2p_cfg_neg_box = ctk.CTkTextbox(form, height=70, font=FONT_BODY)
+        self._p2p_cfg_neg_box.pack(fill="x", padx=12, pady=(0, 10))
+
+        btn_row = ctk.CTkFrame(form, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(4, 10))
+        ctk.CTkButton(btn_row, text="儲存 Prompt 範本", width=160, height=32, font=FONT_BODY,
+                      fg_color="#1f6aa5", command=self._save_p2p_prompt_preset).pack(side="left")
+        self._p2p_prompt_status_label = ctk.CTkLabel(btn_row, text="", font=FONT_SMALL, anchor="w")
+        self._p2p_prompt_status_label.pack(side="left", padx=10)
+
+    def _sync_p2p_prompt_form(self):
+        presets = [p.get("name", "") for p in self._p2p_settings.get("drawing_prompts", [])]
+        if hasattr(self, "_p2p_prompt_cfg_menu") and presets:
+            self._p2p_prompt_cfg_menu.configure(values=presets)
+            cur = self._p2p_prompt_cfg_var.get()
+            if cur not in presets:
+                self._p2p_prompt_cfg_var.set(presets[0])
+            self._on_p2p_prompt_select(self._p2p_prompt_cfg_var.get())
+
+    def _on_p2p_prompt_select(self, choice: str):
+        for p in self._p2p_settings.get("drawing_prompts", []):
+            if p.get("name") == choice:
+                if hasattr(self, "_p2p_preset_name_entry"):
+                    self._p2p_preset_name_entry.delete(0, "end")
+                    self._p2p_preset_name_entry.insert(0, p.get("name", ""))
+                    self._p2p_cfg_pos_box.delete("1.0", "end")
+                    self._p2p_cfg_pos_box.insert("1.0", p.get("positive", ""))
+                    self._p2p_cfg_neg_box.delete("1.0", "end")
+                    self._p2p_cfg_neg_box.insert("1.0", p.get("negative", ""))
+                break
+
+    def _save_p2p_prompt_preset(self):
+        name = self._p2p_preset_name_entry.get().strip()
+        pos = self._p2p_cfg_pos_box.get("1.0", "end").strip()
+        neg = self._p2p_cfg_neg_box.get("1.0", "end").strip()
+
+        cur_choice = self._p2p_prompt_cfg_var.get()
+        for p in self._p2p_settings.get("drawing_prompts", []):
+            if p.get("name") == cur_choice:
+                p["name"] = name
+                p["positive"] = pos
+                p["negative"] = neg
+                break
+        config.save_p2p_settings(self._p2p_settings)
+        self._p2p_settings = config.load_p2p_settings()
+        self._sync_p2p_prompt_form()
+        self._sync_p2p_prompt_controls()
+        self._p2p_prompt_status_label.configure(text="✅ 提示詞範本已更新", text_color=("#0a7d2c", "#5ec97a"))
+
+    def _add_p2p_prompt_preset(self):
+        new_item = {
+            "id": f"draw_custom_{len(self._p2p_settings.get('drawing_prompts', [])) + 1}",
+            "name": f"新繪圖風格_{len(self._p2p_settings.get('drawing_prompts', [])) + 1}",
+            "positive": "masterpiece, best quality, {subject}",
+            "negative": "lowres, bad anatomy, bad hands, blurry",
+        }
+        self._p2p_settings.setdefault("drawing_prompts", []).append(new_item)
+        config.save_p2p_settings(self._p2p_settings)
+        self._p2p_settings = config.load_p2p_settings()
+        self._p2p_prompt_cfg_var.set(new_item["name"])
+        self._sync_p2p_prompt_form()
+
+    def _delete_p2p_prompt_preset(self):
+        presets = self._p2p_settings.get("drawing_prompts", [])
+        if len(presets) <= 1:
+            messagebox.showwarning("無法刪除", "至少需保留一組繪圖 Prompt 範本。")
+            return
+        cur = self._p2p_prompt_cfg_var.get()
+        if not messagebox.askyesno("刪除確認", f"確定要刪除範本「{cur}」嗎？"):
+            return
+        self._p2p_settings["drawing_prompts"] = [p for p in presets if p.get("name") != cur]
+        config.save_p2p_settings(self._p2p_settings)
+        self._p2p_settings = config.load_p2p_settings()
+        self._sync_p2p_prompt_form()
 
     # ------------------------------------------------------------------ #
     #  Window Cleanup
