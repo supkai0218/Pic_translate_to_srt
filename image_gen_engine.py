@@ -206,8 +206,176 @@ def _extract_images_from_response(body: dict | list) -> list[Image.Image]:
     return results
 
 
+def is_venice_edit_model(model_name: str) -> bool:
+    """Return True if model is an image editing / inpaint model on Venice AI."""
+    m = model_name.lower().strip()
+    if any(k in m for k in ("-edit", "_edit", "/edit", "edit-", "inpaint", "remover")):
+        return True
+    known_edit_models = {
+        "qwen-edit-uncensored",
+        "qwen-edit",
+        "firered-image-edit",
+        "muse-image-edit",
+        "bria-bg-remover",
+    }
+    return m in known_edit_models
+
+
+def is_image_generation_model(model_name: str) -> bool:
+    """Return True if model is an image generation / edit model."""
+    m = model_name.lower().strip()
+    if not m:
+        return True
+    image_keywords = (
+        "image", "flux", "recraft", "seedream", "dall-e", "krea",
+        "riverflow", "imagine", "diffusion", "sd", "mai-image",
+        "muse-image", "edit", "inpaint", "midjourney", "draw",
+    )
+    return any(k in m for k in image_keywords)
+
+
+def sniff_endpoint_info(
+    cfg: P2PProviderCfg,
+    has_images: bool = True,
+    num_images: int = 1,
+) -> dict:
+    """Intelligently inspect and resolve actual calling endpoint URL and mode.
+
+    Returns a dict with:
+        - endpoint_url: str
+        - method: str ("POST")
+        - mode_desc: str
+        - protocol: str
+        - notes: str
+    """
+    url = (cfg.api_url or "").strip().rstrip("/")
+    url_l = url.lower()
+    name_l = (cfg.name or "").lower()
+    ptype = (cfg.provider_type or "").lower()
+    model = (cfg.model or "").strip()
+
+    # 1. Venice AI Detection
+    if "venice.ai" in url_l or ptype == "venice" or "venice" in name_l:
+        base = re.sub(r"/(image/(edit|multi-edit|generate|background-remove|upscale)|models).*$", "", url)
+        if not base:
+            base = "https://api.venice.ai/api/v1"
+        if not base.endswith("/v1"):
+            base = f"{base}/api/v1" if "/api" not in base else f"{base}/v1"
+
+        is_edit = is_venice_edit_model(model)
+        if is_edit:
+            if num_images > 1:
+                target = f"{base}/image/multi-edit"
+                mode = "多圖層合成修圖 (Multi-Edit / 二進位串流)"
+            else:
+                target = f"{base}/image/edit"
+                mode = "以圖修圖 (Inpaint / 二進位串流)"
+            notes = "自動注入 safe_mode: false (無審查)，自動剃除 negative_prompt/strength"
+        else:
+            target = f"{base}/image/generate"
+            mode = "文字生圖 (Text-to-Image / Base64 JSON)"
+            notes = "同步生成，回傳 JSON Base64 影像"
+
+        return {
+            "endpoint_url": target,
+            "method": "POST",
+            "mode_desc": mode,
+            "protocol": "Venice Direct REST",
+            "notes": notes,
+        }
+
+    # 2. Atlas Cloud Detection
+    if "atlascloud.ai" in url_l or ptype == "atlas" or "atlas" in name_l:
+        base = re.sub(r"/(model/(generateImage|prediction)|models|public/v1/balance).*$", "", url)
+        if not base:
+            base = "https://api.atlascloud.ai/api/v1"
+        target = f"{base}/model/generateImage"
+        return {
+            "endpoint_url": target,
+            "method": "POST",
+            "mode_desc": "非同步佇列生圖 (Async Polling)",
+            "protocol": "Atlas Async Task",
+            "notes": "提交任務獲取 prediction_id，自動輪詢狀態至完成取圖",
+        }
+
+    # 3. OpenRouter Detection
+    if "openrouter.ai" in url_l or ptype == "openrouter" or "openrouter" in name_l:
+        # Clean base: strip /images/generations, /images, /chat/completions, /models, etc.
+        base = re.sub(r"/(images(/generations)?|chat/completions|models).*$", "", url)
+        if not base.endswith("/v1"):
+            base = f"{base}/api/v1" if "/api" not in base else f"{base}/v1"
+
+        is_explicit_chat = "/chat/completions" in url_l
+        is_image_model = is_image_generation_model(model) or "/images" in url_l
+
+        if is_image_model and not is_explicit_chat:
+            target = f"{base}/images/generations"
+            mode = "OpenRouter 專屬生圖 (OpenAI 影像標準 / Base64 JSON)"
+            protocol = "OpenRouter Image Generations"
+            notes = "直接呼叫 /images/generations 取得 Base64 圖檔，原生支援以圖生圖 (image 參數)"
+        else:
+            target = f"{base}/chat/completions"
+            mode = "多模態視覺對話 (Multimodal Chat)"
+            protocol = "OpenRouter Multimodal"
+            notes = "傳遞多模態圖文對話訊息，解析回傳之 Markdown/URL 圖片"
+
+        return {
+            "endpoint_url": target,
+            "method": "POST",
+            "mode_desc": mode,
+            "protocol": protocol,
+            "notes": notes,
+        }
+
+    # 4. Standard OpenAI Images endpoint
+    if "/images/generations" in url_l or "/images/edits" in url_l:
+        return {
+            "endpoint_url": url,
+            "method": "POST",
+            "mode_desc": "OpenAI 圖像端點標準",
+            "protocol": "OpenAI Images",
+            "notes": "標準 OpenAI 相容格式",
+        }
+
+    # 5. Generic Fallback
+    if url.endswith("/generate") or url.endswith("/edit"):
+        target = url
+        mode = "通用同步端點 (雙模自動解碼)"
+        protocol = "Generic REST"
+        notes = "自動感應二進位 PNG/WebP 與 JSON Base64 回傳"
+    elif url.endswith("/chat/completions"):
+        target = url
+        mode = "通用對話端點 (Multimodal Chat)"
+        protocol = "Generic Chat"
+        notes = "解析 Markdown 圖檔或 URL 連結"
+    elif url.endswith("/v1"):
+        if is_image_generation_model(model):
+            target = f"{url}/images/generations"
+            mode = "標準 OpenAI 影像生成端點"
+            protocol = "OpenAI Images"
+            notes = "標準 OpenAI /v1/images/generations 規範"
+        else:
+            target = f"{url}/chat/completions"
+            mode = "通用對話端點 (Multimodal Chat)"
+            protocol = "Generic Chat"
+            notes = "標準 OpenAI /v1/chat/completions 規範"
+    else:
+        target = f"{url}/images/generations" if is_image_generation_model(model) else f"{url}/image/generate"
+        mode = "通用同步端點"
+        protocol = "Generic REST"
+        notes = "自動感應二進位與 JSON 回傳"
+
+    return {
+        "endpoint_url": target,
+        "method": "POST",
+        "mode_desc": mode,
+        "protocol": protocol,
+        "notes": notes,
+    }
+
+
 def test_p2p_connection(cfg: P2PProviderCfg) -> tuple[bool, str]:
-    """Test API connection and authentication."""
+    """Test API connection and authentication with automatic endpoint normalization."""
     _ensure_requests()
     if not cfg.api_url:
         return False, "API 網址為空，請先填寫 API 網址。"
@@ -217,30 +385,46 @@ def test_p2p_connection(cfg: P2PProviderCfg) -> tuple[bool, str]:
         headers["Authorization"] = f"Bearer {cfg.api_key}"
 
     url = cfg.api_url.rstrip("/")
+    url_l = url.lower()
     ptype = cfg.provider_type.lower()
     name_l = cfg.name.lower()
 
-    if "atlascloud.ai" in url or ptype == "atlas" or "atlas" in name_l:
+    if "atlascloud.ai" in url_l or ptype == "atlas" or "atlas" in name_l:
         test_url = "https://api.atlascloud.ai/public/v1/balance"
+        detected_tag = "Atlas Cloud (非同步輪詢架構)"
+    elif "venice.ai" in url_l or ptype == "venice" or "venice" in name_l:
+        # Strip any trailing action paths (/image/edit, /image/generate, /image/multi-edit, /models, etc.)
+        base = re.sub(r"/(image/(edit|multi-edit|generate|background-remove|upscale)|models).*$", "", url)
+        if not base.endswith("/v1"):
+            base = f"{base}/api/v1" if "/api" not in base else f"{base}/v1"
+        test_url = f"{base}/models"
+        detected_tag = "Venice AI (支援二進位修圖與生圖自適應分流)"
+    elif "openrouter.ai" in url_l or ptype == "openrouter" or "openrouter" in name_l:
+        # Normalize to standard /v1 base for model catalog probe
+        base = re.sub(r"/(images(/generations)?|chat/completions|models).*$", "", url)
+        if not base.endswith("/v1"):
+            base = f"{base}/api/v1" if "/api" not in base else f"{base}/v1"
+        test_url = f"{base}/models"
+        detected_tag = "OpenRouter (支援 /images/generations 生圖與 Chat 對話自適應分流)"
     elif url.endswith("/chat/completions"):
         test_url = url
+        detected_tag = "Chat Completions 端點"
     elif url.endswith("/v1"):
         test_url = f"{url}/models"
-    elif url.endswith("/image/generate"):
-        test_url = url.replace("/image/generate", "/models")
-    elif url.endswith("/model/generateImage"):
-        test_url = url.replace("/model/generateImage", "/models")
+        detected_tag = "標準 /v1 端點"
     else:
-        test_url = f"{url}/models"
+        base = re.sub(r"/(images?(/.*)?|chat/completions|model/.*|models)$", "", url)
+        test_url = f"{base}/models" if base else f"{url}/models"
+        detected_tag = "通用 REST 服務商"
 
     try:
         resp = requests.get(test_url, headers=headers, timeout=15)
         if resp.status_code in (200, 201):
-            return True, f"連線成功 (HTTP {resp.status_code})"
+            return True, f"連線成功 (HTTP {resp.status_code}) - 已識別為 {detected_tag}"
         if resp.status_code in (401, 403):
             return False, f"金鑰驗證失敗 (HTTP {resp.status_code})：請確認 API Key 是否正確"
         if resp.status_code == 404:
-            return False, f"找不到端點 (HTTP 404)：請確認 API 網址是否正確"
+            return False, f"找不到端點 (HTTP 404)：測試網址 [{test_url}] 不存在，請確認 Base URL"
         return False, f"伺服器回應錯誤 (HTTP {resp.status_code})"
     except Exception as exc:
         return False, f"連線失敗：{exc}"
@@ -359,10 +543,14 @@ def generate_image(
     ptype = cfg.provider_type.lower()
     name_l = cfg.name.lower()
 
+    sniffed = sniff_endpoint_info(cfg, has_images=bool(images), num_images=len(images))
+    target_url = sniffed["endpoint_url"]
+    protocol = sniffed.get("protocol", "")
+
     # ------------------------------------------------------------- #
     #  Atlas Cloud Endpoint: /api/v1/model/generateImage (Async Polling)
     # ------------------------------------------------------------- #
-    if ptype == "atlas" or "atlascloud" in base_url or "atlas" in name_l or "/model/generateImage" in base_url:
+    if protocol == "Atlas Async Task" or ptype == "atlas" or "atlascloud" in base_url or "atlas" in name_l:
         if "atlascloud.ai" in base_url:
             gen_url = "https://api.atlascloud.ai/api/v1/model/generateImage"
             pred_base = "https://api.atlascloud.ai/api/v1/model/prediction"
@@ -441,47 +629,166 @@ def generate_image(
         raise P2PError(f"Atlas Cloud 繪圖逾時（已等待超過 {timeout} 秒）。")
 
     # ------------------------------------------------------------- #
-    #  Venice AI Endpoint: /api/v1/image/generate
+    #  Venice AI Endpoint: Adaptive /image/edit or /image/generate
     # ------------------------------------------------------------- #
-    if ptype == "venice" or "/image/generate" in base_url:
-        target_url = base_url if "/image/generate" in base_url else f"{base_url}/image/generate"
+    if protocol == "Venice Direct REST" or ptype == "venice" or "venice.ai" in base_url.lower():
+        is_edit = is_venice_edit_model(cfg.model)
+
+        if is_edit:
+            # Venice /image/edit or /image/multi-edit
+            payload = {
+                "prompt": prompt,
+                "safe_mode": False,
+            }
+            if len(images) > 1:
+                payload["modelId"] = cfg.model
+                b64_list = []
+                for img in images:
+                    b64_s, _ = encode_image_b64(img)
+                    b64_list.append(b64_s)
+                payload["images"] = b64_list
+            elif images:
+                payload["model"] = cfg.model
+                b64_s, _ = encode_image_b64(images[0])
+                payload["image"] = b64_s
+            else:
+                payload["model"] = cfg.model
+
+            if aspect_ratio and aspect_ratio != "auto":
+                payload["aspect_ratio"] = aspect_ratio
+            if output_format and output_format != "auto":
+                payload["output_format"] = output_format
+
+            if extra_params and isinstance(extra_params, dict):
+                payload.update(extra_params)
+
+            try:
+                resp = requests.post(target_url, headers=headers, json=payload, timeout=timeout)
+            except Exception as exc:
+                raise P2PError(f"連線至 Venice 失敗：{exc}") from exc
+
+            if resp.status_code != 200:
+                raise P2PError(f"Venice 回應錯誤 (HTTP {resp.status_code}): {resp.text[:300]}")
+
+            # Dual-mode parsing: binary image or JSON Base64
+            content_type = resp.headers.get("content-type", "").lower()
+            if "image/" in content_type or not resp.text.strip().startswith("{"):
+                try:
+                    out_img = Image.open(io.BytesIO(resp.content))
+                    out_img.load()
+                    return [out_img]
+                except Exception as exc:
+                    raise P2PError(f"無法解析 Venice 二進位圖片資料：{exc}") from exc
+
+            imgs = _extract_images_from_response(resp.json())
+            if not imgs:
+                raise P2PError("Venice 回應中未包含圖片資料。")
+            return imgs
+
+        else:
+            # Text-to-Image /image/generate
+            payload = {
+                "model": cfg.model,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "return_binary": False,
+                "aspect_ratio": aspect_ratio,
+            }
+            if output_format and output_format != "auto":
+                payload["output_format"] = output_format
+            if images:
+                b64, _ = encode_image_b64(images[0])
+                payload["image"] = b64
+                payload["strength"] = strength
+            if extra_params and isinstance(extra_params, dict):
+                payload.update(extra_params)
+
+            try:
+                resp = requests.post(target_url, headers=headers, json=payload, timeout=timeout)
+            except Exception as exc:
+                raise P2PError(f"連線至 Venice 失敗：{exc}") from exc
+
+            if resp.status_code != 200:
+                raise P2PError(f"Venice 回應錯誤 (HTTP {resp.status_code}): {resp.text[:300]}")
+
+            content_type = resp.headers.get("content-type", "").lower()
+            if "image/" in content_type or not resp.text.strip().startswith("{"):
+                try:
+                    out_img = Image.open(io.BytesIO(resp.content))
+                    out_img.load()
+                    return [out_img]
+                except Exception as exc:
+                    raise P2PError(f"無法解析 Venice 二進位圖片：{exc}") from exc
+
+            imgs = _extract_images_from_response(resp.json())
+            if not imgs:
+                raise P2PError("Venice 回應中未包含圖片資料。")
+            return imgs
+
+    # ------------------------------------------------------------- #
+    #  OpenRouter Image Generations / OpenAI /images/generations
+    # ------------------------------------------------------------- #
+    if protocol in ("OpenRouter Image Generations", "OpenAI Images") or target_url.endswith("/images/generations"):
         payload = {
             "model": cfg.model,
             "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "return_binary": False,
-            "aspect_ratio": aspect_ratio,
+            "response_format": "b64_json",
         }
+        if images:
+            if len(images) > 1:
+                b64_list = []
+                for img in images:
+                    b64_s, _ = encode_image_b64(img)
+                    b64_list.append(b64_s)
+                payload["images"] = b64_list
+            else:
+                b64_s, _ = encode_image_b64(images[0])
+                payload["image"] = b64_s
+
+        if aspect_ratio and aspect_ratio != "auto":
+            payload["aspect_ratio"] = aspect_ratio
+        if size and size != "auto":
+            payload["size"] = size
+        elif aspect_ratio and aspect_ratio != "auto" and is_gpt_image_model(cfg.model):
+            payload["size"] = ASPECT_TO_SIZE_MAP.get(aspect_ratio, "1024x1024")
+        if quality and quality != "auto":
+            payload["quality"] = quality
+        if background and background != "auto":
+            payload["background"] = background
         if output_format and output_format != "auto":
             payload["output_format"] = output_format
-        if images:
-            # Venice image-to-image uses first reference image
-            b64, _ = encode_image_b64(images[0])
-            payload["image"] = b64
-            payload["strength"] = strength
+        if num_outputs > 1:
+            payload["n"] = num_outputs
+
         if extra_params and isinstance(extra_params, dict):
             payload.update(extra_params)
 
         try:
             resp = requests.post(target_url, headers=headers, json=payload, timeout=timeout)
         except Exception as exc:
-            raise P2PError(f"連線至 Venice 失敗：{exc}") from exc
+            raise P2PError(f"無法發送請求至 {target_url}：{exc}") from exc
 
         if resp.status_code != 200:
-            raise P2PError(f"Venice 回應錯誤 (HTTP {resp.status_code}): {resp.text[:300]}")
+            raise P2PError(f"繪圖服務回應錯誤 (HTTP {resp.status_code}): {resp.text[:400]}")
+
+        content_type = resp.headers.get("content-type", "").lower()
+        if "image/" in content_type or not resp.text.strip().startswith("{"):
+            try:
+                out_img = Image.open(io.BytesIO(resp.content))
+                out_img.load()
+                return [out_img]
+            except Exception as exc:
+                raise P2PError(f"解析二進位圖片失敗：{exc}") from exc
 
         imgs = _extract_images_from_response(resp.json())
         if not imgs:
-            raise P2PError("Venice 回應中未包含圖片資料。")
+            raise P2PError(f"繪圖服務未回傳圖片資料：{resp.text[:300]}")
         return imgs
 
     # ------------------------------------------------------------- #
-    #  OpenRouter / Chat Multimodal Endpoint
+    #  Multimodal Chat Endpoint (/chat/completions)
     # ------------------------------------------------------------- #
-    # If endpoint doesn't specify /chat/completions or /images/generations, default to chat
-    if ptype == "openrouter" or base_url.endswith("/v1") or "/chat/completions" in base_url:
-        target_url = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
-
+    if protocol in ("OpenRouter Multimodal", "Generic Chat") or target_url.endswith("/chat/completions"):
         # Build prompt instructions with negative prompt and aspect ratio
         prompt_instruction = (
             f"Generate a new high-quality image based on the provided reference image(s).\n"
@@ -543,13 +850,15 @@ def generate_image(
     # ------------------------------------------------------------- #
     #  Fallback: Standard OpenAI /images/generations
     # ------------------------------------------------------------- #
-    target_url = f"{base_url}/images/generations" if not base_url.endswith("/images/generations") else base_url
     payload = {
         "model": cfg.model,
         "prompt": prompt,
         "n": num_outputs,
         "response_format": "b64_json",
     }
+    if images:
+        b64_s, _ = encode_image_b64(images[0])
+        payload["image"] = b64_s
     if size and size != "auto":
         payload["size"] = size
     elif aspect_ratio:
@@ -566,6 +875,15 @@ def generate_image(
 
     if resp.status_code != 200:
         raise P2PError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+
+    content_type = resp.headers.get("content-type", "").lower()
+    if "image/" in content_type or not resp.text.strip().startswith("{"):
+        try:
+            out_img = Image.open(io.BytesIO(resp.content))
+            out_img.load()
+            return [out_img]
+        except Exception:
+            pass
 
     imgs = _extract_images_from_response(resp.json())
     if not imgs:

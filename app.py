@@ -155,7 +155,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.02)")
+        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.03)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -4742,6 +4742,7 @@ class App(ctk.CTk):
         )
         self._p2p_name_entry = ctk.CTkEntry(form, font=FONT_BODY)
         self._p2p_name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=6)
+        self._p2p_name_entry.bind("<KeyRelease>", lambda e: self._update_p2p_endpoint_debug_display())
 
         # Row 1: API URL
         ctk.CTkLabel(form, text="API 網址 (Base URL)：", font=FONT_BODY, anchor="e").grid(
@@ -4749,6 +4750,7 @@ class App(ctk.CTk):
         )
         self._p2p_url_entry = ctk.CTkEntry(form, font=FONT_BODY)
         self._p2p_url_entry.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=6)
+        self._p2p_url_entry.bind("<KeyRelease>", lambda e: self._update_p2p_endpoint_debug_display())
 
         # Row 2: API Key + View .env
         ctk.CTkLabel(form, text="API 金鑰 (API Key)：", font=FONT_BODY, anchor="e").grid(
@@ -4808,28 +4810,100 @@ class App(ctk.CTk):
         ).pack(side="left", padx=(6, 0))
 
         ctk.CTkLabel(model_group, text="新增模型：", font=FONT_BODY, anchor="e").grid(
-            row=2, column=0, sticky="e", padx=(10, 8), pady=(4, 8)
+            row=2, column=0, sticky="e", padx=(10, 8), pady=(4, 6)
         )
         self._p2p_new_model_var = ctk.StringVar()
+        self._p2p_new_model_var.trace_add("write", self._update_p2p_endpoint_debug_display)
         new_model_entry = ctk.CTkEntry(
             model_group, textvariable=self._p2p_new_model_var, font=FONT_BODY,
-            placeholder_text="輸入繪圖模型名稱，例如 black-forest-labs/flux-1-schnell"
+            placeholder_text="輸入繪圖模型名稱，例如 qwen-edit-uncensored 或 flux-1-schnell"
         )
-        new_model_entry.grid(row=2, column=1, sticky="ew", pady=(4, 8))
+        new_model_entry.grid(row=2, column=1, sticky="ew", pady=(4, 6))
         ctk.CTkButton(
             model_group, text="＋ 加入模型", width=105, height=28, font=FONT_SMALL,
             command=self._add_p2p_model_to_current
-        ).grid(row=2, column=2, sticky="w", padx=(10, 10), pady=(4, 8))
+        ).grid(row=2, column=2, sticky="w", padx=(10, 10), pady=(4, 6))
+
+        # Row 3: Sniffed Actual Endpoint & Debug Display
+        ctk.CTkLabel(model_group, text="🎯 嗅探實際端點：", font=FONT_BODY, text_color=("#1f6aa5", "#4ea8de"), anchor="e").grid(
+            row=3, column=0, sticky="e", padx=(10, 8), pady=(2, 6)
+        )
+        debug_box = ctk.CTkFrame(model_group, fg_color="transparent")
+        debug_box.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 10), pady=(2, 6))
+        debug_box.grid_columnconfigure(0, weight=1)
+
+        self._p2p_endpoint_debug_var = ctk.StringVar(value="[POST] （分析中…）")
+        self._p2p_endpoint_notes_var = ctk.StringVar(value="")
+
+        ctk.CTkLabel(
+            debug_box, textvariable=self._p2p_endpoint_debug_var, font=("Microsoft JhengHei", 12, "bold"),
+            text_color=("#0f5132", "#75b798"), anchor="w"
+        ).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(
+            debug_box, textvariable=self._p2p_endpoint_notes_var, font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w"
+        ).grid(row=1, column=0, sticky="w")
 
         # Bottom Buttons
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
-        btn_row.pack(fill="x", padx=14, pady=(0, 8))
+        btn_row.pack(fill="x", padx=14, pady=(0, 6))
         ctk.CTkButton(btn_row, text="測試連線", width=120, height=32, font=FONT_BODY,
                       command=self._test_p2p_api_connection).pack(side="left", padx=(0, 8))
         ctk.CTkButton(btn_row, text="儲存服務商與模型", width=160, height=32, font=FONT_BODY,
                       fg_color="#1f6aa5", command=self._save_p2p_api_settings).pack(side="left")
         self._p2p_api_status_label = ctk.CTkLabel(btn_row, text="", font=FONT_SMALL, anchor="w")
         self._p2p_api_status_label.pack(side="left", padx=10)
+
+        # Guide Card: Step-by-Step Instructions for Universal Adapter
+        guide_card = ctk.CTkFrame(parent, fg_color=("gray95", "gray17"))
+        guide_card.pack(fill="x", padx=14, pady=(4, 10))
+
+        ctk.CTkLabel(
+            guide_card,
+            text="💡 通用適配器使用與設定指引（新增供應商免繁瑣配置）：",
+            font=("Microsoft JhengHei", 12, "bold"),
+            anchor="w"
+        ).pack(fill="x", padx=12, pady=(6, 2))
+
+        guide_text = (
+            "1. Venice AI：Base URL 建議填寫「https://api.venice.ai/api/v1」。通用適配器會自動識別模型：\n"
+            "   • 圖片修改模型（如 qwen-edit-uncensored、帶 -edit 或 inpaint 之模型）自動導向 /image/edit (二進位串流模式)。\n"
+            "   • 純文字生圖模型（如 qwen-image-2、venice-sd35）自動導向 /image/generate (JSON 模式)，免手動切換 URL。\n"
+            "2. Atlas Cloud：Base URL 填寫「https://api.atlascloud.ai/api/v1」，自動啟用非同步任務排隊與輪詢取圖。\n"
+            "3. OpenRouter / 聚合商：Base URL 填寫「https://openrouter.ai/api/v1」，自動透過多模態視覺通道生成。\n"
+            "4. 其他服務商：填入官方 Base URL 即可，適配器將自動探測並於上方「🎯 嗅探實際端點」即時顯示除錯資訊。"
+        )
+        ctk.CTkLabel(
+            guide_card,
+            text=guide_text,
+            font=FONT_SMALL,
+            text_color=("gray30", "#adb5bd"),
+            justify="left",
+            anchor="w"
+        ).pack(fill="x", padx=14, pady=(0, 6))
+
+    def _update_p2p_endpoint_debug_display(self, *args):
+        if not hasattr(self, "_p2p_endpoint_debug_var"):
+            return
+        url = self._p2p_url_entry.get().strip() if hasattr(self, "_p2p_url_entry") else ""
+        name = self._p2p_name_entry.get().strip() if hasattr(self, "_p2p_name_entry") else ""
+
+        new_typed = self._p2p_new_model_var.get().strip() if hasattr(self, "_p2p_new_model_var") else ""
+        sel_m = self._p2p_selected_model_var.get().strip() if hasattr(self, "_p2p_selected_model_var") else ""
+        if sel_m == "（無）":
+            sel_m = ""
+
+        target_model = new_typed or sel_m or "未選擇模型"
+        cfg = P2PProviderCfg(name=name, api_url=url, api_key="", model=target_model)
+        info = image_gen_engine.sniff_endpoint_info(cfg)
+
+        self._p2p_endpoint_debug_var.set(
+            f"[{info['method']}] {info['endpoint_url']}  |  模式：{info['mode_desc']}"
+        )
+        self._p2p_endpoint_notes_var.set(
+            f"💡 適配說明：{info['notes']}"
+        )
 
     def _refresh_p2p_model_menu(self, keep: str | None = None):
         models = self._p2p_current_models or ["（無）"]
@@ -4838,9 +4912,11 @@ class App(ctk.CTk):
         sel = keep if keep in models else (models[0] if models != ["（無）"] else "（無）")
         if hasattr(self, "_p2p_selected_model_var"):
             self._p2p_selected_model_var.set(sel)
+        self._update_p2p_endpoint_debug_display()
 
     def _on_p2p_model_menu_select(self, val: str):
         self._p2p_selected_model_var.set(val)
+        self._update_p2p_endpoint_debug_display()
 
     def _set_current_p2p_model_active(self):
         m = self._p2p_selected_model_var.get().strip()
@@ -4904,6 +4980,7 @@ class App(ctk.CTk):
                     env = p.get("api_key_env") or config._env_var_name_for(p.get("name", ""))
                     if hasattr(self, "_p2p_key_hint_var"):
                         self._p2p_key_hint_var.set(f"金鑰儲存於 .env：{env}")
+                    self._update_p2p_endpoint_debug_display()
                 break
 
     def _save_p2p_api_settings(self):

@@ -36,11 +36,16 @@
       "api_key_env": "VENICE_API_KEY",
       "api_key": "",
       "models": [
-        "flux-dev-uncensored",
-        "flux-dev",
-        "stable-diffusion-3.5"
+        "qwen-edit-uncensored",
+        "qwen-edit",
+        "wan-2-7-pro-edit",
+        "gpt-image-2-5-flare-edit",
+        "flux-2-max-edit",
+        "qwen-image-2",
+        "venice-sd35",
+        "flux-dev-uncensored"
       ],
-      "selected_model": "flux-dev-uncensored",
+      "selected_model": "qwen-edit-uncensored",
       "provider_type": "venice"
     }
   ],
@@ -59,3 +64,4 @@
     "samples": 1
   }
 }
+
