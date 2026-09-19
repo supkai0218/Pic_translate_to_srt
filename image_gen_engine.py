@@ -234,6 +234,173 @@ def is_image_generation_model(model_name: str) -> bool:
     return any(k in m for k in image_keywords)
 
 
+def sniff_model_capabilities(cfg: P2PProviderCfg) -> dict:
+    """Sniff and return parameter capability flags for the selected provider and model.
+
+    Returns a dict with:
+        - supports_strength: bool
+        - supports_negative_prompt: bool
+        - supports_size: bool
+        - supports_aspect_ratio: bool
+        - supports_quality: bool
+        - supports_background: bool
+        - supports_seed: bool
+        - supports_output_format: bool
+        - supports_num_outputs: bool
+        - max_input_references: int
+        - reference_format: str ("openrouter_input_references", "atlas_images", "venice_b64", "none")
+        - notes_map: dict[str, str] (human-readable disabled reasons)
+    """
+    url = (cfg.api_url or "").strip().rstrip("/")
+    url_l = url.lower()
+    name_l = (cfg.name or "").lower()
+    ptype = (cfg.provider_type or "").lower()
+    model = (cfg.model or "").strip()
+    model_l = model.lower()
+
+    # Default capabilities
+    caps = {
+        "supports_strength": False,
+        "supports_negative_prompt": False,
+        "supports_size": False,
+        "supports_aspect_ratio": True,
+        "supports_quality": False,
+        "supports_background": False,
+        "supports_seed": False,
+        "supports_output_format": True,
+        "supports_num_outputs": True,
+        "max_input_references": 1,
+        "reference_format": "none",
+        "notes_map": {},
+    }
+
+    # 1. Venice AI
+    if "venice.ai" in url_l or ptype == "venice" or "venice" in name_l:
+        is_edit = is_venice_edit_model(model)
+        if is_edit:
+            caps["supports_strength"] = False
+            caps["supports_negative_prompt"] = False
+            caps["supports_size"] = False
+            caps["supports_aspect_ratio"] = True
+            caps["supports_quality"] = "gpt-image" in model_l
+            caps["supports_background"] = False
+            caps["supports_seed"] = False
+            caps["supports_output_format"] = True
+            caps["supports_num_outputs"] = False
+            caps["max_input_references"] = 3 if ("wan" in model_l or "multi" in model_l) else 1
+            caps["reference_format"] = "venice_b64"
+            caps["notes_map"] = {
+                "strength": "Venice 修圖模型嚴格禁用重繪強度參數 (傳送將導致報錯)",
+                "negative_prompt": "Venice 修圖模型不支援負向提示詞",
+                "size": "Venice 修圖模型使用長寬比例與階層 (1K/2K/4K)",
+                "num_outputs": "Venice 修圖每次固定生成 1 張",
+            }
+        else:
+            caps["supports_strength"] = True
+            caps["supports_negative_prompt"] = True
+            caps["supports_size"] = False
+            caps["supports_aspect_ratio"] = True
+            caps["supports_quality"] = False
+            caps["supports_background"] = False
+            caps["supports_seed"] = True
+            caps["supports_output_format"] = True
+            caps["supports_num_outputs"] = False
+            caps["max_input_references"] = 1
+            caps["reference_format"] = "venice_b64"
+            caps["notes_map"] = {
+                "size": "Venice 生圖模型由長寬比控制幾何尺寸",
+                "num_outputs": "Venice 生圖每次固定生成 1 張",
+            }
+        return caps
+
+    # 2. Atlas Cloud
+    if "atlascloud.ai" in url_l or ptype == "atlas" or "atlas" in name_l:
+        if is_gpt_image_model(model):
+            caps["supports_strength"] = False
+            caps["supports_negative_prompt"] = False
+            caps["supports_size"] = True
+            caps["supports_aspect_ratio"] = True
+            caps["supports_quality"] = True
+            caps["supports_background"] = True
+            caps["supports_seed"] = False
+            caps["supports_output_format"] = True
+            caps["supports_num_outputs"] = True
+            caps["max_input_references"] = 16
+            caps["reference_format"] = "atlas_images"
+            caps["notes_map"] = {
+                "strength": "Atlas GPT-Image 為自回歸修圖模型，不吃去噪強度",
+                "negative_prompt": "Atlas GPT-Image 由自然語言指令控制，不支援負向詞",
+            }
+        else:
+            caps["supports_strength"] = True
+            caps["supports_negative_prompt"] = True
+            caps["supports_size"] = True
+            caps["supports_aspect_ratio"] = True
+            caps["supports_quality"] = False
+            caps["supports_background"] = False
+            caps["supports_seed"] = True
+            caps["supports_output_format"] = True
+            caps["supports_num_outputs"] = True
+            caps["max_input_references"] = 1
+            caps["reference_format"] = "atlas_images"
+            caps["notes_map"] = {}
+        return caps
+
+    # 3. OpenRouter
+    if "openrouter.ai" in url_l or ptype == "openrouter" or "openrouter" in name_l:
+        is_explicit_chat = "/chat/completions" in url_l
+        if is_explicit_chat:
+            caps["supports_strength"] = False
+            caps["supports_negative_prompt"] = False
+            caps["supports_size"] = False
+            caps["supports_aspect_ratio"] = True
+            caps["supports_quality"] = False
+            caps["supports_background"] = False
+            caps["supports_seed"] = False
+            caps["supports_output_format"] = False
+            caps["supports_num_outputs"] = False
+            caps["max_input_references"] = 10
+            caps["reference_format"] = "chat_multimodal"
+            caps["notes_map"] = {
+                "strength": "多模態對話模型不支援去噪滑桿",
+                "negative_prompt": "對話模型提示詞由正向 Prompt 控制",
+            }
+            return caps
+
+        # OpenRouter Image Generations
+        caps["supports_strength"] = False
+        caps["supports_negative_prompt"] = False
+        caps["supports_size"] = False  # OpenRouter strictly rejects size, maps to aspect_ratio
+        caps["supports_aspect_ratio"] = True
+        caps["supports_quality"] = is_gpt_image_model(model) or "quality" in model_l
+        caps["supports_background"] = is_gpt_image_model(model)
+        caps["supports_seed"] = any(k in model_l for k in ("flux", "seedream", "recraft"))
+        caps["supports_output_format"] = any(k in model_l for k in ("flux", "recraft", "seedream"))
+        caps["supports_num_outputs"] = True
+        caps["max_input_references"] = 16
+        caps["reference_format"] = "openrouter_input_references"
+        caps["notes_map"] = {
+            "strength": "OpenRouter 影像端點不支援去噪強度滑桿",
+            "negative_prompt": "OpenRouter 影像端點由自然語言控制，不支援負向詞",
+            "size": "OpenRouter 尺寸由長寬比與品質自動決定",
+        }
+        return caps
+
+    # 4. Standard / Generic
+    caps["supports_strength"] = True
+    caps["supports_negative_prompt"] = True
+    caps["supports_size"] = True
+    caps["supports_aspect_ratio"] = True
+    caps["supports_quality"] = is_gpt_image_model(model)
+    caps["supports_background"] = is_gpt_image_model(model)
+    caps["supports_seed"] = True
+    caps["supports_output_format"] = True
+    caps["supports_num_outputs"] = True
+    caps["max_input_references"] = 1
+    caps["reference_format"] = "generic_image"
+    return caps
+
+
 def sniff_endpoint_info(
     cfg: P2PProviderCfg,
     has_images: bool = True,
@@ -254,6 +421,8 @@ def sniff_endpoint_info(
     ptype = (cfg.provider_type or "").lower()
     model = (cfg.model or "").strip()
 
+    caps = sniff_model_capabilities(cfg)
+
     # 1. Venice AI Detection
     if "venice.ai" in url_l or ptype == "venice" or "venice" in name_l:
         base = re.sub(r"/(image/(edit|multi-edit|generate|background-remove|upscale)|models).*$", "", url)
@@ -270,7 +439,7 @@ def sniff_endpoint_info(
             else:
                 target = f"{base}/image/edit"
                 mode = "以圖修圖 (Inpaint / 二進位串流)"
-            notes = "自動注入 safe_mode: false (無審查)，自動剃除 negative_prompt/strength"
+            notes = f"自動注入 safe_mode: false (無審查)，自動剃除 negative_prompt/strength (最多 {caps['max_input_references']} 張參考圖)"
         else:
             target = f"{base}/image/generate"
             mode = "文字生圖 (Text-to-Image / Base64 JSON)"
@@ -295,7 +464,7 @@ def sniff_endpoint_info(
             "method": "POST",
             "mode_desc": "非同步佇列生圖 (Async Polling)",
             "protocol": "Atlas Async Task",
-            "notes": "提交任務獲取 prediction_id，自動輪詢狀態至完成取圖",
+            "notes": f"提交任務獲取 prediction_id，自動輪詢狀態至完成取圖 (支援最多 {caps['max_input_references']} 張參考圖)",
         }
 
     # 3. OpenRouter Detection
@@ -312,7 +481,7 @@ def sniff_endpoint_info(
             target = f"{base}/images/generations"
             mode = "OpenRouter 專屬生圖 (OpenAI 影像標準 / Base64 JSON)"
             protocol = "OpenRouter Image Generations"
-            notes = "直接呼叫 /images/generations 取得 Base64 圖檔，原生支援以圖生圖 (image 參數)"
+            notes = f"原生支援最多 {caps['max_input_references']} 張參考圖 (input_references 協議)，支援長寬比/品質自動對齊"
         else:
             target = f"{base}/chat/completions"
             mode = "多模態視覺對話 (Multimodal Chat)"
@@ -527,6 +696,7 @@ def generate_image(
     quality: str = "auto",
     background: str = "auto",
     output_format: str = "auto",
+    seed: Optional[int] = None,
     extra_params: Optional[dict] = None,
     timeout: int = 180,
 ) -> list[Image.Image]:
@@ -544,6 +714,7 @@ def generate_image(
     name_l = cfg.name.lower()
 
     sniffed = sniff_endpoint_info(cfg, has_images=bool(images), num_images=len(images))
+    caps = sniff_model_capabilities(cfg)
     target_url = sniffed["endpoint_url"]
     protocol = sniffed.get("protocol", "")
 
@@ -561,6 +732,10 @@ def generate_image(
             gen_url = f"{base_url}/model/generateImage"
             pred_base = f"{base_url}/model/prediction"
 
+        atlas_extra = dict(extra_params) if extra_params else {}
+        if seed is not None and caps.get("supports_seed"):
+            atlas_extra["seed"] = int(seed)
+
         payload = build_atlas_payload(
             cfg=cfg,
             images=images,
@@ -573,7 +748,7 @@ def generate_image(
             quality=quality,
             background=background,
             output_format=output_format,
-            extra_params=extra_params,
+            extra_params=atlas_extra,
         )
 
         try:
@@ -643,7 +818,7 @@ def generate_image(
             if len(images) > 1:
                 payload["modelId"] = cfg.model
                 b64_list = []
-                for img in images:
+                for img in images[:caps.get("max_input_references", 3)]:
                     b64_s, _ = encode_image_b64(img)
                     b64_list.append(b64_s)
                 payload["images"] = b64_list
@@ -658,6 +833,10 @@ def generate_image(
                 payload["aspect_ratio"] = aspect_ratio
             if output_format and output_format != "auto":
                 payload["output_format"] = output_format
+            if quality and quality != "auto" and caps.get("supports_quality"):
+                payload["quality"] = quality
+            if seed is not None and caps.get("supports_seed"):
+                payload["seed"] = int(seed)
 
             if extra_params and isinstance(extra_params, dict):
                 payload.update(extra_params)
@@ -700,6 +879,8 @@ def generate_image(
                 b64, _ = encode_image_b64(images[0])
                 payload["image"] = b64
                 payload["strength"] = strength
+            if seed is not None and caps.get("supports_seed"):
+                payload["seed"] = int(seed)
             if extra_params and isinstance(extra_params, dict):
                 payload.update(extra_params)
 
@@ -726,37 +907,91 @@ def generate_image(
             return imgs
 
     # ------------------------------------------------------------- #
-    #  OpenRouter Image Generations / OpenAI /images/generations
+    #  OpenRouter Image Generations (Native input_references Schema)
     # ------------------------------------------------------------- #
-    if protocol in ("OpenRouter Image Generations", "OpenAI Images") or target_url.endswith("/images/generations"):
+    if protocol == "OpenRouter Image Generations" or "openrouter.ai" in target_url:
         payload = {
             "model": cfg.model,
             "prompt": prompt,
             "response_format": "b64_json",
         }
         if images:
-            if len(images) > 1:
-                b64_list = []
-                for img in images:
-                    b64_s, _ = encode_image_b64(img)
-                    b64_list.append(b64_s)
-                payload["images"] = b64_list
-            else:
-                b64_s, _ = encode_image_b64(images[0])
-                payload["image"] = b64_s
+            max_refs = caps.get("max_input_references", 16)
+            input_refs = []
+            for img in images[:max_refs]:
+                b64_s, mime = encode_image_b64(img)
+                input_refs.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{b64_s}"
+                    }
+                })
+            payload["input_references"] = input_refs
 
-        if aspect_ratio and aspect_ratio != "auto":
-            payload["aspect_ratio"] = aspect_ratio
+        # OpenRouter does not accept 'size'; auto-convert size to aspect_ratio if not given
+        resolved_aspect = aspect_ratio
+        if (not resolved_aspect or resolved_aspect == "auto") and size and size != "auto":
+            SIZE_TO_ASPECT = {v: k for k, v in ASPECT_TO_SIZE_MAP.items()}
+            resolved_aspect = SIZE_TO_ASPECT.get(size, "1:1")
+
+        if resolved_aspect and resolved_aspect != "auto":
+            payload["aspect_ratio"] = resolved_aspect
+
+        if quality and quality != "auto" and caps.get("supports_quality"):
+            payload["quality"] = quality
+        if background and background != "auto" and caps.get("supports_background"):
+            payload["background"] = background
+        if output_format and output_format != "auto" and caps.get("supports_output_format"):
+            payload["output_format"] = output_format
+        if num_outputs > 1 and caps.get("supports_num_outputs"):
+            payload["n"] = num_outputs
+        if seed is not None and caps.get("supports_seed"):
+            payload["seed"] = int(seed)
+
+        if extra_params and isinstance(extra_params, dict):
+            payload.update(extra_params)
+
+        try:
+            resp = requests.post(target_url, headers=headers, json=payload, timeout=timeout)
+        except Exception as exc:
+            raise P2PError(f"無法發送請求至 {target_url}：{exc}") from exc
+
+        if resp.status_code != 200:
+            raise P2PError(f"OpenRouter 回應錯誤 (HTTP {resp.status_code}): {resp.text[:400]}")
+
+        content_type = resp.headers.get("content-type", "").lower()
+        if "image/" in content_type or not resp.text.strip().startswith("{"):
+            try:
+                out_img = Image.open(io.BytesIO(resp.content))
+                out_img.load()
+                return [out_img]
+            except Exception as exc:
+                raise P2PError(f"解析二進位圖片失敗：{exc}") from exc
+
+        imgs = _extract_images_from_response(resp.json())
+        if not imgs:
+            raise P2PError(f"OpenRouter 未回傳圖片資料：{resp.text[:300]}")
+        return imgs
+
+    # ------------------------------------------------------------- #
+    #  Standard OpenAI /images/generations
+    # ------------------------------------------------------------- #
+    if protocol == "OpenAI Images" or target_url.endswith("/images/generations"):
+        payload = {
+            "model": cfg.model,
+            "prompt": prompt,
+            "response_format": "b64_json",
+        }
+        if images:
+            b64_s, _ = encode_image_b64(images[0])
+            payload["image"] = b64_s
+
         if size and size != "auto":
             payload["size"] = size
-        elif aspect_ratio and aspect_ratio != "auto" and is_gpt_image_model(cfg.model):
+        elif aspect_ratio:
             payload["size"] = ASPECT_TO_SIZE_MAP.get(aspect_ratio, "1024x1024")
         if quality and quality != "auto":
             payload["quality"] = quality
-        if background and background != "auto":
-            payload["background"] = background
-        if output_format and output_format != "auto":
-            payload["output_format"] = output_format
         if num_outputs > 1:
             payload["n"] = num_outputs
 
@@ -770,15 +1005,6 @@ def generate_image(
 
         if resp.status_code != 200:
             raise P2PError(f"繪圖服務回應錯誤 (HTTP {resp.status_code}): {resp.text[:400]}")
-
-        content_type = resp.headers.get("content-type", "").lower()
-        if "image/" in content_type or not resp.text.strip().startswith("{"):
-            try:
-                out_img = Image.open(io.BytesIO(resp.content))
-                out_img.load()
-                return [out_img]
-            except Exception as exc:
-                raise P2PError(f"解析二進位圖片失敗：{exc}") from exc
 
         imgs = _extract_images_from_response(resp.json())
         if not imgs:

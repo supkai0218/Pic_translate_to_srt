@@ -265,13 +265,19 @@ class TestV203OpenRouterExecutionAndDecoding(unittest.TestCase):
             api_key="test_key",
             model="openai/gpt-image-2.5-flare",
         )
-        ref_img = Image.new("RGB", (64, 64), color=(0, 0, 255))
+        ref_imgs = [Image.new("RGB", (64, 64), color=(i * 40, 0, 255 - i * 40)) for i in range(5)]
 
         out_imgs = generate_image(
             cfg=cfg,
-            images=[ref_img],
+            images=ref_imgs,
             prompt="Turn blue into green",
-            aspect_ratio="16:9",
+            negative_prompt="blurry, low quality",  # Should be omitted
+            strength=0.7,                            # Should be omitted
+            size="2048x1152",                        # Should be converted to aspect_ratio="16:9"
+            aspect_ratio="auto",
+            quality="high",
+            seed=12345,
+            num_outputs=2,
         )
 
         self.assertEqual(len(out_imgs), 1)
@@ -284,21 +290,133 @@ class TestV203OpenRouterExecutionAndDecoding(unittest.TestCase):
         self.assertEqual(target_url, "https://openrouter.ai/api/v1/images/generations")
         self.assertEqual(payload["model"], "openai/gpt-image-2.5-flare")
         self.assertEqual(payload["prompt"], "Turn blue into green")
+        # Verify 5 input_references objects were created with data URLs
+        self.assertIn("input_references", payload)
+        self.assertEqual(len(payload["input_references"]), 5)
+        for item in payload["input_references"]:
+            self.assertEqual(item["type"], "image_url")
+            self.assertTrue(item["image_url"]["url"].startswith("data:image/"))
+
+        # Verify aspect_ratio mapped from 2048x1152 to 16:9
         self.assertEqual(payload["aspect_ratio"], "16:9")
-        self.assertIn("image", payload)
+        # Verify forbidden keys are stripped to prevent HTTP 400 Bad Request
+        self.assertNotIn("size", payload)
+        self.assertNotIn("negative_prompt", payload)
+        self.assertNotIn("strength", payload)
+        self.assertEqual(payload["quality"], "high")
+        # GPT image model doesn't support seed, stripped to avoid 400
+        self.assertNotIn("seed", payload)
+        self.assertEqual(payload["n"], 2)
         self.assertEqual(payload["response_format"], "b64_json")
+
+    @patch("image_gen_engine.requests.post")
+    def test_openrouter_flux_seed_supported(self, mock_post):
+        test_img = Image.new("RGB", (32, 32), color=(10, 20, 30))
+        buf = io.BytesIO()
+        test_img.save(buf, format="PNG")
+        import base64
+        png_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {"created": 1, "data": [{"b64_json": png_b64}]}
+        mock_post.return_value = mock_resp
+
+        cfg = P2PProviderCfg(
+            name="OpenRouter",
+            api_url="https://openrouter.ai/api/v1",
+            api_key="test_key",
+            model="black-forest-labs/flux-1-dev",
+        )
+        generate_image(
+            cfg=cfg,
+            images=[],
+            prompt="A futuristic city",
+            seed=42,
+        )
+        payload = mock_post.call_args[1]["json"]
+        self.assertEqual(payload["seed"], 42)
+
+
+class TestV203CapabilitiesSniffer(unittest.TestCase):
+    """Test model capability sniffer across Venice, Atlas Cloud, and OpenRouter."""
+
+    def test_venice_edit_capabilities(self):
+        cfg = P2PProviderCfg(
+            name="Venice AI",
+            api_url="https://api.venice.ai/api/v1",
+            api_key="k",
+            model="qwen-edit-uncensored",
+        )
+        caps = image_gen_engine.sniff_model_capabilities(cfg)
+        self.assertFalse(caps["supports_strength"])
+        self.assertFalse(caps["supports_negative_prompt"])
+        self.assertFalse(caps["supports_size"])
+        self.assertTrue(caps["supports_aspect_ratio"])
+        self.assertFalse(caps["supports_seed"])  # Venice edit accepts strictly minimal schema
+        self.assertFalse(caps["supports_num_outputs"])
+        self.assertEqual(caps["max_input_references"], 1)
+
+    def test_venice_generate_capabilities(self):
+        cfg = P2PProviderCfg(
+            name="Venice AI",
+            api_url="https://api.venice.ai/api/v1",
+            api_key="k",
+            model="qwen-image-2",
+        )
+        caps = image_gen_engine.sniff_model_capabilities(cfg)
+        self.assertTrue(caps["supports_strength"])
+        self.assertTrue(caps["supports_negative_prompt"])
+        self.assertFalse(caps["supports_size"])
+        self.assertTrue(caps["supports_aspect_ratio"])
+        self.assertTrue(caps["supports_seed"])
+        self.assertFalse(caps["supports_num_outputs"])
+
+    def test_atlas_gpt_image_capabilities(self):
+        cfg = P2PProviderCfg(
+            name="Atlas Cloud",
+            api_url="https://api.atlascloud.ai/api/v1",
+            api_key="k",
+            model="openai/gpt-image-2.5-flare/edit",
+        )
+        caps = image_gen_engine.sniff_model_capabilities(cfg)
+        self.assertFalse(caps["supports_strength"])
+        self.assertFalse(caps["supports_negative_prompt"])
+        self.assertTrue(caps["supports_size"])
+        self.assertTrue(caps["supports_quality"])
+        self.assertTrue(caps["supports_background"])
+        self.assertEqual(caps["max_input_references"], 16)
+
+    def test_openrouter_image_capabilities(self):
+        cfg = P2PProviderCfg(
+            name="OpenRouter",
+            api_url="https://openrouter.ai/api/v1",
+            api_key="k",
+            model="openai/gpt-image-2.5-flare",
+        )
+        caps = image_gen_engine.sniff_model_capabilities(cfg)
+        self.assertFalse(caps["supports_strength"])
+        self.assertFalse(caps["supports_negative_prompt"])
+        self.assertFalse(caps["supports_size"])
+        self.assertTrue(caps["supports_aspect_ratio"])
+        self.assertTrue(caps["supports_quality"])
+        self.assertTrue(caps["supports_background"])
+        self.assertTrue(caps["supports_num_outputs"])
+        self.assertEqual(caps["max_input_references"], 16)
 
 
 class TestV203UIDebugDisplay(unittest.TestCase):
-    """Test dynamic UI debug display updating."""
+    """Test dynamic UI debug display and capability syncing."""
 
     def test_app_debug_display_update(self):
         import app
         root = app.App()
         root.withdraw()
         try:
-            # Ensure P2P API tab is constructed
-            root._build_p2p_api_tab(root.p2p_tabs.tab("  圖生圖 API 設定  "))
+            # Ensure P2P API tab is constructed using tab index 1
+            tab_keys = list(root.p2p_tabs._tab_dict.keys())
+            root._build_p2p_api_tab(root.p2p_tabs.tab(tab_keys[1]))
 
             # Set Venice URL and edit model
             root._p2p_url_entry.delete(0, "end")
@@ -325,6 +443,56 @@ class TestV203UIDebugDisplay(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_app_dynamic_capability_sync(self):
+        import app
+        root = app.App()
+        root.withdraw()
+        try:
+            tab_keys = list(root.p2p_tabs._tab_dict.keys())
+            root._build_p2p_editor_tab(root.p2p_tabs.tab(tab_keys[0]))
+
+            # Inject test providers
+            root._p2p_settings["providers"] = [
+                {
+                    "name": "TestOpenRouter",
+                    "api_url": "https://openrouter.ai/api/v1",
+                    "api_key": "k1",
+                    "models": ["openai/gpt-image-2.5-flare"],
+                    "selected_model": "openai/gpt-image-2.5-flare",
+                },
+                {
+                    "name": "TestVeniceGen",
+                    "api_url": "https://api.venice.ai/api/v1",
+                    "api_key": "k2",
+                    "models": ["qwen-image-2"],
+                    "selected_model": "qwen-image-2",
+                }
+            ]
+            # 1. Switch to OpenRouter
+            root._p2p_prov_var.set("TestOpenRouter")
+            root._p2p_model_var.set("openai/gpt-image-2.5-flare")
+            root._sync_p2p_model_capabilities()
+
+            self.assertEqual(root._p2p_neg_prompt_box.cget("state"), "disabled")
+            self.assertEqual(root._p2p_strength_slider.cget("state"), "disabled")
+            self.assertEqual(root._p2p_size_menu.cget("state"), "disabled")
+            self.assertEqual(root._p2p_count_menu.cget("state"), "normal")
+            self.assertIn("最多支援 16 張參考圖", root._p2p_status_label.cget("text"))
+
+            # 2. Switch to Venice Text-to-Image
+            root._p2p_prov_var.set("TestVeniceGen")
+            root._p2p_model_var.set("qwen-image-2")
+            root._sync_p2p_model_capabilities()
+
+            self.assertEqual(root._p2p_neg_prompt_box.cget("state"), "normal")
+            self.assertEqual(root._p2p_strength_slider.cget("state"), "normal")
+            self.assertEqual(root._p2p_count_menu.cget("state"), "disabled")
+            self.assertEqual(root._p2p_count_var.get(), "1")
+
+        finally:
+            root.destroy()
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -155,7 +155,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.03)")
+        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.04)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -4118,7 +4118,7 @@ class App(ctk.CTk):
         self._p2p_model_var = ctk.StringVar(value="")
         self._p2p_model_menu = ctk.CTkOptionMenu(
             prov_row, values=["default"], variable=self._p2p_model_var, font=FONT_SMALL,
-            width=160, height=26
+            width=160, height=26, command=self._on_p2p_model_change
         )
         self._p2p_model_menu.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
@@ -4141,26 +4141,26 @@ class App(ctk.CTk):
         self._p2p_pos_prompt_box.pack(fill="x", pady=(0, 4))
 
         # Negative Prompt
-        ctk.CTkLabel(right_scroll, text="🚫 負向提示詞 (Negative Prompt)：", font=FONT_SMALL, anchor="w").pack(
-            fill="x", pady=(2, 1))
+        self._p2p_neg_prompt_label = ctk.CTkLabel(right_scroll, text="🚫 負向提示詞 (Negative Prompt)：", font=FONT_SMALL, anchor="w")
+        self._p2p_neg_prompt_label.pack(fill="x", pady=(2, 1))
         self._p2p_neg_prompt_box = ctk.CTkTextbox(right_scroll, height=45, font=FONT_SMALL)
         self._p2p_neg_prompt_box.pack(fill="x", pady=(0, 4))
 
-        # Parameters: Strength & Aspect Ratio
+        # Parameters: Count & Aspect Ratio (v2.03: Count moved out to primary row)
         param_row = ctk.CTkFrame(right_scroll, fg_color="transparent")
         param_row.pack(fill="x", pady=(2, 4))
 
-        ctk.CTkLabel(param_row, text="強度(重繪)：", font=FONT_SMALL).pack(side="left")
-        self._p2p_strength_var = ctk.DoubleVar(value=self._p2p_settings.get("default_params", {}).get("image_strength", 0.65))
-        self._p2p_strength_slider = ctk.CTkSlider(
-            param_row, from_=0.10, to=1.00, variable=self._p2p_strength_var,
-            width=90, height=14, command=lambda v: self._p2p_strength_label.configure(text=f"{float(v):.2f}")
+        self._p2p_count_label = ctk.CTkLabel(param_row, text="張數：", font=FONT_SMALL)
+        self._p2p_count_label.pack(side="left")
+        self._p2p_count_var = ctk.StringVar(value="1")
+        self._p2p_count_menu = ctk.CTkOptionMenu(
+            param_row, values=["1", "2", "3", "4"],
+            variable=self._p2p_count_var, font=FONT_SMALL, height=24, width=65
         )
-        self._p2p_strength_slider.pack(side="left", padx=(2, 4))
-        self._p2p_strength_label = ctk.CTkLabel(param_row, text=f"{self._p2p_strength_var.get():.2f}", font=FONT_SMALL, width=28)
-        self._p2p_strength_label.pack(side="left", padx=(0, 6))
+        self._p2p_count_menu.pack(side="left", padx=(2, 8))
 
-        ctk.CTkLabel(param_row, text="比例：", font=FONT_SMALL).pack(side="left")
+        self._p2p_aspect_label = ctk.CTkLabel(param_row, text="比例：", font=FONT_SMALL)
+        self._p2p_aspect_label.pack(side="left")
         self._p2p_aspect_var = ctk.StringVar(value=self._p2p_settings.get("default_params", {}).get("aspect_ratio", "1:1"))
         self._p2p_aspect_seg = ctk.CTkSegmentedButton(
             param_row, values=["1:1", "16:9", "9:16", "4:3", "3:2"],
@@ -4168,68 +4168,90 @@ class App(ctk.CTk):
         )
         self._p2p_aspect_seg.pack(side="left", fill="x", expand=True)
 
-        # Advanced Drawing Parameters Collapsible Panel (v2.02)
+        # Advanced Drawing Parameters Collapsible Panel (v2.02 / v2.03)
         self._p2p_adv_open = False
         self._p2p_adv_toggle_btn = ctk.CTkButton(
-            right_scroll, text="⚙️ 展開進階繪圖參數 (Size / Quality / Format...) ▼",
+            right_scroll, text="⚙️ 展開進階繪圖參數 (強度 / 尺寸 / 畫質 / Seed...) ▼",
             height=22, font=FONT_SMALL, fg_color="transparent", text_color=("#1f6aa5", "#64b5f6"),
             hover_color=("gray85", "gray25"), anchor="w", command=self._toggle_p2p_advanced_params
         )
         self._p2p_adv_toggle_btn.pack(fill="x", pady=(2, 2))
 
         self._p2p_adv_frame = ctk.CTkFrame(right_scroll, fg_color=("gray88", "gray18"), corner_radius=6)
-        # Inside adv_frame:
+
+        # Row 1: Strength (v2.03 moved inside advanced panel)
         adv_row1 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
         adv_row1.pack(fill="x", padx=8, pady=(6, 2))
-        ctk.CTkLabel(adv_row1, text="解析度/尺寸：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        self._p2p_strength_label_title = ctk.CTkLabel(adv_row1, text="重繪強度：", font=FONT_SMALL, width=80, anchor="w")
+        self._p2p_strength_label_title.pack(side="left")
+        self._p2p_strength_var = ctk.DoubleVar(value=self._p2p_settings.get("default_params", {}).get("image_strength", 0.65))
+        self._p2p_strength_slider = ctk.CTkSlider(
+            adv_row1, from_=0.10, to=1.00, variable=self._p2p_strength_var,
+            width=110, height=14, command=lambda v: self._p2p_strength_label.configure(text=f"{float(v):.2f}")
+        )
+        self._p2p_strength_slider.pack(side="left", padx=(2, 4))
+        self._p2p_strength_label = ctk.CTkLabel(adv_row1, text=f"{self._p2p_strength_var.get():.2f}", font=FONT_SMALL, width=28)
+        self._p2p_strength_label.pack(side="left", padx=(0, 6))
+
+        # Row 2: Resolution / Size
+        adv_row2 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row2.pack(fill="x", padx=8, pady=2)
+        self._p2p_size_label = ctk.CTkLabel(adv_row2, text="解析度/尺寸：", font=FONT_SMALL, width=80, anchor="w")
+        self._p2p_size_label.pack(side="left")
         self._p2p_size_var = ctk.StringVar(value="auto")
         self._p2p_size_menu = ctk.CTkOptionMenu(
-            adv_row1, values=["auto", "1024x1024", "1536x1024", "2048x1152", "1152x2048", "2560x1088", "3840x2160", "1024x768", "768x1024"],
+            adv_row2, values=["auto", "1024x1024", "1536x1024", "2048x1152", "1152x2048", "2560x1088", "3840x2160", "1024x768", "768x1024"],
             variable=self._p2p_size_var, font=FONT_SMALL, height=24
         )
         self._p2p_size_menu.pack(side="left", fill="x", expand=True)
 
-        adv_row2 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
-        adv_row2.pack(fill="x", padx=8, pady=2)
-        ctk.CTkLabel(adv_row2, text="畫質等級：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        # Row 3: Quality & Background
+        adv_row3 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row3.pack(fill="x", padx=8, pady=2)
+        self._p2p_quality_label = ctk.CTkLabel(adv_row3, text="畫質等級：", font=FONT_SMALL, width=80, anchor="w")
+        self._p2p_quality_label.pack(side="left")
         self._p2p_quality_var = ctk.StringVar(value="auto")
         self._p2p_quality_menu = ctk.CTkOptionMenu(
-            adv_row2, values=["auto", "low", "medium", "high", "xhigh", "max"],
+            adv_row3, values=["auto", "low", "medium", "high", "xhigh", "max"],
             variable=self._p2p_quality_var, font=FONT_SMALL, height=24, width=95
         )
         self._p2p_quality_menu.pack(side="left", padx=(0, 6))
 
-        ctk.CTkLabel(adv_row2, text="背景：", font=FONT_SMALL).pack(side="left")
+        self._p2p_bg_label = ctk.CTkLabel(adv_row3, text="背景：", font=FONT_SMALL)
+        self._p2p_bg_label.pack(side="left")
         self._p2p_bg_var = ctk.StringVar(value="auto")
         self._p2p_bg_menu = ctk.CTkOptionMenu(
-            adv_row2, values=["auto", "opaque", "transparent"],
+            adv_row3, values=["auto", "opaque", "transparent"],
             variable=self._p2p_bg_var, font=FONT_SMALL, height=24
         )
         self._p2p_bg_menu.pack(side="left", fill="x", expand=True)
 
-        adv_row3 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
-        adv_row3.pack(fill="x", padx=8, pady=2)
-        ctk.CTkLabel(adv_row3, text="輸出格式：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        # Row 4: Format & Seed (v2.03)
+        adv_row4 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row4.pack(fill="x", padx=8, pady=2)
+        self._p2p_format_label = ctk.CTkLabel(adv_row4, text="輸出格式：", font=FONT_SMALL, width=80, anchor="w")
+        self._p2p_format_label.pack(side="left")
         self._p2p_format_var = ctk.StringVar(value="auto")
         self._p2p_format_menu = ctk.CTkOptionMenu(
-            adv_row3, values=["auto", "png", "jpeg", "webp"],
+            adv_row4, values=["auto", "png", "jpeg", "webp"],
             variable=self._p2p_format_var, font=FONT_SMALL, height=24, width=95
         )
         self._p2p_format_menu.pack(side="left", padx=(0, 6))
 
-        ctk.CTkLabel(adv_row3, text="張數：", font=FONT_SMALL).pack(side="left")
-        self._p2p_count_var = ctk.StringVar(value="1")
-        self._p2p_count_menu = ctk.CTkOptionMenu(
-            adv_row3, values=["1", "2", "3", "4"],
-            variable=self._p2p_count_var, font=FONT_SMALL, height=24
+        self._p2p_seed_label = ctk.CTkLabel(adv_row4, text="種子(Seed)：", font=FONT_SMALL)
+        self._p2p_seed_label.pack(side="left")
+        self._p2p_seed_var = ctk.StringVar(value="")
+        self._p2p_seed_entry = ctk.CTkEntry(
+            adv_row4, textvariable=self._p2p_seed_var, placeholder_text="隨機", font=FONT_SMALL, height=24
         )
-        self._p2p_count_menu.pack(side="left", fill="x", expand=True)
+        self._p2p_seed_entry.pack(side="left", fill="x", expand=True)
 
-        adv_row4 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
-        adv_row4.pack(fill="x", padx=8, pady=(2, 6))
-        ctk.CTkLabel(adv_row4, text="自訂JSON：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        # Row 5: Custom Extra JSON
+        adv_row5 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row5.pack(fill="x", padx=8, pady=(2, 6))
+        ctk.CTkLabel(adv_row5, text="自訂JSON：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
         self._p2p_extra_json_entry = ctk.CTkEntry(
-            adv_row4, placeholder_text='如: {"seed": 42}', font=FONT_SMALL, height=24
+            adv_row5, placeholder_text='如: {"steps": 30}', font=FONT_SMALL, height=24
         )
         self._p2p_extra_json_entry.pack(side="left", fill="x", expand=True)
 
@@ -4527,6 +4549,138 @@ class App(ctk.CTk):
                     sel_m = p.get("selected_model") or models[0]
                     self._p2p_model_var.set(sel_m)
                 break
+        self._sync_p2p_model_capabilities()
+
+    def _on_p2p_model_change(self, choice: str):
+        prov_name = self._p2p_prov_var.get()
+        for p in self._p2p_settings.get("providers", []):
+            if p.get("name") == prov_name:
+                p["selected_model"] = choice
+                break
+        self._sync_p2p_model_capabilities()
+
+    def _sync_p2p_model_capabilities(self):
+        """根據當前選取的服務商與模型，動態啟用或反灰 (gray out) 控制項與更新標籤。"""
+        if not hasattr(self, "_p2p_prov_var") or not hasattr(self, "_p2p_model_var"):
+            return
+        prov_name = self._p2p_prov_var.get()
+        target_prov = None
+        for p in self._p2p_settings.get("providers", []):
+            if p.get("name") == prov_name:
+                target_prov = dict(p)
+                break
+        if not target_prov:
+            return
+
+        target_prov["selected_model"] = self._p2p_model_var.get()
+        cfg = P2PProviderCfg.from_dict(target_prov)
+        caps = image_gen_engine.sniff_model_capabilities(cfg)
+
+        # 1. Negative Prompt
+        if hasattr(self, "_p2p_neg_prompt_box") and hasattr(self, "_p2p_neg_prompt_label"):
+            sup_neg = caps.get("supports_negative_prompt", True)
+            if sup_neg:
+                self._p2p_neg_prompt_box.configure(state="normal")
+                self._p2p_neg_prompt_label.configure(
+                    text="🚫 負向提示詞 (Negative Prompt)：",
+                    text_color=("gray10", "gray90")
+                )
+            else:
+                self._p2p_neg_prompt_box.configure(state="disabled")
+                self._p2p_neg_prompt_label.configure(
+                    text="🚫 負向提示詞 [此模型不支援]：",
+                    text_color=("gray50", "gray50")
+                )
+
+        # 2. Strength
+        if hasattr(self, "_p2p_strength_slider") and hasattr(self, "_p2p_strength_label_title"):
+            sup_str = caps.get("supports_strength", True)
+            if sup_str:
+                self._p2p_strength_slider.configure(state="normal")
+                self._p2p_strength_label_title.configure(
+                    text="重繪強度：",
+                    text_color=("gray10", "gray90")
+                )
+            else:
+                self._p2p_strength_slider.configure(state="disabled")
+                self._p2p_strength_label_title.configure(
+                    text="重繪強度 [不支援]：",
+                    text_color=("gray50", "gray50")
+                )
+
+        # 3. Output Count
+        if hasattr(self, "_p2p_count_menu"):
+            sup_count = caps.get("supports_num_outputs", True)
+            self._p2p_count_menu.configure(state="normal" if sup_count else "disabled")
+            if not sup_count:
+                self._p2p_count_var.set("1")
+
+        # 4. Aspect Ratio
+        if hasattr(self, "_p2p_aspect_seg"):
+            sup_aspect = caps.get("supports_aspect_ratio", True)
+            self._p2p_aspect_seg.configure(state="normal" if sup_aspect else "disabled")
+
+        # 5. Size / Resolution
+        if hasattr(self, "_p2p_size_menu") and hasattr(self, "_p2p_size_label"):
+            sup_size = caps.get("supports_size", True)
+            self._p2p_size_menu.configure(state="normal" if sup_size else "disabled")
+            self._p2p_size_label.configure(
+                text="解析度/尺寸：" if sup_size else "解析度 [不支援]：",
+                text_color=("gray10", "gray90") if sup_size else ("gray50", "gray50")
+            )
+            if not sup_size:
+                self._p2p_size_var.set("auto")
+
+        # 6. Quality
+        if hasattr(self, "_p2p_quality_menu") and hasattr(self, "_p2p_quality_label"):
+            sup_qual = caps.get("supports_quality", False)
+            self._p2p_quality_menu.configure(state="normal" if sup_qual else "disabled")
+            self._p2p_quality_label.configure(
+                text="畫質等級：" if sup_qual else "畫質 [不支援]：",
+                text_color=("gray10", "gray90") if sup_qual else ("gray50", "gray50")
+            )
+            if not sup_qual:
+                self._p2p_quality_var.set("auto")
+
+        # 7. Background
+        if hasattr(self, "_p2p_bg_menu") and hasattr(self, "_p2p_bg_label"):
+            sup_bg = caps.get("supports_background", False)
+            self._p2p_bg_menu.configure(state="normal" if sup_bg else "disabled")
+            self._p2p_bg_label.configure(
+                text="背景：" if sup_bg else "背景 [不支援]：",
+                text_color=("gray10", "gray90") if sup_bg else ("gray50", "gray50")
+            )
+            if not sup_bg:
+                self._p2p_bg_var.set("auto")
+
+        # 8. Seed
+        if hasattr(self, "_p2p_seed_entry") and hasattr(self, "_p2p_seed_label"):
+            sup_seed = caps.get("supports_seed", True)
+            self._p2p_seed_entry.configure(state="normal" if sup_seed else "disabled")
+            self._p2p_seed_label.configure(
+                text="種子(Seed)：" if sup_seed else "種子 [不支援]：",
+                text_color=("gray10", "gray90") if sup_seed else ("gray50", "gray50")
+            )
+            if not sup_seed:
+                self._p2p_seed_var.set("")
+
+        # 9. Output Format
+        if hasattr(self, "_p2p_format_menu") and hasattr(self, "_p2p_format_label"):
+            sup_fmt = caps.get("supports_output_format", True)
+            self._p2p_format_menu.configure(state="normal" if sup_fmt else "disabled")
+            self._p2p_format_label.configure(
+                text="輸出格式：" if sup_fmt else "格式 [不支援]：",
+                text_color=("gray10", "gray90") if sup_fmt else ("gray50", "gray50")
+            )
+            if not sup_fmt:
+                self._p2p_format_var.set("auto")
+
+        # 10. Update status hint if idle
+        if hasattr(self, "_p2p_status_label") and not self._p2p_busy:
+            max_refs = caps.get("max_input_references", 1)
+            self._p2p_status_label.configure(
+                text=f"模型：{cfg.model}（最多支援 {max_refs} 張參考圖）"
+            )
 
     def _on_p2p_preset_change(self, choice: str):
         for p in self._p2p_settings.get("drawing_prompts", []):
@@ -4535,8 +4689,11 @@ class App(ctk.CTk):
                     self._p2p_pos_prompt_box.delete("1.0", "end")
                     self._p2p_pos_prompt_box.insert("1.0", p.get("positive", ""))
                 if hasattr(self, "_p2p_neg_prompt_box"):
+                    prev_state = self._p2p_neg_prompt_box.cget("state")
+                    self._p2p_neg_prompt_box.configure(state="normal")
                     self._p2p_neg_prompt_box.delete("1.0", "end")
                     self._p2p_neg_prompt_box.insert("1.0", p.get("negative", ""))
+                    self._p2p_neg_prompt_box.configure(state=prev_state)
                 break
 
     def _start_p2p_generate(self):
@@ -4579,7 +4736,7 @@ class App(ctk.CTk):
         aspect = self._p2p_aspect_var.get()
         strength = float(self._p2p_strength_var.get())
 
-        # Collect advanced parameters (v2.02)
+        # Collect advanced parameters (v2.02 / v2.03)
         adv_size = self._p2p_size_var.get().strip() if hasattr(self, "_p2p_size_var") else "auto"
         adv_quality = self._p2p_quality_var.get().strip() if hasattr(self, "_p2p_quality_var") else "auto"
         adv_bg = self._p2p_bg_var.get().strip() if hasattr(self, "_p2p_bg_var") else "auto"
@@ -4588,6 +4745,16 @@ class App(ctk.CTk):
             num_outputs = int(self._p2p_count_var.get()) if hasattr(self, "_p2p_count_var") else 1
         except Exception:
             num_outputs = 1
+
+        seed_val = None
+        if hasattr(self, "_p2p_seed_var"):
+            seed_txt = self._p2p_seed_var.get().strip()
+            if seed_txt:
+                try:
+                    seed_val = int(seed_txt)
+                except ValueError:
+                    messagebox.showerror("隨機種子格式錯誤", "隨機種子 (Seed) 必須為整數，例如 42。若要隨機請留空。")
+                    return
 
         adv_extra = None
         if hasattr(self, "_p2p_extra_json_entry"):
@@ -4620,6 +4787,7 @@ class App(ctk.CTk):
                     quality=adv_quality,
                     background=adv_bg,
                     output_format=adv_fmt,
+                    seed=seed_val,
                     extra_params=adv_extra,
                 )
                 if imgs:
