@@ -6,6 +6,7 @@ Or: PicTrans2Srt.exe [video_path] [-s srt_path] [--play]
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import re
 import sys
@@ -155,7 +156,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.04)")
+        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.05)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -265,6 +266,19 @@ class App(ctk.CTk):
         self._p2p_busy: bool = False
         self._p2p_gallery_checkboxes: dict = {}
         self._p2p_current_models: list[str] = []
+
+        # v2.05 Folder expansion & privacy preview & output gallery state
+        storage_cfg = self._settings.get("storage_folders", {})
+        self._current_input_dir: str = config.resolve_captured_dir(self._settings)
+        self._current_output_dir: str = config.resolve_generated_dir(self._settings)
+        self._recent_input_dirs: list[str] = list(storage_cfg.get("recent_input_dirs", []))
+        self._recent_output_dirs: list[str] = list(storage_cfg.get("recent_output_dirs", []))
+        self._output_images: list[dict] = []
+        self._selected_output_paths: set[str] = set()
+        self._p2p_output_checkboxes: dict = {}
+        self._p2p_preview_visible_var = ctk.BooleanVar(value=True)
+        self._p2p_custom_w_var = ctk.StringVar(value="1024")
+        self._p2p_custom_h_var = ctk.StringVar(value="768")
 
         # Tabs (v2.01 Refined Hierarchical Structure)
         self.tabs = ctk.CTkTabview(self, anchor="nw", command=self._on_tab_change)
@@ -684,6 +698,7 @@ class App(ctk.CTk):
         if sub_name == "  編輯及預覽視窗  ":
             self._build_p2p_editor_tab(self.p2p_tabs.tab("  編輯及預覽視窗  "))
             self._refresh_p2p_gallery()
+            self._refresh_p2p_output_gallery()
             self._sync_p2p_prompt_controls()
         elif sub_name == "  圖生圖 API 設定  ":
             self._build_p2p_api_tab(self.p2p_tabs.tab("  圖生圖 API 設定  "))
@@ -782,6 +797,12 @@ class App(ctk.CTk):
         elif tab_name == "  API 設定  ":
             self._settings = config.load_settings()
             self._sync_api_form()
+
+        elif tab_name in ("  圖生圖任務  ", "  編輯及預覽視窗  "):
+            if hasattr(self, "_refresh_p2p_gallery"):
+                self._refresh_p2p_gallery()
+            if hasattr(self, "_refresh_p2p_output_gallery"):
+                self._refresh_p2p_output_gallery()
 
     def _sync_player_ui(self):
         filename = Path(self._video_path).name if self._video_path else "（尚未載入影片）"
@@ -2313,6 +2334,10 @@ class App(ctk.CTk):
         if hasattr(self, "_player_btn_step_forward_large"):
             self._player_btn_step_forward_large.configure(text=f"⏩ +{f_large_sec:g}s")
 
+        if hasattr(self, "_player_btn_capture"):
+            cap_key = config.get_quick_capture_key_display(self._settings)
+            self._player_btn_capture.configure(text=f"📷 截圖至素材庫 ({cap_key})")
+
 
     # ------------------------------------------------------------------ #
     #  Range & ROI Crop Logic
@@ -2529,6 +2554,7 @@ class App(ctk.CTk):
             sec=self._current_sec,
             is_crop=is_crop,
             crop_box=self._crop_box,
+            target_dir=getattr(self, "_current_input_dir", None),
         )
 
         msg = f"📷 已截圖並儲存至：{saved_path.name}"
@@ -2570,6 +2596,7 @@ class App(ctk.CTk):
             sec=self._current_sec,
             is_crop=is_crop,
             crop_box=self._crop_box,
+            target_dir=getattr(self, "_current_input_dir", None),
         )
 
         msg = f"🎨 已截取範圍並存入圖生圖素材庫：{saved_path.name}"
@@ -2857,6 +2884,85 @@ class App(ctk.CTk):
 
         self._render_keybindings_table()
 
+        # Section 3: Default Storage and Material Folders (v2.05)
+        sec3_frame = ctk.CTkFrame(scroll)
+        sec3_frame.pack(fill="x", pady=(0, 14))
+
+        ctk.CTkLabel(sec3_frame, text="預設素材庫與生成資料夾設定", font=FONT_SUBTITLE, anchor="w").pack(
+            fill="x", padx=12, pady=(10, 4)
+        )
+        ctk.CTkLabel(sec3_frame, text="自訂截圖素材庫與 AI 生成圖片的預設儲存路徑，留空則使用程式目錄下的 \\captured 與 \\generated。",
+                     font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w").pack(
+            fill="x", padx=12, pady=(0, 8)
+        )
+
+        f_grid = ctk.CTkFrame(sec3_frame, fg_color="transparent")
+        f_grid.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkLabel(f_grid, text="預設截圖素材庫：", font=FONT_BODY, width=130, anchor="w").grid(row=0, column=0, padx=(0, 4), pady=4, sticky="w")
+        self._s_cap_dir_var = ctk.StringVar(value=self._settings.get("storage_folders", {}).get("default_captured_dir", ""))
+        self._s_cap_dir_entry = ctk.CTkEntry(f_grid, textvariable=self._s_cap_dir_var, placeholder_text="預設: \\captured", font=FONT_SMALL)
+        self._s_cap_dir_entry.grid(row=0, column=1, padx=(0, 6), pady=4, sticky="ew")
+        ctk.CTkButton(f_grid, text="📂 瀏覽...", width=75, height=26, font=FONT_SMALL,
+                      command=self._browse_default_captured_dir).grid(row=0, column=2, padx=(0, 4), pady=4)
+
+        ctk.CTkLabel(f_grid, text="預設 AI 生成庫：", font=FONT_BODY, width=130, anchor="w").grid(row=1, column=0, padx=(0, 4), pady=4, sticky="w")
+        self._s_gen_dir_var = ctk.StringVar(value=self._settings.get("storage_folders", {}).get("default_generated_dir", ""))
+        self._s_gen_dir_entry = ctk.CTkEntry(f_grid, textvariable=self._s_gen_dir_var, placeholder_text="預設: \\generated", font=FONT_SMALL)
+        self._s_gen_dir_entry.grid(row=1, column=1, padx=(0, 6), pady=4, sticky="ew")
+        ctk.CTkButton(f_grid, text="📂 瀏覽...", width=75, height=26, font=FONT_SMALL,
+                      command=self._browse_default_generated_dir).grid(row=1, column=2, padx=(0, 4), pady=4)
+
+        f_grid.grid_columnconfigure(1, weight=1)
+
+        f_btn_row = ctk.CTkFrame(sec3_frame, fg_color="transparent")
+        f_btn_row.pack(fill="x", padx=12, pady=(4, 10))
+        ctk.CTkButton(f_btn_row, text="儲存資料夾設定", width=130, height=30, font=FONT_BODY,
+                      command=self._save_storage_folder_settings).pack(side="left")
+        ctk.CTkButton(f_btn_row, text="恢復預設路徑", width=110, height=30, font=FONT_BODY,
+                      fg_color="#555", hover_color="#444",
+                      command=self._reset_storage_folder_settings).pack(side="left", padx=(8, 0))
+        self._storage_status_label = ctk.CTkLabel(f_btn_row, text="", font=FONT_SMALL,
+                                                  text_color=("#0a7d2c", "#5ec97a"), anchor="w")
+        self._storage_status_label.pack(side="left", padx=(12, 0))
+
+    def _browse_default_captured_dir(self):
+        chosen = filedialog.askdirectory(title="選擇預設截圖素材庫資料夾")
+        if chosen:
+            self._s_cap_dir_var.set(chosen)
+
+    def _browse_default_generated_dir(self):
+        chosen = filedialog.askdirectory(title="選擇預設 AI 生成圖庫資料夾")
+        if chosen:
+            self._s_gen_dir_var.set(chosen)
+
+    def _save_storage_folder_settings(self):
+        cap_val = self._s_cap_dir_var.get().strip()
+        gen_val = self._s_gen_dir_var.get().strip()
+        sf = self._settings.setdefault("storage_folders", {})
+        sf["default_captured_dir"] = cap_val
+        sf["default_generated_dir"] = gen_val
+        config.save_settings(self._settings)
+        self._current_input_dir = config.resolve_captured_dir(self._settings)
+        self._current_output_dir = config.resolve_generated_dir(self._settings)
+        if hasattr(self, "_populate_p2p_input_dir_menu"):
+            self._populate_p2p_input_dir_menu()
+        if hasattr(self, "_populate_p2p_output_dir_menu"):
+            self._populate_p2p_output_dir_menu()
+        if hasattr(self, "_refresh_p2p_gallery"):
+            self._refresh_p2p_gallery()
+        if hasattr(self, "_refresh_p2p_output_gallery"):
+            self._refresh_p2p_output_gallery()
+        if hasattr(self, "_storage_status_label"):
+            self._storage_status_label.configure(text="✅ 資料夾設定已儲存並生效")
+
+    def _reset_storage_folder_settings(self):
+        self._s_cap_dir_var.set("")
+        self._s_gen_dir_var.set("")
+        self._save_storage_folder_settings()
+        if hasattr(self, "_storage_status_label"):
+            self._storage_status_label.configure(text="已恢復預設資料夾路徑")
+
     def _render_keybindings_table(self):
         for w in self._kb_table_frame.winfo_children():
             w.destroy()
@@ -2917,18 +3023,26 @@ class App(ctk.CTk):
 
     def _clear_keybinding(self, action_id: str):
         self._keybindings[action_id] = ""
+        self._settings["keybindings"] = self._keybindings
         config.patch_setting("keybindings", self._keybindings)
         if self._recording_action == action_id:
             self._recording_action = None
         self._render_keybindings_table()
+        self._refresh_step_buttons()
+        if hasattr(self, "_render_p2p_gallery"):
+            self._render_p2p_gallery()
         if hasattr(self, "_kb_status_label"):
             self._kb_status_label.configure(text="已清除快捷鍵")
 
     def _reset_keybindings(self):
         self._keybindings = dict(config.DEFAULT_KEYBINDINGS)
+        self._settings["keybindings"] = self._keybindings
         config.patch_setting("keybindings", self._keybindings)
         self._recording_action = None
         self._render_keybindings_table()
+        self._refresh_step_buttons()
+        if hasattr(self, "_render_p2p_gallery"):
+            self._render_p2p_gallery()
         if hasattr(self, "_kb_status_label"):
             self._kb_status_label.configure(text="已恢復預設快捷鍵")
 
@@ -2982,9 +3096,13 @@ class App(ctk.CTk):
                 return None
             key = event.keysym
             self._keybindings[self._recording_action] = key
+            self._settings["keybindings"] = self._keybindings
             config.patch_setting("keybindings", self._keybindings)
             self._recording_action = None
             self._render_keybindings_table()
+            self._refresh_step_buttons()
+            if hasattr(self, "_render_p2p_gallery"):
+                self._render_p2p_gallery()
             if hasattr(self, "_kb_status_label"):
                 self._kb_status_label.configure(text=f"已將快捷鍵設定為：{format_key_display(key)}")
             return "break"
@@ -4009,11 +4127,25 @@ class App(ctk.CTk):
     #  P2P Tab 1: Edit & Preview Window (_build_p2p_editor_tab)
     # ------------------------------------------------------------------ #
     def _build_p2p_editor_tab(self, parent):
+        # v2.05 Top Utility Bar (Privacy Preview Switch)
+        top_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        top_bar.pack(fill="x", padx=8, pady=(4, 2))
+
+        ctk.CTkLabel(top_bar, text="🎨 AI 以圖生圖工作站", font=FONT_SUBTITLE, anchor="w").pack(side="left", padx=(4, 0))
+
+        self._p2p_preview_switch = ctk.CTkSwitch(
+            top_bar, text="👁️ 圖片即時預覽 (關閉即黑屏防窺)",
+            variable=self._p2p_preview_visible_var,
+            font=FONT_SMALL,
+            command=self._on_p2p_preview_toggle
+        )
+        self._p2p_preview_switch.pack(side="right", padx=(0, 6))
+
         paned = tk.PanedWindow(
             parent, orient="horizontal", sashrelief="raised", sashwidth=6,
             bg="#252526", bd=0, opaqueresize=True
         )
-        paned.pack(fill="both", expand=True, padx=6, pady=6)
+        paned.pack(fill="both", expand=True, padx=6, pady=(2, 6))
 
         left_col = ctk.CTkFrame(paned)
         mid_col = ctk.CTkFrame(paned)
@@ -4023,9 +4155,17 @@ class App(ctk.CTk):
         paned.add(mid_col, minsize=380, stretch="always")
         paned.add(right_col, minsize=380, stretch="always")
 
-        # --- Left Column: \captured Gallery ---
-        ctk.CTkLabel(left_col, text="📁 截圖素材庫 (\\captured)", font=FONT_SUBTITLE, anchor="w").pack(
-            fill="x", padx=10, pady=(8, 4))
+        # --- Left Column: Input Material Gallery ---
+        ctk.CTkLabel(left_col, text="📁 輸入圖庫：", font=FONT_SUBTITLE, anchor="w").pack(
+            fill="x", padx=10, pady=(8, 2))
+
+        self._p2p_input_dir_var = ctk.StringVar(value="")
+        self._p2p_input_dir_menu = ctk.CTkOptionMenu(
+            left_col, values=["截圖素材庫 (預設)"], variable=self._p2p_input_dir_var, font=FONT_SMALL,
+            command=self._on_p2p_input_dir_change
+        )
+        self._p2p_input_dir_menu.pack(fill="x", padx=10, pady=(0, 4))
+        self._populate_p2p_input_dir_menu()
 
         ctk.CTkButton(
             left_col, text="🎬 前往影片截圖視窗 (ROI)", height=28, font=FONT_SMALL,
@@ -4035,10 +4175,13 @@ class App(ctk.CTk):
 
         top_btns = ctk.CTkFrame(left_col, fg_color="transparent")
         top_btns.pack(fill="x", padx=10, pady=(0, 4))
-        ctk.CTkButton(top_btns, text="🔄 重新整理", width=80, height=26, font=FONT_SMALL,
+        ctk.CTkButton(top_btns, text="🔄 重新整理", width=75, height=26, font=FONT_SMALL,
                       command=self._refresh_p2p_gallery).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(top_btns, text="📂 開啟資料夾", width=95, height=26, font=FONT_SMALL,
-                      command=self._open_captured_folder).pack(side="left")
+        ctk.CTkButton(top_btns, text="📂 開啟資料夾", width=85, height=26, font=FONT_SMALL,
+                      command=self._open_current_input_folder).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(top_btns, text="📋 拷貝至輸出庫", width=110, height=26, font=FONT_SMALL,
+                      fg_color="#2e7d32", hover_color="#1b5e20",
+                      command=self._copy_selected_input_to_output).pack(side="left")
 
         sel_btns = ctk.CTkFrame(left_col, fg_color="transparent")
         sel_btns.pack(fill="x", padx=10, pady=(0, 4))
@@ -4146,32 +4289,73 @@ class App(ctk.CTk):
         self._p2p_neg_prompt_box = ctk.CTkTextbox(right_scroll, height=45, font=FONT_SMALL)
         self._p2p_neg_prompt_box.pack(fill="x", pady=(0, 4))
 
-        # Parameters: Count & Aspect Ratio (v2.03: Count moved out to primary row)
-        param_row = ctk.CTkFrame(right_scroll, fg_color="transparent")
-        param_row.pack(fill="x", pady=(2, 4))
+        # Parameters Row 1: Count, Resolution, Aspect Ratio (v2.05 reorganization)
+        param_row1 = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        param_row1.pack(fill="x", pady=(2, 3))
 
-        self._p2p_count_label = ctk.CTkLabel(param_row, text="張數：", font=FONT_SMALL)
+        self._p2p_count_label = ctk.CTkLabel(param_row1, text="張數：", font=FONT_SMALL)
         self._p2p_count_label.pack(side="left")
         self._p2p_count_var = ctk.StringVar(value="1")
         self._p2p_count_menu = ctk.CTkOptionMenu(
-            param_row, values=["1", "2", "3", "4"],
-            variable=self._p2p_count_var, font=FONT_SMALL, height=24, width=65
+            param_row1, values=["1", "2", "3", "4"],
+            variable=self._p2p_count_var, font=FONT_SMALL, height=24, width=58
         )
-        self._p2p_count_menu.pack(side="left", padx=(2, 8))
+        self._p2p_count_menu.pack(side="left", padx=(2, 6))
 
-        self._p2p_aspect_label = ctk.CTkLabel(param_row, text="比例：", font=FONT_SMALL)
-        self._p2p_aspect_label.pack(side="left")
-        self._p2p_aspect_var = ctk.StringVar(value=self._p2p_settings.get("default_params", {}).get("aspect_ratio", "1:1"))
-        self._p2p_aspect_seg = ctk.CTkSegmentedButton(
-            param_row, values=["1:1", "16:9", "9:16", "4:3", "3:2"],
-            variable=self._p2p_aspect_var, height=24, font=FONT_SMALL
+        self._p2p_res_label = ctk.CTkLabel(param_row1, text="解析度：", font=FONT_SMALL)
+        self._p2p_res_label.pack(side="left")
+        self._p2p_res_var = ctk.StringVar(value="auto")
+        self._p2p_res_menu = ctk.CTkOptionMenu(
+            param_row1, values=["auto", "1K", "2K", "3K", "4K"],
+            variable=self._p2p_res_var, font=FONT_SMALL, height=24, width=70
         )
-        self._p2p_aspect_seg.pack(side="left", fill="x", expand=True)
+        self._p2p_res_menu.pack(side="left", padx=(2, 6))
+
+        self._p2p_aspect_label = ctk.CTkLabel(param_row1, text="比例：", font=FONT_SMALL)
+        self._p2p_aspect_label.pack(side="left")
+        init_aspect = self._p2p_settings.get("default_params", {}).get("aspect_ratio", "1:1")
+        self._p2p_aspect_var = ctk.StringVar(value=init_aspect)
+        self._p2p_aspect_menu = ctk.CTkOptionMenu(
+            param_row1, values=["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "自定義"],
+            variable=self._p2p_aspect_var, font=FONT_SMALL, height=24,
+            command=self._on_p2p_aspect_ratio_change
+        )
+        self._p2p_aspect_menu.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        # Parameters Row 2: Dynamic Size Presets or Custom WxH entries (v2.05)
+        self._p2p_size_container = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        self._p2p_size_container.pack(fill="x", pady=(2, 4))
+
+        self._p2p_size_preset_frame = ctk.CTkFrame(self._p2p_size_container, fg_color="transparent")
+        self._p2p_size_preset_frame.pack(fill="x")
+        self._p2p_size_label = ctk.CTkLabel(self._p2p_size_preset_frame, text="尺寸規格：", font=FONT_SMALL)
+        self._p2p_size_label.pack(side="left")
+        self._p2p_size_var = ctk.StringVar(value="auto")
+        init_sizes = image_gen_engine.ASPECT_RATIO_SIZE_PRESETS.get(init_aspect, ["auto", "1024x1024", "自定義..."])
+        self._p2p_size_menu = ctk.CTkOptionMenu(
+            self._p2p_size_preset_frame, values=init_sizes,
+            variable=self._p2p_size_var, font=FONT_SMALL, height=24,
+            command=self._on_p2p_size_preset_change
+        )
+        self._p2p_size_menu.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        self._p2p_custom_size_frame = ctk.CTkFrame(self._p2p_size_container, fg_color="transparent")
+        ctk.CTkLabel(self._p2p_custom_size_frame, text="自訂尺寸：寬 W", font=FONT_SMALL).pack(side="left")
+        self._p2p_custom_w_entry = ctk.CTkEntry(
+            self._p2p_custom_size_frame, textvariable=self._p2p_custom_w_var, width=65, height=24, font=FONT_MONO, justify="center"
+        )
+        self._p2p_custom_w_entry.pack(side="left", padx=(2, 4))
+        ctk.CTkLabel(self._p2p_custom_size_frame, text="× 高 H", font=FONT_SMALL).pack(side="left")
+        self._p2p_custom_h_entry = ctk.CTkEntry(
+            self._p2p_custom_size_frame, textvariable=self._p2p_custom_h_var, width=65, height=24, font=FONT_MONO, justify="center"
+        )
+        self._p2p_custom_h_entry.pack(side="left", padx=(2, 4))
+        ctk.CTkLabel(self._p2p_custom_size_frame, text="px", font=FONT_SMALL).pack(side="left")
 
         # Advanced Drawing Parameters Collapsible Panel (v2.02 / v2.03)
         self._p2p_adv_open = False
         self._p2p_adv_toggle_btn = ctk.CTkButton(
-            right_scroll, text="⚙️ 展開進階繪圖參數 (強度 / 尺寸 / 畫質 / Seed...) ▼",
+            right_scroll, text="⚙️ 展開進階繪圖參數 (強度 / 畫質 / Seed / JSON...) ▼",
             height=22, font=FONT_SMALL, fg_color="transparent", text_color=("#1f6aa5", "#64b5f6"),
             hover_color=("gray85", "gray25"), anchor="w", command=self._toggle_p2p_advanced_params
         )
@@ -4179,7 +4363,7 @@ class App(ctk.CTk):
 
         self._p2p_adv_frame = ctk.CTkFrame(right_scroll, fg_color=("gray88", "gray18"), corner_radius=6)
 
-        # Row 1: Strength (v2.03 moved inside advanced panel)
+        # Adv Row 1: Strength (v2.03)
         adv_row1 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
         adv_row1.pack(fill="x", padx=8, pady=(6, 2))
         self._p2p_strength_label_title = ctk.CTkLabel(adv_row1, text="重繪強度：", font=FONT_SMALL, width=80, anchor="w")
@@ -4193,65 +4377,53 @@ class App(ctk.CTk):
         self._p2p_strength_label = ctk.CTkLabel(adv_row1, text=f"{self._p2p_strength_var.get():.2f}", font=FONT_SMALL, width=28)
         self._p2p_strength_label.pack(side="left", padx=(0, 6))
 
-        # Row 2: Resolution / Size
+        # Adv Row 2: Quality & Background
         adv_row2 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
         adv_row2.pack(fill="x", padx=8, pady=2)
-        self._p2p_size_label = ctk.CTkLabel(adv_row2, text="解析度/尺寸：", font=FONT_SMALL, width=80, anchor="w")
-        self._p2p_size_label.pack(side="left")
-        self._p2p_size_var = ctk.StringVar(value="auto")
-        self._p2p_size_menu = ctk.CTkOptionMenu(
-            adv_row2, values=["auto", "1024x1024", "1536x1024", "2048x1152", "1152x2048", "2560x1088", "3840x2160", "1024x768", "768x1024"],
-            variable=self._p2p_size_var, font=FONT_SMALL, height=24
-        )
-        self._p2p_size_menu.pack(side="left", fill="x", expand=True)
-
-        # Row 3: Quality & Background
-        adv_row3 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
-        adv_row3.pack(fill="x", padx=8, pady=2)
-        self._p2p_quality_label = ctk.CTkLabel(adv_row3, text="畫質等級：", font=FONT_SMALL, width=80, anchor="w")
+        self._p2p_quality_label = ctk.CTkLabel(adv_row2, text="畫質等級：", font=FONT_SMALL, width=80, anchor="w")
         self._p2p_quality_label.pack(side="left")
         self._p2p_quality_var = ctk.StringVar(value="auto")
         self._p2p_quality_menu = ctk.CTkOptionMenu(
-            adv_row3, values=["auto", "low", "medium", "high", "xhigh", "max"],
+            adv_row2, values=["auto", "low", "medium", "high", "xhigh", "max"],
             variable=self._p2p_quality_var, font=FONT_SMALL, height=24, width=95
         )
         self._p2p_quality_menu.pack(side="left", padx=(0, 6))
 
-        self._p2p_bg_label = ctk.CTkLabel(adv_row3, text="背景：", font=FONT_SMALL)
+        self._p2p_bg_label = ctk.CTkLabel(adv_row2, text="背景：", font=FONT_SMALL)
         self._p2p_bg_label.pack(side="left")
         self._p2p_bg_var = ctk.StringVar(value="auto")
         self._p2p_bg_menu = ctk.CTkOptionMenu(
-            adv_row3, values=["auto", "opaque", "transparent"],
+            adv_row2, values=["auto", "opaque", "transparent"],
             variable=self._p2p_bg_var, font=FONT_SMALL, height=24
         )
         self._p2p_bg_menu.pack(side="left", fill="x", expand=True)
 
-        # Row 4: Format & Seed (v2.03)
-        adv_row4 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
-        adv_row4.pack(fill="x", padx=8, pady=2)
-        self._p2p_format_label = ctk.CTkLabel(adv_row4, text="輸出格式：", font=FONT_SMALL, width=80, anchor="w")
+        # Adv Row 3: Format & Seed (v2.03)
+        adv_row3 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row3.pack(fill="x", padx=8, pady=2)
+        self._p2p_format_label = ctk.CTkLabel(adv_row3, text="輸出格式：", font=FONT_SMALL, width=80, anchor="w")
         self._p2p_format_label.pack(side="left")
         self._p2p_format_var = ctk.StringVar(value="auto")
         self._p2p_format_menu = ctk.CTkOptionMenu(
-            adv_row4, values=["auto", "png", "jpeg", "webp"],
+            adv_row3, values=["auto", "png", "jpeg", "webp"],
             variable=self._p2p_format_var, font=FONT_SMALL, height=24, width=95
         )
         self._p2p_format_menu.pack(side="left", padx=(0, 6))
 
-        self._p2p_seed_label = ctk.CTkLabel(adv_row4, text="種子(Seed)：", font=FONT_SMALL)
+        self._p2p_seed_label = ctk.CTkLabel(adv_row3, text="種子(Seed)：", font=FONT_SMALL)
         self._p2p_seed_label.pack(side="left")
         self._p2p_seed_var = ctk.StringVar(value="")
         self._p2p_seed_entry = ctk.CTkEntry(
-            adv_row4, textvariable=self._p2p_seed_var, placeholder_text="隨機", font=FONT_SMALL, height=24
+            adv_row3, textvariable=self._p2p_seed_var, placeholder_text="隨機", font=FONT_SMALL, height=24
         )
         self._p2p_seed_entry.pack(side="left", fill="x", expand=True)
 
-        # Row 5: Custom Extra JSON
-        adv_row5 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
-        adv_row5.pack(fill="x", padx=8, pady=(2, 6))
-        ctk.CTkLabel(adv_row5, text="自訂JSON：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
+        # Adv Row 4: Custom Extra JSON
+        adv_row4 = ctk.CTkFrame(self._p2p_adv_frame, fg_color="transparent")
+        adv_row4.pack(fill="x", padx=8, pady=(2, 6))
+        ctk.CTkLabel(adv_row4, text="自訂JSON：", font=FONT_SMALL, width=80, anchor="w").pack(side="left")
         self._p2p_extra_json_entry = ctk.CTkEntry(
-            adv_row5, placeholder_text='如: {"steps": 30}', font=FONT_SMALL, height=24
+            adv_row4, placeholder_text='如: {"steps": 30}', font=FONT_SMALL, height=24
         )
         self._p2p_extra_json_entry.pack(side="left", fill="x", expand=True)
 
@@ -4267,36 +4439,199 @@ class App(ctk.CTk):
         )
         self._p2p_status_label.pack(fill="x", pady=(0, 4))
 
-        # Output Canvas & Action buttons
+        # Output Canvas & Gallery Section (v2.05)
         ctk.CTkLabel(right_scroll, text="🖼️ AI 生成成果預覽：", font=FONT_SMALL, anchor="w").pack(
             fill="x", pady=(4, 2))
         self._p2p_result_box = ctk.CTkFrame(right_scroll, fg_color="black")
         self._p2p_result_box.pack(fill="x", pady=(0, 4))
 
-        self._p2p_result_canvas = tk.Canvas(self._p2p_result_box, bg="#141414", height=220, highlightthickness=0)
+        self._p2p_result_canvas = tk.Canvas(self._p2p_result_box, bg="#141414", height=200, highlightthickness=0)
         self._p2p_result_canvas.pack(fill="both", expand=True)
 
-        res_btns = ctk.CTkFrame(right_scroll, fg_color="transparent")
-        res_btns.pack(fill="x", pady=(2, 6))
-        self._p2p_save_btn = ctk.CTkButton(
-            res_btns, text="💾 另存至 \\generated", height=28, font=FONT_SMALL,
-            state="disabled", fg_color="#2e7d32", hover_color="#1b5e20",
-            command=self._save_p2p_result
+        # Output Gallery Header & Dropdown (v2.05 replaces old bottom buttons)
+        out_header = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        out_header.pack(fill="x", pady=(6, 2))
+        ctk.CTkLabel(out_header, text="📁 輸出圖庫：", font=FONT_SUBTITLE, anchor="w").pack(side="left")
+
+        self._p2p_output_dir_var = ctk.StringVar(value="")
+        self._p2p_output_dir_menu = ctk.CTkOptionMenu(
+            right_scroll, values=["AI生成資料夾 (預設)"], variable=self._p2p_output_dir_var, font=FONT_SMALL,
+            command=self._on_p2p_output_dir_change
         )
-        self._p2p_save_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self._p2p_reuse_btn = ctk.CTkButton(
-            res_btns, text="🔍 設為下一輪參考圖", height=28, font=FONT_SMALL,
-            state="disabled", command=self._use_result_as_input
+        self._p2p_output_dir_menu.pack(fill="x", pady=(0, 4))
+        self._populate_p2p_output_dir_menu()
+
+        # Output Action Toolbar
+        out_toolbar = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        out_toolbar.pack(fill="x", pady=(0, 4))
+        ctk.CTkButton(out_toolbar, text="🔄 重新整理", width=75, height=26, font=FONT_SMALL,
+                      command=self._refresh_p2p_output_gallery).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(out_toolbar, text="📂 開啟資料夾", width=85, height=26, font=FONT_SMALL,
+                      command=self._open_current_output_folder).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(out_toolbar, text="📋 拷貝至輸入庫", width=110, height=26, font=FONT_SMALL,
+                      fg_color="#2e7d32", hover_color="#1b5e20",
+                      command=self._copy_selected_output_to_input).pack(side="left")
+
+        out_sel_bar = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        out_sel_bar.pack(fill="x", pady=(0, 2))
+        ctk.CTkButton(out_sel_bar, text="☑ 全選", width=55, height=24, font=FONT_SMALL,
+                      command=self._select_all_output).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(out_sel_bar, text="☐ 全不選", width=65, height=24, font=FONT_SMALL,
+                      command=self._deselect_all_output).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(out_sel_bar, text="🗑️ 刪除", width=70, height=24, font=FONT_SMALL,
+                      fg_color="#b23b3b", hover_color="#8a2e2e",
+                      command=self._delete_selected_output).pack(side="right")
+
+        self._p2p_output_count_label = ctk.CTkLabel(
+            right_scroll, text="共 0 張 ｜ 已勾選 0 張", font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w"
         )
-        self._p2p_reuse_btn.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self._p2p_output_count_label.pack(fill="x", pady=(0, 2))
+
+        # Output Thumbnails Scrollable Gallery (v2.05)
+        self._p2p_output_gallery_scroll = ctk.CTkScrollableFrame(right_scroll, height=180)
+        self._p2p_output_gallery_scroll.pack(fill="both", expand=True, pady=(0, 6))
 
     # ------------------------------------------------------------------ #
-    #  P2P Gallery Operations
+    # ------------------------------------------------------------------ #
+    #  P2P Input & Output Directory Dropdown & History Management (v2.05)
+    # ------------------------------------------------------------------ #
+    def _populate_p2p_input_dir_menu(self):
+        if not hasattr(self, "_p2p_input_dir_menu"):
+            return
+        default_dir = str(Path(config.resolve_captured_dir(self._settings)).resolve())
+        items = [f"★ 預設截圖素材庫 ({Path(default_dir).name})"]
+        for d in self._recent_input_dirs[:3]:
+            try:
+                dp = str(Path(d).resolve())
+                if dp != default_dir and Path(dp).is_dir():
+                    items.append(f"{Path(dp).name} ({dp})")
+            except Exception:
+                pass
+        items.append("📂 瀏覽自訂資料夾...")
+        self._p2p_input_dir_menu.configure(values=items)
+        cur_p = str(Path(self._current_input_dir).resolve())
+        if cur_p == default_dir:
+            self._p2p_input_dir_var.set(items[0])
+        else:
+            for it in items[1:-1]:
+                if cur_p in it:
+                    self._p2p_input_dir_var.set(it)
+                    break
+            else:
+                self._p2p_input_dir_var.set(items[0])
+
+    def _on_p2p_input_dir_change(self, choice: str):
+        if choice == "📂 瀏覽自訂資料夾...":
+            chosen = filedialog.askdirectory(title="選擇輸入素材資料夾", initialdir=self._current_input_dir)
+            if not chosen:
+                self._populate_p2p_input_dir_menu()
+                return
+            self._set_current_input_dir(chosen)
+        elif choice.startswith("★ 預設截圖素材庫"):
+            self._set_current_input_dir(config.resolve_captured_dir(self._settings))
+        else:
+            m = re.search(r"\((.+)\)$", choice)
+            if m and Path(m.group(1)).is_dir():
+                self._set_current_input_dir(m.group(1))
+            else:
+                self._set_current_input_dir(config.resolve_captured_dir(self._settings))
+
+    def _set_current_input_dir(self, target_dir: str):
+        target_p = str(Path(target_dir).resolve())
+        self._current_input_dir = target_p
+        default_dir = str(Path(config.resolve_captured_dir(self._settings)).resolve())
+        if target_p != default_dir:
+            if target_p in self._recent_input_dirs:
+                self._recent_input_dirs.remove(target_p)
+            self._recent_input_dirs.insert(0, target_p)
+            self._recent_input_dirs = self._recent_input_dirs[:3]
+            config.update_recent_dirs(self._settings, recent_input=target_p)
+        self._populate_p2p_input_dir_menu()
+        self._selected_captured_paths.clear()
+        self._refresh_p2p_gallery()
+
+    def _populate_p2p_output_dir_menu(self):
+        if not hasattr(self, "_p2p_output_dir_menu"):
+            return
+        default_dir = str(Path(config.resolve_generated_dir(self._settings)).resolve())
+        items = [f"★ 預設 AI 生成庫 ({Path(default_dir).name})"]
+        for d in self._recent_output_dirs[:3]:
+            try:
+                dp = str(Path(d).resolve())
+                if dp != default_dir and Path(dp).is_dir():
+                    items.append(f"{Path(dp).name} ({dp})")
+            except Exception:
+                pass
+        items.append("📂 瀏覽自訂資料夾...")
+        self._p2p_output_dir_menu.configure(values=items)
+        cur_p = str(Path(self._current_output_dir).resolve())
+        if cur_p == default_dir:
+            self._p2p_output_dir_var.set(items[0])
+        else:
+            for it in items[1:-1]:
+                if cur_p in it:
+                    self._p2p_output_dir_var.set(it)
+                    break
+            else:
+                self._p2p_output_dir_var.set(items[0])
+
+    def _on_p2p_output_dir_change(self, choice: str):
+        if choice == "📂 瀏覽自訂資料夾...":
+            chosen = filedialog.askdirectory(title="選擇輸出圖片資料夾", initialdir=self._current_output_dir)
+            if not chosen:
+                self._populate_p2p_output_dir_menu()
+                return
+            self._set_current_output_dir(chosen)
+        elif choice.startswith("★ 預設 AI 生成庫"):
+            self._set_current_output_dir(config.resolve_generated_dir(self._settings))
+        else:
+            m = re.search(r"\((.+)\)$", choice)
+            if m and Path(m.group(1)).is_dir():
+                self._set_current_output_dir(m.group(1))
+            else:
+                self._set_current_output_dir(config.resolve_generated_dir(self._settings))
+
+    def _set_current_output_dir(self, target_dir: str):
+        target_p = str(Path(target_dir).resolve())
+        self._current_output_dir = target_p
+        default_dir = str(Path(config.resolve_generated_dir(self._settings)).resolve())
+        if target_p != default_dir:
+            if target_p in self._recent_output_dirs:
+                self._recent_output_dirs.remove(target_p)
+            self._recent_output_dirs.insert(0, target_p)
+            self._recent_output_dirs = self._recent_output_dirs[:3]
+            config.update_recent_dirs(self._settings, recent_output=target_p)
+        self._populate_p2p_output_dir_menu()
+        self._selected_output_paths.clear()
+        self._refresh_p2p_output_gallery()
+
+    def _open_captured_folder(self):
+        self._open_current_input_folder()
+
+    def _open_current_input_folder(self):
+        d = Path(self._current_input_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(d))
+        except Exception as exc:
+            messagebox.showerror("開啟失敗", f"無法開啟目錄：{exc}")
+
+    def _open_current_output_folder(self):
+        d = Path(self._current_output_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(d))
+        except Exception as exc:
+            messagebox.showerror("開啟失敗", f"無法開啟目錄：{exc}")
+
+    # ------------------------------------------------------------------ #
+    #  P2P Input Gallery Operations
     # ------------------------------------------------------------------ #
     def _refresh_p2p_gallery(self):
         if not hasattr(self, "_p2p_gallery_scroll"):
             return
-        self._captured_images = capture_manager.list_captured_images()
+        self._captured_images = capture_manager.list_images_in_dir(self._current_input_dir)
         self._render_p2p_gallery()
 
     def _render_p2p_gallery(self):
@@ -4310,8 +4645,11 @@ class App(ctk.CTk):
             self._p2p_gallery_count_label.configure(text=f"共 {total} 張 ｜ 已勾選 {sel_count} 張")
 
         if not self._captured_images:
+            cap_key = config.get_quick_capture_key_display(self._settings)
+            folder_name = Path(self._current_input_dir).name
             empty_lbl = ctk.CTkLabel(
-                self._p2p_gallery_scroll, text="\\captured 目錄目前無圖片\n可於播放器按 C 鍵或點擊截圖",
+                self._p2p_gallery_scroll,
+                text=f"[{folder_name}] 目前無圖片\n可於播放器按 [{cap_key}] 鍵或點擊截圖",
                 font=FONT_SMALL, text_color=("gray40", "#9aa0a6")
             )
             empty_lbl.pack(pady=20)
@@ -4364,13 +4702,6 @@ class App(ctk.CTk):
         if not self._active_edit_path and self._captured_images:
             self._set_active_p2p_image(str(self._captured_images[0]["path"]))
 
-    def _open_captured_folder(self):
-        d = capture_manager.get_captured_dir()
-        try:
-            os.startfile(str(d))
-        except Exception as exc:
-            messagebox.showerror("開啟失敗", f"無法開啟目錄：{exc}")
-
     def _select_all_captured(self):
         for item in self._captured_images:
             self._selected_captured_paths.add(str(item["path"]))
@@ -4421,6 +4752,25 @@ class App(ctk.CTk):
         self._original_active_img = None
         self._refresh_p2p_gallery()
 
+    def _copy_selected_input_to_output(self):
+        if not self._selected_captured_paths:
+            messagebox.showinfo("提示", "請先在輸入圖庫勾選至少一張圖片進行拷貝。")
+            return
+        copied = capture_manager.copy_images_to_directory(self._selected_captured_paths, self._current_output_dir)
+        if copied:
+            copied_str_set = {str(p) for p in copied}
+            self._selected_output_paths.update(copied_str_set)
+            self._refresh_p2p_output_gallery()
+            self._set_active_output_image(str(copied[0]))
+            for p_str, cb in self._p2p_output_checkboxes.items():
+                if p_str in copied_str_set:
+                    cb.set(True)
+            if hasattr(self, "_p2p_output_count_label"):
+                self._p2p_output_count_label.configure(
+                    text=f"共 {len(self._output_images)} 張 ｜ 已勾選 {len(self._selected_output_paths)} 張"
+                )
+            messagebox.showinfo("拷貝成功", f"已成功拷貝 {len(copied)} 張圖片至輸出圖庫，並已自動勾選！")
+
     def _set_active_p2p_image(self, p_str: str):
         self._active_edit_path = p_str
         self._edit_rotation = 0
@@ -4439,6 +4789,151 @@ class App(ctk.CTk):
                 text=f"共 {len(self._captured_images)} 張 ｜ 已勾選 {len(self._selected_captured_paths)} 張"
             )
         self._render_active_p2p_canvas()
+
+    # ------------------------------------------------------------------ #
+    #  P2P Output Gallery Operations (v2.05)
+    # ------------------------------------------------------------------ #
+    def _refresh_p2p_output_gallery(self):
+        if not hasattr(self, "_p2p_output_gallery_scroll"):
+            return
+        self._output_images = capture_manager.list_images_in_dir(self._current_output_dir)
+        self._render_p2p_output_gallery()
+
+    def _render_p2p_output_gallery(self):
+        for w in self._p2p_output_gallery_scroll.winfo_children():
+            w.destroy()
+        self._p2p_output_checkboxes.clear()
+
+        total = len(self._output_images)
+        sel_count = len(self._selected_output_paths)
+        if hasattr(self, "_p2p_output_count_label"):
+            self._p2p_output_count_label.configure(text=f"共 {total} 張 ｜ 已勾選 {sel_count} 張")
+
+        if not self._output_images:
+            folder_name = Path(self._current_output_dir).name
+            empty_lbl = ctk.CTkLabel(
+                self._p2p_output_gallery_scroll,
+                text=f"[{folder_name}] 目前無生成圖片\n點擊「開始 AI 以圖生圖」生成新成果",
+                font=FONT_SMALL, text_color=("gray40", "#9aa0a6")
+            )
+            empty_lbl.pack(pady=20)
+            return
+
+        self._thumb_cache = getattr(self, "_thumb_cache", {})
+
+        for item in self._output_images:
+            p_str = str(item["path"])
+            row_frame = ctk.CTkFrame(self._p2p_output_gallery_scroll, fg_color=("gray85", "gray20"))
+            row_frame.pack(fill="x", pady=2, padx=2)
+
+            cb_var = ctk.BooleanVar(value=(p_str in self._selected_output_paths))
+            self._p2p_output_checkboxes[p_str] = cb_var
+
+            cb = ctk.CTkCheckBox(
+                row_frame, text="", variable=cb_var, width=20,
+                command=lambda p=p_str: self._toggle_output_selection(p)
+            )
+            cb.pack(side="left", padx=(6, 4))
+
+            # Thumbnail
+            thumb_tk = self._thumb_cache.get(p_str)
+            if not thumb_tk:
+                try:
+                    img = Image.open(item["path"])
+                    img.thumbnail((64, 36), Image.Resampling.BILINEAR)
+                    thumb_tk = ImageTk.PhotoImage(img)
+                    self._thumb_cache[p_str] = thumb_tk
+                except Exception:
+                    thumb_tk = None
+
+            if thumb_tk:
+                thumb_lbl = tk.Label(row_frame, image=thumb_tk, bg="#202020", cursor="hand2")
+                thumb_lbl.pack(side="left", padx=(0, 6), pady=3)
+                thumb_lbl.bind("<Button-1>", lambda _e, p=p_str: self._set_active_output_image(p))
+
+            info_col = ctk.CTkFrame(row_frame, fg_color="transparent")
+            info_col.pack(side="left", fill="x", expand=True)
+
+            name_lbl = ctk.CTkLabel(info_col, text=item["name"], font=FONT_SMALL, anchor="w", cursor="hand2")
+            name_lbl.pack(fill="x")
+            name_lbl.bind("<Button-1>", lambda _e, p=p_str: self._set_active_output_image(p))
+
+            time_lbl = ctk.CTkLabel(info_col, text=item.get("date_str", ""), font=("Consolas", 10),
+                                    text_color=("gray40", "#888"), anchor="w")
+            time_lbl.pack(fill="x")
+
+    def _set_active_output_image(self, p_str: str):
+        try:
+            self._current_gen_img = Image.open(p_str).convert("RGB")
+            self._render_result_canvas()
+        except Exception as exc:
+            messagebox.showerror("讀取失敗", f"無法載入生成圖片：{exc}")
+
+    def _select_all_output(self):
+        for item in self._output_images:
+            self._selected_output_paths.add(str(item["path"]))
+        for var in self._p2p_output_checkboxes.values():
+            var.set(True)
+        if hasattr(self, "_p2p_output_count_label"):
+            self._p2p_output_count_label.configure(
+                text=f"共 {len(self._output_images)} 張 ｜ 已勾選 {len(self._selected_output_paths)} 張"
+            )
+
+    def _deselect_all_output(self):
+        self._selected_output_paths.clear()
+        for var in self._p2p_output_checkboxes.values():
+            var.set(False)
+        if hasattr(self, "_p2p_output_count_label"):
+            self._p2p_output_count_label.configure(
+                text=f"共 {len(self._output_images)} 張 ｜ 已勾選 0 張"
+            )
+
+    def _toggle_output_selection(self, p_str: str):
+        var = self._p2p_output_checkboxes.get(p_str)
+        if var and var.get():
+            self._selected_output_paths.add(p_str)
+        else:
+            self._selected_output_paths.discard(p_str)
+        if hasattr(self, "_p2p_output_count_label"):
+            self._p2p_output_count_label.configure(
+                text=f"共 {len(self._output_images)} 張 ｜ 已勾選 {len(self._selected_output_paths)} 張"
+            )
+
+    def _delete_selected_output(self):
+        if not self._selected_output_paths:
+            messagebox.showinfo("提示", "請先勾選欲刪除的生成圖片。")
+            return
+        count = len(self._selected_output_paths)
+        if not messagebox.askyesno("確認刪除", f"確定要從硬碟刪除這 {count} 張生成圖片嗎？此操作無法復原。"):
+            return
+        for p_str in list(self._selected_output_paths):
+            try:
+                p = Path(p_str)
+                if p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+        self._selected_output_paths.clear()
+        self._refresh_p2p_output_gallery()
+
+    def _copy_selected_output_to_input(self):
+        if not self._selected_output_paths:
+            messagebox.showinfo("提示", "請先在輸出圖庫勾選至少一張圖片進行拷貝。")
+            return
+        copied = capture_manager.copy_images_to_directory(self._selected_output_paths, self._current_input_dir)
+        if copied:
+            copied_str_set = {str(p) for p in copied}
+            self._selected_captured_paths.update(copied_str_set)
+            self._refresh_p2p_gallery()
+            self._set_active_p2p_image(str(copied[0]))
+            for p_str, cb in self._p2p_gallery_checkboxes.items():
+                if p_str in copied_str_set:
+                    cb.set(True)
+            if hasattr(self, "_p2p_gallery_count_label"):
+                self._p2p_gallery_count_label.configure(
+                    text=f"共 {len(self._captured_images)} 張 ｜ 已勾選 {len(self._selected_captured_paths)} 張"
+                )
+            messagebox.showinfo("拷貝成功", f"已成功拷貝 {len(copied)} 張圖片至輸入圖庫，並已自動勾選！")
 
     # ------------------------------------------------------------------ #
     #  P2P Image Editing Pipeline (Rotate & Flip)
@@ -4479,6 +4974,7 @@ class App(ctk.CTk):
         saved_p = capture_manager.save_edited_image(
             img=self._active_edit_img,
             original_path=orig_p,
+            target_dir=self._current_input_dir,
         )
         self._refresh_p2p_gallery()
         self._set_active_p2p_image(str(saved_p))
@@ -4490,26 +4986,44 @@ class App(ctk.CTk):
         if self._p2p_adv_open:
             self._p2p_adv_frame.pack_forget()
             self._p2p_adv_open = False
-            self._p2p_adv_toggle_btn.configure(text="⚙️ 展開進階繪圖參數 (Size / Quality / Format...) ▼")
+            self._p2p_adv_toggle_btn.configure(text="⚙️ 展開進階繪圖參數 (強度 / 畫質 / Seed / JSON...) ▼")
         else:
             self._p2p_adv_frame.pack(after=self._p2p_adv_toggle_btn, fill="x", pady=(0, 4))
             self._p2p_adv_open = True
             self._p2p_adv_toggle_btn.configure(text="⚙️ 收合進階繪圖參數 ▲")
 
+    def _on_p2p_preview_toggle(self):
+        """防窺模式切換：重新渲染畫布。"""
+        self._render_active_p2p_canvas()
+        self._render_result_canvas()
+
     def _render_active_p2p_canvas(self):
-        if not hasattr(self, "_p2p_edit_canvas") or not self._active_edit_img:
+        if not hasattr(self, "_p2p_edit_canvas"):
             return
         cw = max(10, self._p2p_edit_canvas.winfo_width())
         ch = max(10, self._p2p_edit_canvas.winfo_height())
-        iw, ih = self._active_edit_img.size
+        self._p2p_edit_canvas.delete("all")
 
+        # Privacy Mode: Pure Black Canvas (防窺黑屏模式)
+        if not self._p2p_preview_visible_var.get():
+            self._p2p_edit_canvas.create_rectangle(0, 0, cw, ch, fill="#050505", outline="")
+            self._p2p_edit_canvas.create_text(
+                cw // 2, ch // 2,
+                text="[ 圖片預覽已關閉 (防窺黑屏模式) ]",
+                fill="#555555", font=FONT_BODY
+            )
+            return
+
+        if not self._active_edit_img:
+            return
+
+        iw, ih = self._active_edit_img.size
         scale = min(cw / iw, ch / ih)
         disp_w = max(1, int(iw * scale))
         disp_h = max(1, int(ih * scale))
 
         disp_img = self._active_edit_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
         self._p2p_canvas_tk = ImageTk.PhotoImage(disp_img)
-        self._p2p_edit_canvas.delete("all")
         self._p2p_edit_canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._p2p_canvas_tk)
 
         if hasattr(self, "_p2p_edit_info_label"):
@@ -4517,6 +5031,58 @@ class App(ctk.CTk):
             self._p2p_edit_info_label.configure(
                 text=f"原尺寸: {iw}x{ih} ｜ 旋轉: {self._edit_rotation}° ｜ 水平翻轉: {flip_str}"
             )
+
+    def _render_result_canvas(self):
+        if not hasattr(self, "_p2p_result_canvas"):
+            return
+        cw = max(10, self._p2p_result_canvas.winfo_width())
+        ch = max(10, self._p2p_result_canvas.winfo_height())
+        self._p2p_result_canvas.delete("all")
+
+        # Privacy Mode: Pure Black Canvas (防窺黑屏模式)
+        if not self._p2p_preview_visible_var.get():
+            self._p2p_result_canvas.create_rectangle(0, 0, cw, ch, fill="#050505", outline="")
+            self._p2p_result_canvas.create_text(
+                cw // 2, ch // 2,
+                text="[ 圖片預覽已關閉 (防窺黑屏模式) ]",
+                fill="#555555", font=FONT_BODY
+            )
+            return
+
+        if not self._current_gen_img:
+            return
+
+        iw, ih = self._current_gen_img.size
+        scale = min(cw / iw, ch / ih)
+        disp_w = max(1, int(iw * scale))
+        disp_h = max(1, int(ih * scale))
+
+        disp_img = self._current_gen_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
+        self._p2p_result_tk = ImageTk.PhotoImage(disp_img)
+        self._p2p_result_canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._p2p_result_tk)
+
+    def _on_p2p_aspect_ratio_change(self, choice: str):
+        if choice == "自定義":
+            if hasattr(self, "_p2p_size_preset_frame"):
+                self._p2p_size_preset_frame.pack_forget()
+            if hasattr(self, "_p2p_custom_size_frame"):
+                self._p2p_custom_size_frame.pack(fill="x")
+        else:
+            if hasattr(self, "_p2p_custom_size_frame"):
+                self._p2p_custom_size_frame.pack_forget()
+            if hasattr(self, "_p2p_size_preset_frame"):
+                self._p2p_size_preset_frame.pack(fill="x")
+            presets = image_gen_engine.ASPECT_RATIO_SIZE_PRESETS.get(choice, ["auto", "自定義..."])
+            if hasattr(self, "_p2p_size_menu"):
+                self._p2p_size_menu.configure(values=presets)
+                cur_s = self._p2p_size_var.get()
+                if cur_s not in presets:
+                    self._p2p_size_var.set("auto")
+
+    def _on_p2p_size_preset_change(self, choice: str):
+        if choice == "自定義...":
+            self._p2p_aspect_var.set("自定義")
+            self._on_p2p_aspect_ratio_change("自定義")
 
     # ------------------------------------------------------------------ #
     #  P2P Generation & Result Management
@@ -4616,16 +5182,27 @@ class App(ctk.CTk):
                 self._p2p_count_var.set("1")
 
         # 4. Aspect Ratio
-        if hasattr(self, "_p2p_aspect_seg"):
+        if hasattr(self, "_p2p_aspect_menu"):
             sup_aspect = caps.get("supports_aspect_ratio", True)
-            self._p2p_aspect_seg.configure(state="normal" if sup_aspect else "disabled")
+            self._p2p_aspect_menu.configure(state="normal" if sup_aspect else "disabled")
+
+        # 4b. Resolution (v2.05)
+        if hasattr(self, "_p2p_res_menu") and hasattr(self, "_p2p_res_label"):
+            sup_res = caps.get("supports_resolution", True)
+            self._p2p_res_menu.configure(state="normal" if sup_res else "disabled")
+            self._p2p_res_label.configure(
+                text="解析度：" if sup_res else "解析度 [不支援]：",
+                text_color=("gray10", "gray90") if sup_res else ("gray50", "gray50")
+            )
+            if not sup_res:
+                self._p2p_res_var.set("auto")
 
         # 5. Size / Resolution
         if hasattr(self, "_p2p_size_menu") and hasattr(self, "_p2p_size_label"):
             sup_size = caps.get("supports_size", True)
             self._p2p_size_menu.configure(state="normal" if sup_size else "disabled")
             self._p2p_size_label.configure(
-                text="解析度/尺寸：" if sup_size else "解析度 [不支援]：",
+                text="尺寸規格：" if sup_size else "尺寸 [不支援]：",
                 text_color=("gray10", "gray90") if sup_size else ("gray50", "gray50")
             )
             if not sup_size:
@@ -4733,11 +5310,27 @@ class App(ctk.CTk):
 
         pos_prompt = self._p2p_pos_prompt_box.get("1.0", "end").strip()
         neg_prompt = self._p2p_neg_prompt_box.get("1.0", "end").strip()
-        aspect = self._p2p_aspect_var.get()
-        strength = float(self._p2p_strength_var.get())
 
-        # Collect advanced parameters (v2.02 / v2.03)
-        adv_size = self._p2p_size_var.get().strip() if hasattr(self, "_p2p_size_var") else "auto"
+        # Collect parameters (v2.05)
+        aspect = self._p2p_aspect_var.get()
+        if aspect == "自定義":
+            try:
+                cw = int(self._p2p_custom_w_var.get().strip())
+                ch = int(self._p2p_custom_h_var.get().strip())
+                if cw <= 0 or ch <= 0:
+                    raise ValueError
+                adv_size = f"{cw}x{ch}"
+                aspect = image_gen_engine.resolve_closest_aspect_ratio(adv_size)
+            except Exception:
+                messagebox.showerror("自訂尺寸格式錯誤", "自訂寬度 (W) 與高度 (H) 必須為正整數 px，例如 1024 與 768。")
+                return
+        else:
+            adv_size = self._p2p_size_var.get().strip() if hasattr(self, "_p2p_size_var") else "auto"
+            if adv_size == "自定義...":
+                adv_size = "auto"
+
+        res_val = self._p2p_res_var.get().strip() if hasattr(self, "_p2p_res_var") else "auto"
+        strength = float(self._p2p_strength_var.get())
         adv_quality = self._p2p_quality_var.get().strip() if hasattr(self, "_p2p_quality_var") else "auto"
         adv_bg = self._p2p_bg_var.get().strip() if hasattr(self, "_p2p_bg_var") else "auto"
         adv_fmt = self._p2p_format_var.get().strip() if hasattr(self, "_p2p_format_var") else "auto"
@@ -4784,6 +5377,7 @@ class App(ctk.CTk):
                     strength=strength,
                     num_outputs=num_outputs,
                     size=adv_size,
+                    resolution=res_val,
                     quality=adv_quality,
                     background=adv_bg,
                     output_format=adv_fmt,
@@ -4796,6 +5390,7 @@ class App(ctk.CTk):
                         self._current_gen_img,
                         prompt_name=self._p2p_preset_var.get(),
                         model_name=cfg.model,
+                        target_dir=self._current_output_dir,
                     )
                     self.after(0, lambda: self._on_p2p_success(saved_p))
                 else:
@@ -4810,8 +5405,14 @@ class App(ctk.CTk):
         self._p2p_busy = False
         self._p2p_gen_btn.configure(state="normal", text="🎨 開始 AI 以圖生圖")
         self._p2p_status_label.configure(text=f"✅ 生成成功！已存至：{saved_path.name}")
-        self._p2p_save_btn.configure(state="normal")
-        self._p2p_reuse_btn.configure(state="normal")
+        self._refresh_p2p_output_gallery()
+        self._selected_output_paths.add(str(saved_path))
+        if str(saved_path) in self._p2p_output_checkboxes:
+            self._p2p_output_checkboxes[str(saved_path)].set(True)
+        if hasattr(self, "_p2p_output_count_label"):
+            self._p2p_output_count_label.configure(
+                text=f"共 {len(self._output_images)} 張 ｜ 已勾選 {len(self._selected_output_paths)} 張"
+            )
         self._render_result_canvas()
 
     def _on_p2p_error(self, err_msg: str):
@@ -4820,22 +5421,6 @@ class App(ctk.CTk):
         self._p2p_status_label.configure(text=f"❌ 生圖失敗：{err_msg[:60]}")
         messagebox.showerror("生成失敗", f"AI 繪圖發生錯誤：\n{err_msg}")
 
-    def _render_result_canvas(self):
-        if not hasattr(self, "_p2p_result_canvas") or not self._current_gen_img:
-            return
-        cw = max(10, self._p2p_result_canvas.winfo_width())
-        ch = max(10, self._p2p_result_canvas.winfo_height())
-        iw, ih = self._current_gen_img.size
-
-        scale = min(cw / iw, ch / ih)
-        disp_w = max(1, int(iw * scale))
-        disp_h = max(1, int(ih * scale))
-
-        disp_img = self._current_gen_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
-        self._p2p_result_tk = ImageTk.PhotoImage(disp_img)
-        self._p2p_result_canvas.delete("all")
-        self._p2p_result_canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._p2p_result_tk)
-
     def _save_p2p_result(self):
         if not self._current_gen_img:
             return
@@ -4843,18 +5428,18 @@ class App(ctk.CTk):
         model_name = self._p2p_model_var.get() if hasattr(self, "_p2p_model_var") else "model"
         safe_prompt = capture_manager.sanitize_filename_part(prompt_name, max_len=30) if prompt_name else "custom"
         safe_model = capture_manager.simplify_model_name(model_name)
-        import datetime
         now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
         suggested_name = f"{safe_prompt}_{safe_model}_{now_str}.png"
 
         target = filedialog.asksaveasfilename(
             defaultextension=".png",
             filetypes=[("PNG 圖片", "*.png"), ("JPEG 圖片", "*.jpg")],
-            initialdir=str(capture_manager.get_generated_dir()),
+            initialdir=str(self._current_output_dir),
             initialfile=suggested_name,
         )
         if target:
             self._current_gen_img.save(target)
+            self._refresh_p2p_output_gallery()
             messagebox.showinfo("儲存完成", f"圖片已成功另存為：\n{target}")
 
     def _use_result_as_input(self):
@@ -4863,10 +5448,11 @@ class App(ctk.CTk):
         saved_p = capture_manager.save_captured_image(
             img=self._current_gen_img,
             custom_name="ai_ref",
+            target_dir=self._current_input_dir,
         )
         self._refresh_p2p_gallery()
         self._set_active_p2p_image(str(saved_p))
-        messagebox.showinfo("已設為參考圖", f"AI 生成圖已存入 \\captured 並設為當前編輯參考圖：\n{saved_p.name}")
+        messagebox.showinfo("已設為參考圖", f"AI 生成圖已存入輸入圖庫並設為當前編輯參考圖：\n{saved_p.name}")
 
     # ------------------------------------------------------------------ #
     #  P2P Tab 2: API Settings (_build_p2p_api_tab)

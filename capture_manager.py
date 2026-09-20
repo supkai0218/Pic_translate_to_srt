@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Optional
@@ -19,16 +20,12 @@ import config
 
 def get_captured_dir() -> Path:
     """Ensure and return the directory for captured video frames."""
-    d = config.CAPTURED_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return config.resolve_captured_dir()
 
 
 def get_generated_dir() -> Path:
     """Ensure and return the directory for AI-generated images."""
-    d = config.GENERATED_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return config.resolve_generated_dir()
 
 
 def sanitize_filename_part(name: str, max_len: int = 50) -> str:
@@ -62,9 +59,14 @@ def save_captured_image(
     is_crop: bool = False,
     crop_box: Optional[tuple[int, int, int, int]] = None,
     custom_name: str = "",
+    target_dir: Optional[Path | str] = None,
 ) -> Path:
-    """Save captured image into \\captured directory with naming '{video}_{timestamp}.jpg'."""
-    cap_dir = get_captured_dir()
+    """Save captured image into target directory (default get_captured_dir()) with naming '{video}_{timestamp}.jpg'."""
+    if target_dir:
+        cap_dir = Path(target_dir)
+        cap_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        cap_dir = get_captured_dir()
 
     if custom_name:
         safe_stem = sanitize_filename_part(custom_name)
@@ -125,12 +127,17 @@ def simplify_model_name(model_name: str) -> str:
 def save_edited_image(
     img: Image.Image,
     original_path: str | Path = "",
+    target_dir: Optional[Path | str] = None,
 ) -> Path:
-    """Save rotated or flipped image into \\captured with '{original_stem}_edit.jpg'.
+    """Save rotated or flipped image into target directory (default get_captured_dir()) with '{original_stem}_edit.jpg'.
 
     Prevents repetitive chain suffixes like '_edit_edit_edit' by normalizing to clean stem.
     """
-    cap_dir = get_captured_dir()
+    if target_dir:
+        cap_dir = Path(target_dir)
+        cap_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        cap_dir = get_captured_dir()
 
     if original_path:
         orig_stem = Path(original_path).stem
@@ -162,11 +169,17 @@ def save_generated_image(
     prompt_name: str = "",
     model_name: str = "",
     index: int = 1,
+    target_dir: Optional[Path | str] = None,
 ) -> Path:
-    """Save AI-generated image into \\generated directory with naming
-    '{prompt範本名稱}_{模型名稱}_YYYYMMDD_hhmm.png'.
+    """Save AI-generated image into target directory (default get_generated_dir())
+    with naming '{prompt範本名稱}_{模型名稱}_YYYYMMDD_hhmm.png'.
     """
-    gen_dir = get_generated_dir()
+    if target_dir:
+        gen_dir = Path(target_dir)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        gen_dir = get_generated_dir()
+
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     safe_prompt = sanitize_filename_part(prompt_name, max_len=30) if prompt_name else "custom"
     safe_model = simplify_model_name(model_name)
@@ -183,14 +196,16 @@ def save_generated_image(
     return target
 
 
-def list_captured_images() -> list[dict]:
-    """List all captured images in \\captured, newest first."""
-    cap_dir = get_captured_dir()
+def list_images_in_dir(target_dir: Path | str) -> list[dict]:
+    """List all supported images in specified directory, newest first."""
+    p_dir = Path(target_dir)
+    if not p_dir.is_dir():
+        return []
     valid_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
     items = []
     try:
-        for entry in os.scandir(cap_dir):
+        for entry in os.scandir(p_dir):
             if entry.is_file():
                 p = Path(entry.path)
                 if p.suffix.lower() in valid_exts:
@@ -205,9 +220,50 @@ def list_captured_images() -> list[dict]:
     except Exception:
         pass
 
-    # Newest first
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return items
+
+
+def list_captured_images(custom_dir: Optional[Path | str] = None) -> list[dict]:
+    """List all captured images in captured directory (or custom directory), newest first."""
+    d = Path(custom_dir) if custom_dir else get_captured_dir()
+    return list_images_in_dir(d)
+
+
+def list_generated_images(custom_dir: Optional[Path | str] = None) -> list[dict]:
+    """List all generated images in generated directory (or custom directory), newest first."""
+    d = Path(custom_dir) if custom_dir else get_generated_dir()
+    return list_images_in_dir(d)
+
+
+def copy_images_to_directory(source_paths: list[Path | str], target_dir: Path | str) -> list[Path]:
+    """Copy selected image files into target directory.
+
+    If target file already exists, automatically appends sequential suffix
+    (e.g., '{stem}_1{suffix}', '{stem}_2{suffix}') to avoid overwriting.
+    Returns list of destination Paths.
+    """
+    dest_dir = Path(target_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+
+    for src_raw in source_paths:
+        src = Path(src_raw)
+        if not src.is_file():
+            continue
+
+        target_file = dest_dir / src.name
+        stem = src.stem
+        suffix = src.suffix
+        counter = 1
+        while target_file.exists():
+            target_file = dest_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+
+        shutil.copy2(src, target_file)
+        copied.append(target_file)
+
+    return copied
 
 
 def rotate_image(img: Image.Image, angle: int) -> Image.Image:

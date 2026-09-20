@@ -264,6 +264,7 @@ def sniff_model_capabilities(cfg: P2PProviderCfg) -> dict:
         "supports_negative_prompt": False,
         "supports_size": False,
         "supports_aspect_ratio": True,
+        "supports_resolution": True,
         "supports_quality": False,
         "supports_background": False,
         "supports_seed": False,
@@ -610,6 +611,42 @@ ASPECT_TO_SIZE_MAP: dict[str, str] = {
     "21:9": "2560x1088",
 }
 
+ASPECT_RATIO_SIZE_PRESETS: dict[str, list[str]] = {
+    "1:1": ["auto", "1024x1024", "2048x2048", "自定義..."],
+    "16:9": ["auto", "2048x1152", "2560x1088", "3840x2160", "自定義..."],
+    "9:16": ["auto", "1152x2048", "1088x2560", "2160x3840", "自定義..."],
+    "4:3": ["auto", "1024x768", "1536x1152", "2880x2160", "自定義..."],
+    "3:4": ["auto", "768x1024", "1152x1536", "2160x2880", "自定義..."],
+    "3:2": ["auto", "1536x1024", "自定義..."],
+    "2:3": ["auto", "1024x1536", "自定義..."],
+    "21:9": ["auto", "2560x1088", "自定義..."],
+}
+
+
+def resolve_closest_aspect_ratio(size_or_wh: str) -> str:
+    """Parse 'WIDTHxHEIGHT' string and return closest standard aspect ratio string."""
+    if not size_or_wh or size_or_wh == "auto":
+        return "1:1"
+    m = re.match(r"^(\d+)[xX*:](\d+)$", size_or_wh.strip())
+    if not m:
+        return "1:1"
+    w, h = float(m.group(1)), float(m.group(2))
+    if w <= 0 or h <= 0:
+        return "1:1"
+    ratio = w / h
+    candidates = [
+        (1.0, "1:1"),
+        (16 / 9, "16:9"),
+        (9 / 16, "9:16"),
+        (4 / 3, "4:3"),
+        (3 / 4, "3:4"),
+        (3 / 2, "3:2"),
+        (2 / 3, "2:3"),
+        (21 / 9, "21:9"),
+    ]
+    best_match = min(candidates, key=lambda c: abs(c[0] - ratio))
+    return best_match[1]
+
 
 def is_gpt_image_model(model_name: str) -> bool:
     """Return True if model follows OpenAI GPT-Image edit / dall-e parameter schema."""
@@ -693,6 +730,7 @@ def generate_image(
     strength: float = 0.65,
     num_outputs: int = 1,
     size: str = "auto",
+    resolution: str = "auto",
     quality: str = "auto",
     background: str = "auto",
     output_format: str = "auto",
@@ -735,6 +773,8 @@ def generate_image(
         atlas_extra = dict(extra_params) if extra_params else {}
         if seed is not None and caps.get("supports_seed"):
             atlas_extra["seed"] = int(seed)
+        if resolution and resolution != "auto":
+            atlas_extra["resolution"] = resolution
 
         payload = build_atlas_payload(
             cfg=cfg,
@@ -829,8 +869,16 @@ def generate_image(
             else:
                 payload["model"] = cfg.model
 
-            if aspect_ratio and aspect_ratio != "auto":
-                payload["aspect_ratio"] = aspect_ratio
+            resolved_aspect = aspect_ratio
+            if (not resolved_aspect or resolved_aspect in ("auto", "自定義")) and size and size != "auto":
+                resolved_aspect = resolve_closest_aspect_ratio(size)
+            elif resolved_aspect == "自定義":
+                resolved_aspect = "1:1"
+
+            if resolved_aspect and resolved_aspect != "auto":
+                payload["aspect_ratio"] = resolved_aspect
+            if resolution and resolution != "auto" and caps.get("supports_resolution"):
+                payload["resolution"] = resolution
             if output_format and output_format != "auto":
                 payload["output_format"] = output_format
             if quality and quality != "auto" and caps.get("supports_quality"):
@@ -866,13 +914,21 @@ def generate_image(
 
         else:
             # Text-to-Image /image/generate
+            resolved_aspect = aspect_ratio
+            if (not resolved_aspect or resolved_aspect in ("auto", "自定義")) and size and size != "auto":
+                resolved_aspect = resolve_closest_aspect_ratio(size)
+            elif resolved_aspect == "自定義":
+                resolved_aspect = "1:1"
+
             payload = {
                 "model": cfg.model,
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
                 "return_binary": False,
-                "aspect_ratio": aspect_ratio,
+                "aspect_ratio": resolved_aspect,
             }
+            if resolution and resolution != "auto" and caps.get("supports_resolution"):
+                payload["resolution"] = resolution
             if output_format and output_format != "auto":
                 payload["output_format"] = output_format
             if images:
@@ -930,12 +986,16 @@ def generate_image(
 
         # OpenRouter does not accept 'size'; auto-convert size to aspect_ratio if not given
         resolved_aspect = aspect_ratio
-        if (not resolved_aspect or resolved_aspect == "auto") and size and size != "auto":
+        if (not resolved_aspect or resolved_aspect in ("auto", "自定義")) and size and size != "auto":
             SIZE_TO_ASPECT = {v: k for k, v in ASPECT_TO_SIZE_MAP.items()}
-            resolved_aspect = SIZE_TO_ASPECT.get(size, "1:1")
+            resolved_aspect = SIZE_TO_ASPECT.get(size) or resolve_closest_aspect_ratio(size)
+        elif resolved_aspect == "自定義":
+            resolved_aspect = "1:1"
 
         if resolved_aspect and resolved_aspect != "auto":
             payload["aspect_ratio"] = resolved_aspect
+        if resolution and resolution != "auto" and caps.get("supports_resolution"):
+            payload["resolution"] = resolution
 
         if quality and quality != "auto" and caps.get("supports_quality"):
             payload["quality"] = quality

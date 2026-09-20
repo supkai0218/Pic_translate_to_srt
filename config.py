@@ -601,7 +601,82 @@ DEFAULT_P2P_SETTINGS: dict = {
         "aspect_ratio": "1:1",
         "samples": 1,
     },
+    "storage_folders": {
+        "default_captured_dir": "",
+        "default_generated_dir": "",
+        "recent_input_dirs": [],
+        "recent_output_dirs": [],
+    },
 }
+
+
+def resolve_captured_dir(settings_p2p: Optional[dict] = None) -> Path:
+    """Return configured custom captured directory or fallback to CAPTURED_DIR."""
+    s = settings_p2p if settings_p2p is not None else load_p2p_settings()
+    custom = s.get("storage_folders", {}).get("default_captured_dir", "").strip()
+    if custom:
+        try:
+            p = Path(custom)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
+    CAPTURED_DIR.mkdir(parents=True, exist_ok=True)
+    return CAPTURED_DIR
+
+
+def resolve_generated_dir(settings_p2p: Optional[dict] = None) -> Path:
+    """Return configured custom generated directory or fallback to GENERATED_DIR."""
+    s = settings_p2p if settings_p2p is not None else load_p2p_settings()
+    custom = s.get("storage_folders", {}).get("default_generated_dir", "").strip()
+    if custom:
+        try:
+            p = Path(custom)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    return GENERATED_DIR
+
+
+def get_quick_capture_key_display(settings: Optional[dict] = None) -> str:
+    """Return display string for quick_capture hotkey, e.g. 'C' or 'F2'."""
+    s = settings if settings is not None else load_settings()
+    kb = s.get("keybindings", {})
+    if not kb:
+        kb = s.get("shortcuts", {})
+    k = kb.get("quick_capture", "c")
+    if not k:
+        k = "c"
+    if k.lower() == "c":
+        return "C"
+    return k.upper() if len(k) <= 3 else k
+
+
+def update_recent_dirs(
+    settings: dict,
+    recent_input: Optional[str] = None,
+    recent_output: Optional[str] = None,
+    max_recent: int = 3,
+) -> None:
+    """Update FIFO recent_input_dirs and recent_output_dirs lists in settings."""
+    sf = settings.setdefault("storage_folders", {})
+    if recent_input:
+        in_list = sf.setdefault("recent_input_dirs", [])
+        if recent_input in in_list:
+            in_list.remove(recent_input)
+        in_list.insert(0, recent_input)
+        sf["recent_input_dirs"] = in_list[:max_recent]
+
+    if recent_output:
+        out_list = sf.setdefault("recent_output_dirs", [])
+        if recent_output in out_list:
+            out_list.remove(recent_output)
+        out_list.insert(0, recent_output)
+        sf["recent_output_dirs"] = out_list[:max_recent]
+
+    save_settings(settings)
 
 
 def _migrate_p2p_secrets(settings: dict) -> bool:
