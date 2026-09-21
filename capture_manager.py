@@ -23,6 +23,21 @@ def get_captured_dir() -> Path:
     return config.resolve_captured_dir()
 
 
+def get_captured_drop_dir() -> Path:
+    """Ensure and return the .drop directory for captured video frames."""
+    return config.resolve_captured_drop_dir()
+
+
+def get_ocr_dir() -> Path:
+    """Ensure and return the directory for OCR subtitle crop images."""
+    return config.resolve_ocr_dir()
+
+
+def get_ocr_drop_dir() -> Path:
+    """Ensure and return the .drop directory for OCR subtitle crop images."""
+    return config.resolve_ocr_drop_dir()
+
+
 def get_generated_dir() -> Path:
     """Ensure and return the directory for AI-generated images."""
     return config.resolve_generated_dir()
@@ -52,19 +67,62 @@ def sec_to_safe_ts(sec: float) -> str:
     return f"{h:02d}-{m:02d}-{s:02d}_{ms:03d}"
 
 
+def safe_ts_to_sec(ts_str: str) -> float:
+    """Convert filesystem-safe timestamp 'HH-MM-SS_mmm' back to float seconds."""
+    try:
+        parts = ts_str.split("_")
+        h_m_s = parts[0].split("-")
+        h = int(h_m_s[0])
+        m = int(h_m_s[1])
+        s = int(h_m_s[2])
+        ms = int(parts[1]) if len(parts) > 1 else 0
+        return round(h * 3600.0 + m * 60.0 + s + ms / 1000.0, 3)
+    except Exception:
+        return 0.0
+
+
+def parse_ocr_filename(filename: str) -> Optional[tuple[float, float]]:
+    """Parse start and end seconds from OCR capture filename.
+
+    Pattern: '{video_stem}_ocr_{start_ts}_{end_ts}{crop_tag}.jpg'
+    Returns (start_sec, end_sec) or None if pattern not found.
+    """
+    pattern = r"_ocr_(\d{2}-\d{2}-\d{2}_\d{3})_(\d{2}-\d{2}-\d{2}_\d{3})"
+    m = re.search(pattern, filename)
+    if m:
+        start_sec = safe_ts_to_sec(m.group(1))
+        end_sec = safe_ts_to_sec(m.group(2))
+        return (start_sec, end_sec)
+
+    pattern_single = r"_ocr_(\d{2}-\d{2}-\d{2}_\d{3})"
+    m2 = re.search(pattern_single, filename)
+    if m2:
+        start_sec = safe_ts_to_sec(m2.group(1))
+        return (start_sec, start_sec + 2.0)
+    return None
+
+
 def save_captured_image(
     img: Image.Image,
     video_path: str = "",
     sec: float = 0.0,
+    end_sec: Optional[float] = None,
     is_crop: bool = False,
     crop_box: Optional[tuple[int, int, int, int]] = None,
     custom_name: str = "",
+    category: str = "captured",
     target_dir: Optional[Path | str] = None,
 ) -> Path:
-    """Save captured image into target directory (default get_captured_dir()) with naming '{video}_{timestamp}.jpg'."""
+    """Save captured image into target directory.
+
+    If category == 'ocr' and target_dir is None, defaults to get_ocr_dir().
+    Otherwise defaults to get_captured_dir().
+    """
     if target_dir:
         cap_dir = Path(target_dir)
         cap_dir.mkdir(parents=True, exist_ok=True)
+    elif category == "ocr":
+        cap_dir = get_ocr_dir()
     else:
         cap_dir = get_captured_dir()
 
@@ -76,10 +134,18 @@ def save_captured_image(
     else:
         safe_stem = "capture"
 
-    ts_str = sec_to_safe_ts(sec)
+    start_ts = sec_to_safe_ts(sec)
     crop_tag = "_crop" if is_crop else ""
 
-    base_name = f"{safe_stem}_{ts_str}{crop_tag}"
+    if category == "ocr":
+        if end_sec is not None:
+            end_ts = sec_to_safe_ts(end_sec)
+            base_name = f"{safe_stem}_ocr_{start_ts}_{end_ts}{crop_tag}"
+        else:
+            base_name = f"{safe_stem}_ocr_{start_ts}{crop_tag}"
+    else:
+        base_name = f"{safe_stem}_{start_ts}{crop_tag}"
+
     target = cap_dir / f"{base_name}.jpg"
 
     # Avoid collision by appending counter
@@ -286,3 +352,68 @@ def flip_image(img: Image.Image, horizontal: bool = True) -> Image.Image:
     if horizontal:
         return img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
     return img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+
+
+def safe_move_to_drop(filepath: str | Path, drop_dir: Path | str) -> Optional[Path]:
+    """Move a file to the .drop directory, avoiding collisions by appending counter if needed."""
+    src = Path(filepath)
+    if not src.is_file():
+        return None
+    d_dir = Path(drop_dir)
+    d_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = d_dir / src.name
+    stem = src.stem
+    suffix = src.suffix
+    counter = 1
+    while dest.exists():
+        dest = d_dir / f"{stem}_{counter}{suffix}"
+        counter += 1
+
+    try:
+        shutil.move(str(src), str(dest))
+        return dest
+    except Exception as e:
+        print(f"[safe_move_to_drop] Error moving {src} to {dest}: {e}")
+        return None
+
+
+def safe_restore_from_drop(filepath: str | Path, target_dir: Path | str) -> Optional[Path]:
+    """Move a file from .drop back to target working directory, avoiding collisions."""
+    src = Path(filepath)
+    if not src.is_file():
+        return None
+    t_dir = Path(target_dir)
+    t_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = t_dir / src.name
+    stem = src.stem
+    suffix = src.suffix
+    counter = 1
+    while dest.exists():
+        dest = t_dir / f"{stem}_{counter}{suffix}"
+        counter += 1
+
+    try:
+        shutil.move(str(src), str(dest))
+        return dest
+    except Exception as e:
+        print(f"[safe_restore_from_drop] Error moving {src} to {dest}: {e}")
+        return None
+
+
+def clear_drop_dir(drop_dir: Path | str) -> int:
+    """Permanently delete all image files inside drop_dir. Returns count of deleted files."""
+    d_dir = Path(drop_dir)
+    if not d_dir.is_dir():
+        return 0
+    deleted = 0
+    for entry in os.scandir(d_dir):
+        if entry.is_file():
+            p = Path(entry.path)
+            try:
+                p.unlink()
+                deleted += 1
+            except Exception:
+                pass
+    return deleted

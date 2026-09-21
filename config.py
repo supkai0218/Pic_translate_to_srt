@@ -14,6 +14,7 @@ import re
 import sys
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv, set_key
 
@@ -24,6 +25,7 @@ else:
 
 SETTINGS_FILE = BASE_DIR / "settings.json"
 SETTINGS_P2P_FILE = BASE_DIR / "settings_p2p.json"
+OCR_DIR = BASE_DIR / "ocr2srt"
 CAPTURED_DIR = BASE_DIR / "captured"
 GENERATED_DIR = BASE_DIR / "generated"
 DOTENV_PATH = BASE_DIR / ".env"
@@ -174,10 +176,22 @@ _DEFAULTS: dict = {
     "last_srt_path": "",
     "step_settings": DEFAULT_STEP_SETTINGS,
     "keybindings": DEFAULT_KEYBINDINGS,
+    "custom_srt_suffix": "_translated",
+    "srt_save_mode": "save_as",  # "save_as" | "overwrite"
+    "selected_ocr_provider": "",
+    "selected_ocr_model": "",
+    "selected_ocr_prompt_id": "",
     "appearance_mode": "dark",
     "sub_render_enabled": True,
     "last_volume": 80,
     "window_geometry": None,
+    "storage_folders": {
+        "default_ocr_dir": "",
+        "default_captured_dir": "",
+        "default_generated_dir": "",
+        "recent_input_dirs": [],
+        "recent_output_dirs": [],
+    },
 }
 
 
@@ -347,6 +361,13 @@ def get_default_provider() -> dict | None:
     return providers[0] if providers else None
 
 
+def get_default_provider_name() -> str:
+    """Return the default provider name or empty string."""
+    p = get_default_provider()
+    return p.get("name", "") if p else ""
+
+
+
 def upsert_provider(provider: dict) -> None:
     """Insert or update a provider keyed by name; persist. Any api_key is
     written to .env (never to settings.json)."""
@@ -512,6 +533,32 @@ def resolve_prompt(provider_name: str, model_name: str, settings: dict | None = 
     return DEFAULT_PROMPT_PROFILES[0], "[公版] 預設通用公版"
 
 
+def get_prompt_profiles(settings: dict | None = None) -> list[dict]:
+    """Return all prompt profiles."""
+    if settings is None:
+        settings = load_settings()
+    return settings.get("prompt_profiles", []) or list(DEFAULT_PROMPT_PROFILES)
+
+
+def get_prompt_profile_by_id(profile_id: str, settings: dict | None = None) -> dict | None:
+    """Return the prompt profile dict matching profile_id, or None."""
+    profiles = get_prompt_profiles(settings)
+    for p in profiles:
+        if p.get("id") == profile_id:
+            return p
+    return None
+
+
+def get_prompt_profile_by_name(name: str, settings: dict | None = None) -> dict | None:
+    """Return the prompt profile dict matching name, or None."""
+    profiles = get_prompt_profiles(settings)
+    for p in profiles:
+        if p.get("name") == name:
+            return p
+    return None
+
+
+
 # ====================================================================== #
 #  v2.01 Pic-to-Pic (P2P) Image Generation Settings Management
 # ====================================================================== #
@@ -602,12 +649,35 @@ DEFAULT_P2P_SETTINGS: dict = {
         "samples": 1,
     },
     "storage_folders": {
+        "default_ocr_dir": "",
         "default_captured_dir": "",
         "default_generated_dir": "",
         "recent_input_dirs": [],
         "recent_output_dirs": [],
     },
 }
+
+
+def resolve_ocr_dir(settings: Optional[dict] = None) -> Path:
+    """Return configured custom OCR directory or fallback to OCR_DIR."""
+    s = settings if settings is not None else load_settings()
+    custom = s.get("storage_folders", {}).get("default_ocr_dir", "").strip()
+    if custom:
+        try:
+            p = Path(custom)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
+    OCR_DIR.mkdir(parents=True, exist_ok=True)
+    return OCR_DIR
+
+
+def resolve_ocr_drop_dir(settings: Optional[dict] = None) -> Path:
+    """Return .drop folder under resolved OCR dir."""
+    drop = resolve_ocr_dir(settings) / ".drop"
+    drop.mkdir(parents=True, exist_ok=True)
+    return drop
 
 
 def resolve_captured_dir(settings_p2p: Optional[dict] = None) -> Path:
@@ -623,6 +693,13 @@ def resolve_captured_dir(settings_p2p: Optional[dict] = None) -> Path:
             pass
     CAPTURED_DIR.mkdir(parents=True, exist_ok=True)
     return CAPTURED_DIR
+
+
+def resolve_captured_drop_dir(settings_p2p: Optional[dict] = None) -> Path:
+    """Return .drop folder under resolved captured dir."""
+    drop = resolve_captured_dir(settings_p2p) / ".drop"
+    drop.mkdir(parents=True, exist_ok=True)
+    return drop
 
 
 def resolve_generated_dir(settings_p2p: Optional[dict] = None) -> Path:

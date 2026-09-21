@@ -132,6 +132,7 @@ class SubtitleTask:
     crop_img: Image.Image                          # Cropped PIL Image sent to LLM
     status: str = "待處理"                          # "待處理" | "翻譯中" | "已完成" | "失敗"
     translation: str = ""
+    raw_translation: str = ""                      # v2.06: original LLM output before manual edit
     error_msg: str = ""
     image_path: Optional[str] = None               # v2.01: local saved path in \captured
 
@@ -156,7 +157,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.05)")
+        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.06)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -269,8 +270,9 @@ class App(ctk.CTk):
 
         # v2.05 Folder expansion & privacy preview & output gallery state
         storage_cfg = self._settings.get("storage_folders", {})
-        self._current_input_dir: str = config.resolve_captured_dir(self._settings)
-        self._current_output_dir: str = config.resolve_generated_dir(self._settings)
+        self._current_ocr_dir: Path = config.resolve_ocr_dir(self._settings)
+        self._current_input_dir: str = str(config.resolve_captured_dir(self._settings))
+        self._current_output_dir: str = str(config.resolve_generated_dir(self._settings))
         self._recent_input_dirs: list[str] = list(storage_cfg.get("recent_input_dirs", []))
         self._recent_output_dirs: list[str] = list(storage_cfg.get("recent_output_dirs", []))
         self._output_images: list[dict] = []
@@ -279,6 +281,14 @@ class App(ctk.CTk):
         self._p2p_preview_visible_var = ctk.BooleanVar(value=True)
         self._p2p_custom_w_var = ctk.StringVar(value="1024")
         self._p2p_custom_h_var = ctk.StringVar(value="768")
+
+        # v2.06: .drop History State for Subtitle OCR and P2P
+        self._ocr_history_mode: bool = False
+        self._selected_ocr_drop_paths: set[str] = set()
+        self._ocr_drop_checkboxes: dict = {}
+        self._p2p_history_mode: bool = False
+        self._selected_p2p_drop_paths: set[str] = set()
+        self._p2p_drop_checkboxes: dict = {}
 
         # Tabs (v2.01 Refined Hierarchical Structure)
         self.tabs = ctk.CTkTabview(self, anchor="nw", command=self._on_tab_change)
@@ -289,9 +299,10 @@ class App(ctk.CTk):
         self.tabs.add("  圖生圖任務  ")
         self.tabs.add("  按鈕與快捷鍵設定  ")
 
-        # Sub-tabview for OCR (API & Prompt settings):
+        # Sub-tabview for OCR (Execution, API & Prompt settings):
         self.ocr_tabs = ctk.CTkTabview(self.tabs.tab("  截圖翻譯字幕任務  "), anchor="nw", command=self._on_ocr_subtab_change)
         self.ocr_tabs.pack(fill="both", expand=True, padx=4, pady=4)
+        self.ocr_tabs.add("  翻譯字幕執行  ")
         self.ocr_tabs.add("  翻譯字幕 API 設定  ")
         self.ocr_tabs.add("  翻譯字幕 Prompt 設定  ")
 
@@ -615,9 +626,14 @@ class App(ctk.CTk):
         orig_tab = self.tabs.tab
 
         def custom_set(name: str):
-            if name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
+            if name in ("  影片截圖視窗  ", "  影片與字幕任務  "):
                 orig_set("  影片截圖視窗  ")
                 self._ensure_tab_built("  影片截圖視窗  ")
+            elif name in ("  翻譯字幕執行  ", "  翻譯字幕執行視窗  ", "  執行  "):
+                orig_set("  截圖翻譯字幕任務  ")
+                if hasattr(self, "ocr_tabs"):
+                    self.ocr_tabs.set("  翻譯字幕執行  ")
+                self._ensure_tab_built("  翻譯字幕執行  ")
             elif name in ("  API 設定  ", "  翻譯字幕 API 設定  "):
                 orig_set("  截圖翻譯字幕任務  ")
                 if hasattr(self, "ocr_tabs"):
@@ -648,8 +664,10 @@ class App(ctk.CTk):
                 self._on_tab_change()
 
         def custom_tab(name: str):
-            if name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
+            if name in ("  影片截圖視窗  ", "  影片與字幕任務  "):
                 return orig_tab("  影片截圖視窗  ")
+            elif name in ("  翻譯字幕執行  ", "  翻譯字幕執行視窗  ", "  執行  "):
+                return self.ocr_tabs.tab("  翻譯字幕執行  ")
             elif name in ("  API 設定  ", "  翻譯字幕 API 設定  "):
                 return self.ocr_tabs.tab("  翻譯字幕 API 設定  ")
             elif name in ("  Prompt 設定  ", "  翻譯字幕 Prompt 設定  "):
@@ -680,7 +698,10 @@ class App(ctk.CTk):
             return
         self._built_ocr_subtabs.add(sub_name)
 
-        if sub_name == "  翻譯字幕 API 設定  ":
+        if sub_name == "  翻譯字幕執行  ":
+            self._build_ocr_exec_tab(self.ocr_tabs.tab("  翻譯字幕執行  "))
+            self._sync_ocr_exec_ui()
+        elif sub_name == "  翻譯字幕 API 設定  ":
             self._build_api_tab(self.ocr_tabs.tab("  翻譯字幕 API 設定  "))
             self._sync_api_form()
         elif sub_name == "  翻譯字幕 Prompt 設定  ":
@@ -717,13 +738,16 @@ class App(ctk.CTk):
         if tab_name == "  影音播放器  ":
             self._build_player_tab(self.tabs.tab("  影音播放器  "))
             self._refresh_step_buttons()
-        elif tab_name in ("  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "):
-            self._built_tabs.update(["  影片截圖視窗  ", "  翻譯字幕執行視窗  ", "  影片與字幕任務  ", "  執行  "])
+        elif tab_name in ("  影片截圖視窗  ", "  影片與字幕任務  "):
+            self._built_tabs.update(["  影片截圖視窗  ", "  影片與字幕任務  "])
             self._build_video_tab(self.tabs.tab("  影片截圖視窗  "))
             self._refresh_step_buttons()
             self._sync_video_tab_ui()
             self._render_tasks_list()
-            self._refresh_run_tab_summary()
+            self._refresh_capture_gallery()
+        elif tab_name in ("  翻譯字幕執行  ", "  翻譯字幕執行視窗  ", "  執行  "):
+            self._built_tabs.update(["  翻譯字幕執行  ", "  翻譯字幕執行視窗  ", "  執行  "])
+            self._ensure_ocr_subtab_built("  翻譯字幕執行  ")
         elif tab_name == "  截圖翻譯字幕任務  ":
             self._built_tabs.add("  截圖翻譯字幕任務  ")
             if hasattr(self, "ocr_tabs"):
@@ -1688,69 +1712,872 @@ class App(ctk.CTk):
         )
         self._capture_p2p_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
-        # Right Column: Tasks List
+        # Right Column: Tasks & Captures Paned Container (v2.06)
         right_col = ctk.CTkFrame(main_box)
         right_col.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=0)
 
-        # Task list header
-        t_hdr = ctk.CTkFrame(right_col, fg_color="transparent")
-        t_hdr.pack(fill="x", padx=10, pady=(8, 4))
+        vpaned = tk.PanedWindow(
+            right_col, orient="vertical", sashrelief="raised", sashwidth=6,
+            bg="#252526", bd=0, opaqueresize=True
+        )
+        vpaned.pack(fill="both", expand=True, padx=2, pady=2)
+
+        top_pane = ctk.CTkFrame(vpaned)
+        bottom_pane = ctk.CTkFrame(vpaned)
+
+        vpaned.add(top_pane, minsize=160, stretch="always")
+        vpaned.add(bottom_pane, minsize=160, stretch="always")
+
+        # Upper Pane: Subtitle Translation Tasks
+        t_hdr = ctk.CTkFrame(top_pane, fg_color="transparent")
+        t_hdr.pack(fill="x", padx=8, pady=(6, 2))
         self._task_count_label = ctk.CTkLabel(t_hdr, text="待翻譯任務列表 (共 0 組)", font=FONT_SUBTITLE, anchor="w")
         self._task_count_label.pack(side="left")
-        ctk.CTkButton(t_hdr, text="清空任務", width=80, height=26, font=FONT_SMALL,
-                      fg_color="#b23b3b", hover_color="#8a2e2e",
-                      command=self._clear_tasks).pack(side="right")
 
-        # Scrollable Task List
-        self._task_scroll = ctk.CTkScrollableFrame(right_col)
-        self._task_scroll.pack(fill="both", expand=True, padx=10, pady=(2, 6))
+        ctk.CTkButton(
+            t_hdr, text="🚀 前往翻譯字幕執行 ➔", height=26, font=FONT_SMALL,
+            fg_color="#1f6aa5", hover_color="#144d75",
+            command=self._navigate_to_ocr_exec
+        ).pack(side="right", padx=(6, 0))
 
-        # Quick execution & SRT export card in execution tab (v2.01)
-        run_card = ctk.CTkFrame(right_col, fg_color=("gray85", "gray18"))
-        run_card.pack(fill="x", padx=10, pady=(2, 4))
+        ctk.CTkButton(
+            t_hdr, text="📂 開啟目錄", width=75, height=26, font=FONT_SMALL,
+            command=self._open_current_ocr_folder
+        ).pack(side="right", padx=(4, 0))
 
-        self._run_prov_model_label = ctk.CTkLabel(
-            run_card, text="🔹 供應商：— ｜ 模型：—", font=FONT_SMALL, anchor="w"
+        ctk.CTkButton(
+            t_hdr, text="清空任務", width=70, height=26, font=FONT_SMALL,
+            fg_color="#b23b3b", hover_color="#8a2e2e",
+            command=self._clear_tasks
+        ).pack(side="right")
+
+        self._task_scroll = ctk.CTkScrollableFrame(top_pane)
+        self._task_scroll.pack(fill="both", expand=True, padx=6, pady=(2, 4))
+
+        # Lower Pane: P2P Material Captures Gallery
+        b_hdr = ctk.CTkFrame(bottom_pane, fg_color="transparent")
+        b_hdr.pack(fill="x", padx=8, pady=(6, 2))
+        self._capture_gallery_count_label = ctk.CTkLabel(
+            b_hdr, text="圖生圖截圖列表 (共 0 張)", font=FONT_SUBTITLE, anchor="w"
         )
-        self._run_prov_model_label.pack(fill="x", padx=8, pady=(4, 1))
+        self._capture_gallery_count_label.pack(side="left")
 
-        self._run_prompt_label = ctk.CTkLabel(
-            run_card, text="🔹 套用 Prompt：—", font=FONT_SMALL, anchor="w"
+        ctk.CTkButton(
+            b_hdr, text="🎨 前往編輯及預覽 ➔", height=26, font=FONT_SMALL,
+            fg_color="#2e7d32", hover_color="#1b5e20",
+            command=self._navigate_to_p2p_editor
+        ).pack(side="right", padx=(6, 0))
+
+        ctk.CTkButton(
+            b_hdr, text="📂 開啟目錄", width=75, height=26, font=FONT_SMALL,
+            command=self._open_current_input_folder
+        ).pack(side="right", padx=(4, 0))
+
+        ctk.CTkButton(
+            b_hdr, text="🔄 重新整理", width=75, height=26, font=FONT_SMALL,
+            command=self._refresh_capture_gallery
+        ).pack(side="right")
+
+        self._capture_gallery_scroll = ctk.CTkScrollableFrame(bottom_pane)
+        self._capture_gallery_scroll.pack(fill="both", expand=True, padx=6, pady=(2, 4))
+
+    def _navigate_to_ocr_exec(self):
+        self.tabs.set("  截圖翻譯字幕任務  ")
+        if hasattr(self, "ocr_tabs"):
+            self.ocr_tabs.set("  翻譯字幕執行  ")
+        self._ensure_ocr_subtab_built("  翻譯字幕執行  ")
+        if hasattr(self, "_render_ocr_exec_tasks"):
+            self._render_ocr_exec_tasks()
+
+    def _navigate_to_p2p_editor(self):
+        self.tabs.set("  圖生圖任務  ")
+        if hasattr(self, "p2p_tabs"):
+            self.p2p_tabs.set("  編輯及預覽視窗  ")
+        self._ensure_p2p_subtab_built("  編輯及預覽視窗  ")
+
+    def _refresh_capture_gallery(self):
+        if not hasattr(self, "_capture_gallery_scroll"):
+            return
+        target_dir = getattr(self, "_current_input_dir", None) or config.resolve_captured_dir(self._settings)
+        self._captured_images_cache = capture_manager.list_images_in_dir(target_dir)
+        self._render_capture_gallery()
+
+    def _render_capture_gallery(self):
+        if not hasattr(self, "_capture_gallery_scroll"):
+            return
+        for w in self._capture_gallery_scroll.winfo_children():
+            w.destroy()
+
+        images = getattr(self, "_captured_images_cache", [])
+        total = len(images)
+        if hasattr(self, "_capture_gallery_count_label"):
+            self._capture_gallery_count_label.configure(text=f"圖生圖截圖列表 (共 {total} 張)")
+
+        if not images:
+            empty_lbl = ctk.CTkLabel(
+                self._capture_gallery_scroll,
+                text="素材庫中尚無圖片\n點選「🎨 截取範圍至圖生圖素材庫」即可新增",
+                font=FONT_SMALL, text_color=("gray40", "#9aa0a6")
+            )
+            empty_lbl.pack(pady=20)
+            return
+
+        self._thumb_cache = getattr(self, "_thumb_cache", {})
+        for item in images:
+            p = item["path"]
+            row = ctk.CTkFrame(self._capture_gallery_scroll, fg_color=("gray88", "gray18"))
+            row.pack(fill="x", pady=2, padx=2)
+
+            c = tk.Canvas(row, width=54, height=36, bg="#222", highlightthickness=0)
+            c.pack(side="left", padx=4, pady=3)
+            p_str = str(p)
+            tk_img = self._thumb_cache.get(p_str)
+            if not tk_img:
+                try:
+                    with Image.open(p) as img_obj:
+                        th = img_obj.copy()
+                        th.thumbnail((54, 36), Image.Resampling.BILINEAR)
+                        tk_img = ImageTk.PhotoImage(th)
+                        self._thumb_cache[p_str] = tk_img
+                except Exception:
+                    tk_img = None
+            if tk_img:
+                c.create_image(27, 18, anchor="center", image=tk_img)
+                c.image = tk_img
+
+            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box.pack(side="left", fill="both", expand=True, padx=4, pady=2)
+            fname = p.name
+            ctk.CTkLabel(info_box, text=fname, font=FONT_SMALL, anchor="w").pack(fill="x")
+            dim_text = f"{item.get('width', 0)}x{item.get('height', 0)}"
+            time_text = item.get("mtime_str", "")
+            ctk.CTkLabel(info_box, text=f"{dim_text} | {time_text}", font=("Microsoft JhengHei", 9),
+                         text_color=("gray40", "#9aa0a6"), anchor="w").pack(fill="x")
+
+    def _build_ocr_exec_tab(self, parent):
+        """v2.06: Dedicated Subtitle Translation & OCR Execution Workstation."""
+        top_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        top_bar.pack(fill="x", padx=10, pady=(6, 4))
+        ctk.CTkLabel(top_bar, text="⚡ 翻譯字幕執行工作站", font=FONT_SUBTITLE, anchor="w").pack(side="left")
+        ctk.CTkButton(
+            top_bar, text="🎬 前往影片截圖視窗", height=28, font=FONT_SMALL,
+            fg_color="#1f6aa5", hover_color="#144d75",
+            command=lambda: self.tabs.set("  影片截圖視窗  ")
+        ).pack(side="right")
+
+        paned = tk.PanedWindow(
+            parent, orient="horizontal", sashrelief="raised", sashwidth=6,
+            bg="#252526", bd=0, opaqueresize=True
         )
-        self._run_prompt_label.pack(fill="x", padx=8, pady=(1, 4))
+        paned.pack(fill="both", expand=True, padx=6, pady=(2, 6))
 
-        run_btn_row = ctk.CTkFrame(run_card, fg_color="transparent")
-        run_btn_row.pack(fill="x", padx=8, pady=(2, 4))
+        left_col = ctk.CTkFrame(paned)
+        right_col = ctk.CTkFrame(paned)
+        paned.add(left_col, minsize=320, stretch="always")
+        paned.add(right_col, minsize=460, stretch="always")
+
+        # === LEFT COLUMN: Task List & Preview Canvas ===
+        t_hdr = ctk.CTkFrame(left_col, fg_color="transparent")
+        t_hdr.pack(fill="x", padx=8, pady=(6, 2))
+        self._ocr_exec_task_count_label = ctk.CTkLabel(
+            t_hdr, text="待翻譯任務 (共 0 組)", font=FONT_BODY, anchor="w"
+        )
+        self._ocr_exec_task_count_label.pack(side="left")
+
+        self._ocr_history_toggle_btn = ctk.CTkButton(
+            t_hdr, text="📦 讀取歷史截圖", width=105, height=24, font=FONT_SMALL,
+            command=self._toggle_ocr_history_mode
+        )
+        self._ocr_history_toggle_btn.pack(side="right", padx=(4, 0))
+
+        self._ocr_action_btn = ctk.CTkButton(
+            t_hdr, text="清空任務", width=70, height=24, font=FONT_SMALL,
+            fg_color="#b23b3b", hover_color="#8a2e2e",
+            command=self._on_ocr_left_action_btn
+        )
+        self._ocr_action_btn.pack(side="right")
+
+        # History Toolbar Container (placed between header and scroll frame)
+        self._ocr_toolbar_container = ctk.CTkFrame(left_col, fg_color="transparent")
+        self._ocr_toolbar_container.pack(fill="x", padx=8, pady=(0, 2))
+
+        self._ocr_history_toolbar = ctk.CTkFrame(self._ocr_toolbar_container, fg_color="transparent")
+        ctk.CTkButton(
+            self._ocr_history_toolbar, text="☑ 全選", width=55, height=24, font=FONT_SMALL,
+            command=self._select_all_ocr_drop
+        ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            self._ocr_history_toolbar, text="☐ 全不選", width=65, height=24, font=FONT_SMALL,
+            command=self._deselect_all_ocr_drop
+        ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            self._ocr_history_toolbar, text="↩️ 復原所選至任務列表", height=24, font=FONT_SMALL,
+            fg_color="#2e7d32", hover_color="#1b5e20",
+            command=self._restore_selected_ocr_drop_items
+        ).pack(side="left")
+
+        self._ocr_exec_task_scroll = ctk.CTkScrollableFrame(left_col)
+        self._ocr_exec_task_scroll.pack(fill="both", expand=True, padx=6, pady=(2, 4))
+
+        # Preview Container
+        ctk.CTkLabel(left_col, text="🖼️ 選中任務截圖預覽：", font=FONT_SMALL, anchor="w").pack(
+            fill="x", padx=8, pady=(4, 1)
+        )
+        self._ocr_exec_preview_box = ctk.CTkFrame(left_col, fg_color="black", height=160)
+        self._ocr_exec_preview_box.pack(fill="x", padx=8, pady=(0, 4))
+        self._ocr_exec_preview_box.pack_propagate(False)
+
+        self._ocr_exec_preview_canvas = tk.Canvas(
+            self._ocr_exec_preview_box, bg="#141414", highlightthickness=0
+        )
+        self._ocr_exec_preview_canvas.pack(fill="both", expand=True)
+
+        self._ocr_exec_preview_info_label = ctk.CTkLabel(
+            left_col, text="請從上方選擇一組任務檢視預覽", font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w"
+        )
+        self._ocr_exec_preview_info_label.pack(fill="x", padx=8, pady=(0, 6))
+
+        # === RIGHT COLUMN: Dropdowns, Execution, Editable Textbox & SRT Export ===
+        right_scroll = ctk.CTkScrollableFrame(right_col)
+        right_scroll.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+
+        # 1. Dropdown Settings Card
+        cfg_card = ctk.CTkFrame(right_scroll, fg_color=("gray85", "gray18"))
+        cfg_card.pack(fill="x", padx=6, pady=(4, 6))
+
+        # Dropdowns row 1: Provider & Model
+        drop_row1 = ctk.CTkFrame(cfg_card, fg_color="transparent")
+        drop_row1.pack(fill="x", padx=8, pady=(6, 3))
+
+        ctk.CTkLabel(drop_row1, text="API 供應商：", font=FONT_SMALL).pack(side="left")
+        all_provs = [p.get("name", "") for p in config.get_providers()] or ["OpenAI"]
+        saved_prov = self._settings.get("selected_ocr_provider")
+        if not saved_prov:
+            saved_prov = config.get_default_provider_name() or all_provs[0]
+        default_prov = saved_prov if saved_prov in all_provs else all_provs[0]
+        self._ocr_exec_prov_var = ctk.StringVar(value=default_prov)
+        self._ocr_exec_prov_menu = ctk.CTkOptionMenu(
+            drop_row1, values=all_provs, variable=self._ocr_exec_prov_var, font=FONT_SMALL,
+            width=140, height=26, command=self._on_ocr_exec_prov_change
+        )
+        self._ocr_exec_prov_menu.pack(side="left", padx=(2, 10))
+
+        ctk.CTkLabel(drop_row1, text="模型：", font=FONT_SMALL).pack(side="left")
+        self._ocr_exec_model_var = ctk.StringVar(value="")
+        self._ocr_exec_model_menu = ctk.CTkOptionMenu(
+            drop_row1, values=["default"], variable=self._ocr_exec_model_var, font=FONT_SMALL,
+            width=160, height=26, command=self._on_ocr_exec_model_change
+        )
+        self._ocr_exec_model_menu.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        # Dropdowns row 2: Prompt Profile
+        drop_row2 = ctk.CTkFrame(cfg_card, fg_color="transparent")
+        drop_row2.pack(fill="x", padx=8, pady=(3, 6))
+
+        ctk.CTkLabel(drop_row2, text="Prompt 方案：", font=FONT_SMALL).pack(side="left")
+        profiles = config.get_prompt_profiles(self._settings)
+        profile_names = [p.get("name", "") for p in profiles] or ["標準通用繁中字幕"]
+        saved_prompt_id = self._settings.get("selected_ocr_prompt_id")
+        saved_p = config.get_prompt_profile_by_id(saved_prompt_id, self._settings) if saved_prompt_id else None
+        default_prompt_name = saved_p.get("name") if saved_p else profile_names[0]
+        self._ocr_exec_prompt_var = ctk.StringVar(value=default_prompt_name)
+        self._ocr_exec_prompt_menu = ctk.CTkOptionMenu(
+            drop_row2, values=profile_names, variable=self._ocr_exec_prompt_var, font=FONT_SMALL,
+            height=26, command=self._on_ocr_exec_prompt_change
+        )
+        self._ocr_exec_prompt_menu.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        # Initialize models for the selected provider
+        self._update_ocr_exec_model_options()
+
+        # 2. Execution Action & Progress
+        run_row = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        run_row.pack(fill="x", padx=6, pady=(2, 4))
 
         self._run_btn = ctk.CTkButton(
-            run_btn_row, text="開始 OCR 翻譯", height=30, font=FONT_BODY,
-            fg_color="#1f6aa5", hover_color="#144870", command=self._start_ocr
+            run_row, text="▶ 開始 OCR 翻譯", height=32, font=FONT_SUBTITLE,
+            fg_color="#1f6aa5", hover_color="#144d75", command=self._start_ocr
         )
-        self._run_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._run_btn.pack(side="left", padx=(0, 8))
 
+        self._progress = ctk.CTkProgressBar(run_row)
+        self._progress.set(0)
+        self._progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        self._ocr_exec_status_label = ctk.CTkLabel(
+            right_scroll, text="準備就緒。點擊「開始 OCR 翻譯」以執行。", font=FONT_SMALL,
+            text_color=("gray40", "#9aa0a6"), anchor="w"
+        )
+        self._ocr_exec_status_label.pack(fill="x", padx=8, pady=(0, 4))
+
+        # 3. Output Result Dialog (方案 B: 結構化純文字段落，可編輯、可複製)
+        out_hdr = ctk.CTkFrame(right_scroll, fg_color="transparent")
+        out_hdr.pack(fill="x", padx=6, pady=(4, 2))
+        ctk.CTkLabel(
+            out_hdr, text="📝 輸出結果對話框（可直接修改文字與複製，時間軸由系統自動對齊）：",
+            font=FONT_BODY, anchor="w"
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            out_hdr, text="🔄 還原原始結果", width=105, height=24, font=FONT_SMALL,
+            command=self._restore_raw_ocr_translations
+        ).pack(side="right", padx=(4, 0))
+
+        ctk.CTkButton(
+            out_hdr, text="📋 複製全部文字", width=105, height=24, font=FONT_SMALL,
+            fg_color="#2e7d32", hover_color="#1b5e20",
+            command=self._copy_ocr_output_text
+        ).pack(side="right")
+
+        self._ocr_output_textbox = ctk.CTkTextbox(right_scroll, height=180, font=FONT_MONO)
+        self._ocr_output_textbox.pack(fill="x", padx=6, pady=(2, 6))
+
+        # Hidden log reference for backward compatibility
+        self._log = ctk.CTkTextbox(right_scroll, height=60, font=FONT_MONO)
+
+        # 4. Save to SRT Configuration Panel
+        save_card = ctk.CTkFrame(right_scroll, fg_color=("gray85", "gray18"))
+        save_card.pack(fill="x", padx=6, pady=(4, 6))
+
+        # Splicing / Insertion Mode Row
+        s_row1 = ctk.CTkFrame(save_card, fg_color="transparent")
+        s_row1.pack(fill="x", padx=8, pady=(6, 3))
+
+        ctk.CTkLabel(s_row1, text="時間軸方式：", font=FONT_SMALL).pack(side="left")
+        self._mode_var = ctk.StringVar(value=self._settings.get("insertion_mode", "insert"))
+        self._mode_seg = ctk.CTkSegmentedButton(
+            s_row1, values=["insert", "append"],
+            command=lambda v: [self._mode_var.set(v), config.patch_setting("insertion_mode", v)],
+            variable=self._mode_var, height=26, font=FONT_SMALL
+        )
+        self._mode_seg.pack(side="left", padx=(2, 12))
+
+        ctk.CTkLabel(s_row1, text="存檔方式：", font=FONT_SMALL).pack(side="left")
+        self._ocr_save_mode_var = ctk.StringVar(value=self._settings.get("srt_save_mode", "save_as"))
+        self._ocr_save_mode_seg = ctk.CTkSegmentedButton(
+            s_row1, values=["save_as", "overwrite"],
+            command=lambda v: [self._ocr_save_mode_var.set(v), config.patch_setting("srt_save_mode", v), self._update_ocr_save_preview()],
+            variable=self._ocr_save_mode_var, height=26, font=FONT_SMALL
+        )
+        self._ocr_save_mode_seg.pack(side="left", padx=(2, 0))
+
+        # Custom Suffix Row
+        s_row2 = ctk.CTkFrame(save_card, fg_color="transparent")
+        s_row2.pack(fill="x", padx=8, pady=(3, 6))
+
+        ctk.CTkLabel(s_row2, text="另存後綴詞：", font=FONT_SMALL).pack(side="left")
+        self._ocr_suffix_var = ctk.StringVar(value=self._settings.get("custom_srt_suffix", "_translated"))
+        self._ocr_suffix_entry = ctk.CTkEntry(
+            s_row2, textvariable=self._ocr_suffix_var, width=120, height=26, font=FONT_SMALL
+        )
+        self._ocr_suffix_entry.pack(side="left", padx=(2, 8))
+        self._ocr_suffix_entry.bind("<KeyRelease>", lambda _e: self._update_ocr_save_preview())
+
+        self._ocr_save_preview_label = ctk.CTkLabel(
+            s_row2, text="", font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w"
+        )
+        self._ocr_save_preview_label.pack(side="left", fill="x", expand=True)
+
+        # Save Button
         self._insert_btn = ctk.CTkButton(
-            run_btn_row, text="儲存為 SRT 檔案", height=30, font=FONT_BODY,
+            save_card, text="💾 儲存為 SRT 檔案", height=32, font=FONT_BODY,
             state="disabled", fg_color="#2e7d32", hover_color="#1b5e20",
             command=self._insert_and_save
         )
-        self._insert_btn.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self._insert_btn.pack(fill="x", padx=8, pady=(4, 8))
 
-        self._progress = ctk.CTkProgressBar(run_card)
-        self._progress.set(0)
-        self._progress.pack(fill="x", padx=8, pady=(4, 4))
+        self._update_ocr_save_preview()
+        self._render_ocr_exec_tasks()
+        self._render_ocr_output_textbox()
 
-        # Log & Preview
-        log_box = ctk.CTkFrame(right_col, fg_color="transparent")
-        log_box.pack(fill="both", expand=True, padx=10, pady=(0, 2))
-        self._log = ctk.CTkTextbox(log_box, height=85, font=FONT_MONO)
-        self._log.pack(fill="both", expand=True)
+    def _on_ocr_exec_prov_change(self, choice: str):
+        config.patch_setting("selected_ocr_provider", choice)
+        self._update_ocr_exec_model_options()
 
-        self._preview_scroll = ctk.CTkScrollableFrame(right_col, height=75)
-        self._preview_scroll.pack(fill="x", padx=10, pady=(0, 4))
+    def _update_ocr_exec_model_options(self):
+        if not hasattr(self, "_ocr_exec_model_menu"):
+            return
+        prov_name = self._ocr_exec_prov_var.get() if hasattr(self, "_ocr_exec_prov_var") else ""
+        target_prov = None
+        for p in config.get_providers():
+            if p.get("name") == prov_name:
+                target_prov = p
+                break
+        models = target_prov.get("models", []) if target_prov else []
+        if not models and target_prov and target_prov.get("selected_model"):
+            models = [target_prov.get("selected_model")]
+        if not models:
+            models = ["default"]
+        self._ocr_exec_model_menu.configure(values=models)
+        saved_m = self._settings.get("selected_ocr_model") or (target_prov.get("selected_model") if target_prov else "")
+        if saved_m in models:
+            self._ocr_exec_model_var.set(saved_m)
+        else:
+            self._ocr_exec_model_var.set(models[0])
 
-    def _build_ocr_exec_tab(self, parent):
-        """v2.01: Consolidated Subtitle OCR Execution Window."""
-        self._build_video_tab(parent)
+    def _on_ocr_exec_model_change(self, choice: str):
+        config.patch_setting("selected_ocr_model", choice)
+
+    def _on_ocr_exec_prompt_change(self, choice: str):
+        prof = config.get_prompt_profile_by_name(choice, self._settings)
+        if prof and prof.get("id"):
+            config.patch_setting("selected_ocr_prompt_id", prof["id"])
+
+    def _select_ocr_exec_task(self, task: SubtitleTask):
+        self._selected_ocr_exec_task = task
+        self._render_ocr_exec_preview()
+        if hasattr(self, "_render_ocr_exec_tasks"):
+            self._render_ocr_exec_tasks()
+
+    def _render_ocr_exec_preview(self):
+        if not hasattr(self, "_ocr_exec_preview_canvas"):
+            return
+        task = getattr(self, "_selected_ocr_exec_task", None)
+        cw = max(10, self._ocr_exec_preview_canvas.winfo_width())
+        ch = max(10, self._ocr_exec_preview_canvas.winfo_height())
+        self._ocr_exec_preview_canvas.delete("all")
+        if not task or not task.crop_img:
+            self._ocr_exec_preview_canvas.create_text(
+                cw // 2, ch // 2, text="尚無選中任務截圖", fill="#666666", font=FONT_SMALL
+            )
+            if hasattr(self, "_ocr_exec_preview_info_label"):
+                self._ocr_exec_preview_info_label.configure(text="請從上方選擇一組任務檢視預覽")
+            return
+
+        img = task.crop_img.copy()
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih) if iw > 0 and ih > 0 else 1.0
+        nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        resized = img.resize((nw, nh), Image.Resampling.BILINEAR)
+        tk_img = ImageTk.PhotoImage(resized)
+        self._ocr_exec_preview_canvas.create_image(cw // 2, ch // 2, anchor="center", image=tk_img)
+        self._ocr_exec_preview_canvas.image = tk_img
+
+        scope = f"框選區域 ({task.crop_box[0]},{task.crop_box[1]}~{task.crop_box[2]},{task.crop_box[3]})" if task.crop_box else "全畫面"
+        info = f"任務 #{task.id} ｜ 時間軸: {task.start_ts} → {task.end_ts} ({task.duration:.2f}s) ｜ 範圍: {scope}"
+        if hasattr(self, "_ocr_exec_preview_info_label"):
+            self._ocr_exec_preview_info_label.configure(text=info)
+
+    def _render_ocr_exec_tasks(self):
+        if not hasattr(self, "_ocr_exec_task_scroll"):
+            return
+        for w in self._ocr_exec_task_scroll.winfo_children():
+            w.destroy()
+
+        total = len(self._tasks)
+        if hasattr(self, "_ocr_exec_task_count_label"):
+            self._ocr_exec_task_count_label.configure(text=f"待翻譯任務 (共 {total} 組)")
+
+        if not self._tasks:
+            empty_lbl = ctk.CTkLabel(
+                self._ocr_exec_task_scroll,
+                text="尚未建立翻譯任務\n請先前往「影片截圖視窗」新增字幕任務",
+                font=FONT_SMALL, text_color=("gray40", "#9aa0a6")
+            )
+            empty_lbl.pack(pady=30)
+            self._selected_ocr_exec_task = None
+            self._render_ocr_exec_preview()
+            return
+
+        selected = getattr(self, "_selected_ocr_exec_task", None)
+        if selected not in self._tasks:
+            self._selected_ocr_exec_task = self._tasks[0]
+
+        for i, task in enumerate(self._tasks, 1):
+            is_sel = (task == getattr(self, "_selected_ocr_exec_task", None))
+            bg_color = ("#3a7ebf", "#1f4a75") if is_sel else ("gray88", "gray18")
+            card = ctk.CTkFrame(self._ocr_exec_task_scroll, fg_color=bg_color)
+            card.pack(fill="x", pady=2, padx=2)
+
+            # Left thumbnail
+            c = tk.Canvas(card, width=64, height=36, bg="#222", highlightthickness=0)
+            c.pack(side="left", padx=4, pady=3)
+            th = task.crop_img.copy()
+            th.thumbnail((64, 36), Image.Resampling.BILINEAR)
+            th_tk = ImageTk.PhotoImage(th)
+            c.create_image(32, 18, anchor="center", image=th_tk)
+            c.image = th_tk
+            c.bind("<Button-1>", lambda _e, t=task: self._select_ocr_exec_task(t))
+
+            # Info Frame
+            info_frame = ctk.CTkFrame(card, fg_color="transparent")
+            info_frame.pack(side="left", fill="both", expand=True, padx=4, pady=2)
+            info_frame.bind("<Button-1>", lambda _e, t=task: self._select_ocr_exec_task(t))
+
+            time_row = ctk.CTkFrame(info_frame, fg_color="transparent")
+            time_row.pack(fill="x", pady=(0, 2))
+
+            lbl_num = ctk.CTkLabel(time_row, text=f"#{i}", font=FONT_MONO, width=28, anchor="w")
+            lbl_num.pack(side="left")
+            lbl_num.bind("<Button-1>", lambda _e, t=task: self._select_ocr_exec_task(t))
+
+            start_e = ctk.CTkEntry(time_row, width=88, height=22, font=FONT_SMALL)
+            start_e.insert(0, task.start_ts)
+            start_e.pack(side="left", padx=(0, 2))
+
+            ctk.CTkLabel(time_row, text="→", font=FONT_SMALL).pack(side="left", padx=2)
+
+            end_e = ctk.CTkEntry(time_row, width=88, height=22, font=FONT_SMALL)
+            end_e.insert(0, task.end_ts)
+            end_e.pack(side="left", padx=(2, 4))
+
+            dur_lbl = ctk.CTkLabel(time_row, text=f"({task.duration:.2f}s)", font=FONT_SMALL, text_color=("gray40", "#9aa0a6"))
+            dur_lbl.pack(side="left")
+
+            def make_ocr_time_handler(t=task, se=start_e, ee=end_e, dl=dur_lbl):
+                def _handler(_event=None):
+                    self._on_task_time_edit(t, se.get(), ee.get(), se, ee, dl)
+                return _handler
+
+            h = make_ocr_time_handler()
+            start_e.bind("<FocusOut>", h)
+            start_e.bind("<Return>", h)
+            end_e.bind("<FocusOut>", h)
+            end_e.bind("<Return>", h)
+
+            scope_text = "框選區域" if task.crop_box else "全畫面"
+            status_color = {"待處理": "#9aa0a6", "翻譯中": "#2196f3", "已完成": "#4caf50", "失敗": "#f44336"}.get(task.status, "#9aa0a6")
+            sub_info = f"範圍: {scope_text} ｜ 狀態: {task.status}"
+            lbl_sub = ctk.CTkLabel(info_frame, text=sub_info, font=FONT_SMALL, text_color=status_color, anchor="w")
+            lbl_sub.pack(fill="x")
+            lbl_sub.bind("<Button-1>", lambda _e, t=task: self._select_ocr_exec_task(t))
+
+            # Right action buttons
+            b_box = ctk.CTkFrame(card, fg_color="transparent")
+            b_box.pack(side="right", padx=4)
+
+            ctk.CTkButton(
+                b_box, text="選中", width=42, height=24, font=FONT_SMALL,
+                command=lambda t=task: self._select_ocr_exec_task(t)
+            ).pack(side="left", padx=(0, 3))
+
+            ctk.CTkButton(
+                b_box, text="🗑️", width=30, height=24, font=FONT_SMALL,
+                fg_color="#b23b3b", hover_color="#8a2e2e",
+                command=lambda tid=task.id: self._delete_task(tid)
+            ).pack(side="left")
+
+        self._render_ocr_exec_preview()
+
+    def _toggle_ocr_history_mode(self):
+        self._ocr_history_mode = not self._ocr_history_mode
+        self._selected_ocr_drop_paths.clear()
+        if self._ocr_history_mode:
+            self._ocr_history_toggle_btn.configure(text="📋 返回任務列表")
+            self._ocr_action_btn.configure(text="🧹 清空暫存")
+            self._ocr_history_toolbar.pack(fill="x")
+            self._render_ocr_drop_list()
+        else:
+            self._ocr_history_toggle_btn.configure(text="📦 讀取歷史截圖")
+            self._ocr_action_btn.configure(text="清空任務")
+            self._ocr_history_toolbar.pack_forget()
+            self._render_ocr_exec_tasks()
+
+    def _on_ocr_left_action_btn(self):
+        if self._ocr_history_mode:
+            self._clear_ocr_history()
+        else:
+            self._clear_tasks()
+
+    def _select_all_ocr_drop(self):
+        ocr_drop_dir = config.resolve_ocr_drop_dir(self._settings)
+        items = capture_manager.list_images_in_dir(ocr_drop_dir)
+        for it in items:
+            self._selected_ocr_drop_paths.add(str(it["path"]))
+        for cb in self._ocr_drop_checkboxes.values():
+            cb.set(True)
+        if hasattr(self, "_ocr_exec_task_count_label"):
+            self._ocr_exec_task_count_label.configure(
+                text=f"歷史暫存 (.drop) (共 {len(items)} 張 ｜ 已勾選 {len(self._selected_ocr_drop_paths)} 張)"
+            )
+
+    def _deselect_all_ocr_drop(self):
+        self._selected_ocr_drop_paths.clear()
+        for cb in self._ocr_drop_checkboxes.values():
+            cb.set(False)
+        ocr_drop_dir = config.resolve_ocr_drop_dir(self._settings)
+        items = capture_manager.list_images_in_dir(ocr_drop_dir)
+        if hasattr(self, "_ocr_exec_task_count_label"):
+            self._ocr_exec_task_count_label.configure(
+                text=f"歷史暫存 (.drop) (共 {len(items)} 張 ｜ 已勾選 0 張)"
+            )
+
+    def _render_ocr_drop_list(self):
+        if not hasattr(self, "_ocr_exec_task_scroll"):
+            return
+        for w in self._ocr_exec_task_scroll.winfo_children():
+            w.destroy()
+        self._ocr_drop_checkboxes.clear()
+
+        ocr_drop_dir = config.resolve_ocr_drop_dir(self._settings)
+        items = capture_manager.list_images_in_dir(ocr_drop_dir)
+        total = len(items)
+        sel_count = len(self._selected_ocr_drop_paths)
+
+        if hasattr(self, "_ocr_exec_task_count_label"):
+            self._ocr_exec_task_count_label.configure(
+                text=f"歷史暫存 (.drop) (共 {total} 張 ｜ 已勾選 {sel_count} 張)"
+            )
+
+        if not items:
+            lbl = ctk.CTkLabel(
+                self._ocr_exec_task_scroll,
+                text="歷史暫存資料夾 (.drop) 目前沒有截圖檔案。\n刪除或清空的字幕任務將自動保存在此。",
+                font=FONT_SMALL, text_color=("gray40", "#9aa0a6")
+            )
+            lbl.pack(pady=30)
+            return
+
+        for item in items:
+            p_str = str(item["path"])
+            card = ctk.CTkFrame(self._ocr_exec_task_scroll, fg_color=("gray88", "gray18"))
+            card.pack(fill="x", pady=2, padx=2)
+
+            # Checkbox
+            cb = ctk.CTkCheckBox(
+                card, text="", width=24, checkbox_width=20, checkbox_height=20,
+                command=lambda p=p_str: self._on_ocr_drop_cb_toggle(p)
+            )
+            cb.pack(side="left", padx=(6, 2))
+            if p_str in self._selected_ocr_drop_paths:
+                cb.set(True)
+            self._ocr_drop_checkboxes[p_str] = cb
+
+            # Thumbnail
+            c = tk.Canvas(card, width=64, height=36, bg="#222", highlightthickness=0)
+            c.pack(side="left", padx=4, pady=3)
+            try:
+                im = Image.open(item["path"]).convert("RGB")
+                im.thumbnail((64, 36), Image.Resampling.BILINEAR)
+                th_tk = ImageTk.PhotoImage(im)
+                c.create_image(32, 18, anchor="center", image=th_tk)
+                c.image = th_tk
+            except Exception:
+                pass
+
+            # Info
+            info_f = ctk.CTkFrame(card, fg_color="transparent")
+            info_f.pack(side="left", fill="both", expand=True, padx=4, pady=2)
+
+            ts_parsed = capture_manager.parse_ocr_filename(item["name"])
+            if ts_parsed:
+                st, et = ts_parsed
+                ts_text = f"時間軸: {srt_utils.sec_to_ts(st)} → {srt_utils.sec_to_ts(et)}"
+            else:
+                ts_text = item["name"]
+
+            ctk.CTkLabel(info_f, text=ts_text, font=FONT_MONO, anchor="w").pack(fill="x")
+            date_info = f"大小: {max(1, item['size']//1024)} KB ｜ 日期: {item['date_str']}"
+            ctk.CTkLabel(info_f, text=date_info, font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w").pack(fill="x")
+
+            # Restore single button
+            btn_f = ctk.CTkFrame(card, fg_color="transparent")
+            btn_f.pack(side="right", padx=6)
+            ctk.CTkButton(
+                btn_f, text="復原", width=50, height=24, font=FONT_SMALL,
+                fg_color="#2e7d32", hover_color="#1b5e20",
+                command=lambda p=p_str: self._restore_single_ocr_drop(p)
+            ).pack(side="left")
+
+    def _on_ocr_drop_cb_toggle(self, p_str: str):
+        if p_str in self._selected_ocr_drop_paths:
+            self._selected_ocr_drop_paths.remove(p_str)
+        else:
+            self._selected_ocr_drop_paths.add(p_str)
+        ocr_drop_dir = config.resolve_ocr_drop_dir(self._settings)
+        items = capture_manager.list_images_in_dir(ocr_drop_dir)
+        if hasattr(self, "_ocr_exec_task_count_label"):
+            self._ocr_exec_task_count_label.configure(
+                text=f"歷史暫存 (.drop) (共 {len(items)} 張 ｜ 已勾選 {len(self._selected_ocr_drop_paths)} 張)"
+            )
+
+    def _restore_single_ocr_drop(self, p_str: str):
+        self._restore_ocr_drop_items([p_str])
+
+    def _restore_selected_ocr_drop_items(self):
+        if not self._selected_ocr_drop_paths:
+            messagebox.showinfo("提示", "請先勾選欲復原至待翻譯列表的截圖。")
+            return
+        self._restore_ocr_drop_items(list(self._selected_ocr_drop_paths))
+
+    def _restore_ocr_drop_items(self, paths: list[str]):
+        restored_count = 0
+        for p_str in paths:
+            restored_path = capture_manager.safe_restore_from_drop(p_str, self._current_ocr_dir)
+            if restored_path and restored_path.is_file():
+                ts_parsed = capture_manager.parse_ocr_filename(restored_path.name)
+                if ts_parsed:
+                    st, et = ts_parsed
+                else:
+                    fn_ts = srt_utils.parse_filename_timestamp(restored_path)
+                    st = fn_ts if fn_ts is not None else 0.0
+                    et = st + 2.0
+
+                try:
+                    img = Image.open(restored_path).convert("RGB")
+                    task = SubtitleTask(
+                        id=self._next_task_id,
+                        start_sec=st,
+                        end_sec=et,
+                        start_frame_img=img.copy(),
+                        crop_box=None,
+                        crop_img=img.copy(),
+                        status="待處理",
+                        image_path=str(restored_path),
+                    )
+                    self._next_task_id += 1
+                    self._tasks.append(task)
+                    restored_count += 1
+                except Exception as exc:
+                    print(f"Error loading restored image {restored_path}: {exc}")
+
+        self._selected_ocr_drop_paths.clear()
+        self._ocr_history_mode = False
+        self._ocr_history_toggle_btn.configure(text="📦 讀取歷史截圖")
+        self._ocr_action_btn.configure(text="清空任務", command=self._clear_tasks)
+        if hasattr(self, "_ocr_history_toolbar"):
+            self._ocr_history_toolbar.pack_forget()
+        self._render_tasks_list()
+        messagebox.showinfo("復原完成", f"已成功復原 {restored_count} 組截圖至待翻譯任務列表！")
+
+    def _clear_ocr_history(self):
+        ocr_drop_dir = config.resolve_ocr_drop_dir(self._settings)
+        drop_images = capture_manager.list_images_in_dir(ocr_drop_dir)
+        if not drop_images:
+            messagebox.showinfo("提示", "目前沒有歷史暫存檔案需要清空。")
+            return
+        if not messagebox.askyesno("清空確認", f"確定要永久清空所有 {len(drop_images)} 個字幕歷史暫存檔案嗎？此動作無法復原。"):
+            return
+        count = capture_manager.clear_drop_dir(ocr_drop_dir)
+        self._selected_ocr_drop_paths.clear()
+        self._render_ocr_drop_list()
+        messagebox.showinfo("清空完成", f"已永久刪除 {count} 個歷史暫存檔案。")
+
+    def _render_ocr_output_textbox(self):
+        if not hasattr(self, "_ocr_output_textbox"):
+            return
+        self._ocr_output_textbox.delete("1.0", "end")
+        if not self._tasks:
+            return
+        blocks = []
+        for i, task in enumerate(self._tasks, 1):
+            blocks.append(f"[#{i}] {task.start_ts} --> {task.end_ts}")
+            blocks.append(task.translation if task.translation else "（尚未翻譯）")
+            blocks.append("")
+        self._ocr_output_textbox.insert("1.0", "\n".join(blocks).strip() + "\n")
+
+    def _sync_textbox_to_tasks(self):
+        if not hasattr(self, "_ocr_output_textbox"):
+            return
+        raw_text = self._ocr_output_textbox.get("1.0", "end").strip()
+        if not raw_text:
+            return
+        blocks = re.split(r'\[(?:#|任務\s*)(\d+)\][^\n]*\n', raw_text)
+        if len(blocks) >= 3:
+            for idx in range(1, len(blocks), 2):
+                task_idx_str = blocks[idx]
+                task_text = blocks[idx + 1].strip()
+                if task_text == "（尚未翻譯）":
+                    task_text = ""
+                try:
+                    num = int(task_idx_str)
+                    if 1 <= num <= len(self._tasks):
+                        self._tasks[num - 1].translation = task_text
+                except (ValueError, IndexError):
+                    pass
+        else:
+            lines = [l.strip() for l in raw_text.splitlines() if l.strip() and not l.strip().startswith("[#")]
+            for i, line_text in enumerate(lines):
+                if i < len(self._tasks):
+                    if line_text != "（尚未翻譯）":
+                        self._tasks[i].translation = line_text
+
+    def _copy_ocr_output_text(self):
+        if not hasattr(self, "_ocr_output_textbox"):
+            return
+        self._sync_textbox_to_tasks()
+        raw_text = self._ocr_output_textbox.get("1.0", "end").strip()
+        if not raw_text:
+            messagebox.showinfo("無內容", "輸出結果對話框目前無內容可複製。")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(raw_text)
+        if hasattr(self, "_ocr_exec_status_label"):
+            self._ocr_exec_status_label.configure(text="📋 已成功複製全部文字至剪貼簿！")
+            self.after(3000, self._update_ocr_save_preview)
+
+    def _restore_raw_ocr_translations(self):
+        restored = 0
+        for task in self._tasks:
+            if hasattr(task, "raw_translation") and task.raw_translation:
+                task.translation = task.raw_translation
+                restored += 1
+        self._render_ocr_output_textbox()
+        if hasattr(self, "_render_ocr_exec_tasks"):
+            self._render_ocr_exec_tasks()
+        if hasattr(self, "_ocr_exec_status_label"):
+            self._ocr_exec_status_label.configure(text=f"🔄 已還原 {restored} 組 AI 原始翻譯結果。")
+            self.after(3000, self._update_ocr_save_preview)
+
+    def _update_ocr_save_preview(self):
+        if not hasattr(self, "_ocr_save_preview_label"):
+            return
+        save_mode = getattr(self, "_ocr_save_mode_var", None)
+        mode_val = save_mode.get() if save_mode else self._settings.get("srt_save_mode", "save_as")
+        if mode_val == "overwrite":
+            if self._srt_path and Path(self._srt_path).exists():
+                self._ocr_save_preview_label.configure(
+                    text=f"預計：覆蓋現有檔案【{Path(self._srt_path).name}】",
+                    text_color=("#1f6aa5", "#4ca6e8")
+                )
+            else:
+                self._ocr_save_preview_label.configure(
+                    text="（無載入現有 SRT，執行儲存時將自動轉為另存新檔）",
+                    text_color=("gray50", "#e0a92a")
+                )
+        else:
+            suffix = getattr(self, "_ocr_suffix_var", None)
+            s_val = suffix.get().strip() if suffix else "_translated"
+            if s_val and not s_val.startswith(("_", "-", ".")):
+                s_val = "_" + s_val
+            if s_val.endswith(".srt"):
+                s_val = s_val[:-4]
+            if self._srt_path:
+                stem = Path(self._srt_path).stem
+            elif self._video_path:
+                stem = Path(self._video_path).stem
+            else:
+                stem = "subtitles"
+            self._ocr_save_preview_label.configure(
+                text=f"預計檔名：{stem}{s_val}.srt",
+                text_color=("gray40", "#9aa0a6")
+            )
+
+    def _sync_ocr_exec_ui(self):
+        """Refresh OCR execution page dropdowns, previews, and task lists."""
+        if hasattr(self, "_ocr_exec_prov_menu"):
+            all_provs = [p.get("name", "") for p in config.get_providers()] or ["OpenAI"]
+            self._ocr_exec_prov_menu.configure(values=all_provs)
+            curr = self._ocr_exec_prov_var.get()
+            if curr not in all_provs:
+                self._ocr_exec_prov_var.set(all_provs[0])
+            self._update_ocr_exec_model_options()
+
+        if hasattr(self, "_ocr_exec_prompt_menu"):
+            profiles = config.get_prompt_profiles(self._settings)
+            profile_names = [p.get("name", "") for p in profiles] or ["標準通用繁中字幕"]
+            self._ocr_exec_prompt_menu.configure(values=profile_names)
+            curr_p = self._ocr_exec_prompt_var.get()
+            if curr_p not in profile_names:
+                self._ocr_exec_prompt_var.set(profile_names[0])
+
+        if hasattr(self, "_render_ocr_exec_tasks"):
+            self._render_ocr_exec_tasks()
+        if hasattr(self, "_render_ocr_output_textbox"):
+            self._render_ocr_output_textbox()
+        if hasattr(self, "_update_ocr_save_preview"):
+            self._update_ocr_save_preview()
 
     # ------------------------------------------------------------------ #
     #  Video Loading & Playback Engine Methods
@@ -2605,20 +3432,16 @@ class App(ctk.CTk):
         if hasattr(self, "_player_video_spec_label"):
             self._player_video_spec_label.configure(text=f"已截圖至素材庫：{saved_path.name}")
             self.after(3000, lambda: self._sync_player_ui() if hasattr(self, "_sync_player_ui") else None)
+        if hasattr(self, "_video_spec_label"):
+            self._video_spec_label.configure(text=f"🎨 已存入素材庫：{saved_path.name}")
+            self.after(3000, lambda: self._sync_video_tab_ui() if hasattr(self, "_sync_video_tab_ui") else None)
 
         if hasattr(self, "_refresh_p2p_gallery"):
             self._refresh_p2p_gallery()
+        if hasattr(self, "_refresh_capture_gallery"):
+            self._refresh_capture_gallery()
         if hasattr(self, "_set_active_p2p_image"):
             self._set_active_p2p_image(str(saved_path))
-
-        if messagebox.askyesno(
-            "截圖成功",
-            f"已成功截取圖片至 \\captured 素材庫！\n檔名：{saved_path.name}\n\n是否立即前往【圖生圖任務 -> 編輯及預覽視窗】？"
-        ):
-            self.tabs.set("  圖生圖任務  ")
-            if hasattr(self, "p2p_tabs"):
-                self.p2p_tabs.set("  編輯及預覽視窗  ")
-            self._ensure_p2p_subtab_built("  編輯及預覽視窗  ")
 
     def _add_task(self):
         if not self._video_engine:
@@ -2638,19 +3461,20 @@ class App(ctk.CTk):
 
         crop_img = self._get_crop_image(source_override=self._start_frame_img)
 
-        # v2.01: Save captured crop image into \captured directory
+        # v2.06: Save captured crop image into \ocr2srt directory
         saved_img_path = None
         try:
             saved_p = capture_manager.save_captured_image(
                 img=crop_img,
                 video_path=self._video_path,
                 sec=self._start_sec,
+                end_sec=self._end_sec,
                 is_crop=bool(self._crop_box),
                 crop_box=self._crop_box,
+                category="ocr",
+                target_dir=self._current_ocr_dir,
             )
             saved_img_path = str(saved_p)
-            if hasattr(self, "_refresh_p2p_gallery"):
-                self._refresh_p2p_gallery()
         except Exception:
             pass
 
@@ -2671,13 +3495,29 @@ class App(ctk.CTk):
     def _clear_tasks(self):
         if not self._tasks:
             return
-        if messagebox.askyesno("清空任務", "確定要清空所有已建立的任務嗎？"):
+        if messagebox.askyesno("清空任務", "確定要清空所有已建立的任務嗎？截圖將移至歷史暫存備份。"):
+            ocr_drop_dir = config.resolve_ocr_drop_dir(self._settings)
+            for t in self._tasks:
+                if t.image_path and os.path.isfile(t.image_path):
+                    capture_manager.safe_move_to_drop(t.image_path, ocr_drop_dir)
             self._tasks.clear()
             self._render_tasks_list()
+            if hasattr(self, "_render_ocr_exec_tasks"):
+                self._render_ocr_exec_tasks()
+            if hasattr(self, "_render_ocr_output_textbox"):
+                self._render_ocr_output_textbox()
 
     def _delete_task(self, task_id: int):
+        target_task = next((t for t in self._tasks if t.id == task_id), None)
+        if target_task and target_task.image_path and os.path.isfile(target_task.image_path):
+            ocr_drop_dir = config.resolve_ocr_drop_dir(self._settings)
+            capture_manager.safe_move_to_drop(target_task.image_path, ocr_drop_dir)
         self._tasks = [t for t in self._tasks if t.id != task_id]
         self._render_tasks_list()
+        if hasattr(self, "_render_ocr_exec_tasks"):
+            self._render_ocr_exec_tasks()
+        if hasattr(self, "_render_ocr_output_textbox"):
+            self._render_ocr_output_textbox()
 
     def _preview_task(self, task: SubtitleTask):
         self._stop_play()
@@ -2723,8 +3563,33 @@ class App(ctk.CTk):
             info_frame = ctk.CTkFrame(card, fg_color="transparent")
             info_frame.pack(side="left", fill="both", expand=True, padx=4, pady=2)
 
-            t_range = f"#{i}  {task.start_ts} → {task.end_ts} ({task.duration:.2f}s)"
-            ctk.CTkLabel(info_frame, text=t_range, font=FONT_MONO, anchor="w").pack(fill="x")
+            time_row = ctk.CTkFrame(info_frame, fg_color="transparent")
+            time_row.pack(fill="x", pady=(0, 2))
+
+            ctk.CTkLabel(time_row, text=f"#{i}", font=FONT_MONO, width=28, anchor="w").pack(side="left")
+            start_e = ctk.CTkEntry(time_row, width=88, height=22, font=FONT_SMALL)
+            start_e.insert(0, task.start_ts)
+            start_e.pack(side="left", padx=(0, 2))
+
+            ctk.CTkLabel(time_row, text="→", font=FONT_SMALL).pack(side="left", padx=2)
+
+            end_e = ctk.CTkEntry(time_row, width=88, height=22, font=FONT_SMALL)
+            end_e.insert(0, task.end_ts)
+            end_e.pack(side="left", padx=(2, 4))
+
+            dur_lbl = ctk.CTkLabel(time_row, text=f"({task.duration:.2f}s)", font=FONT_SMALL, text_color=("gray40", "#9aa0a6"))
+            dur_lbl.pack(side="left")
+
+            def make_task_time_handler(t=task, se=start_e, ee=end_e, dl=dur_lbl):
+                def _handler(_event=None):
+                    self._on_task_time_edit(t, se.get(), ee.get(), se, ee, dl)
+                return _handler
+
+            h = make_task_time_handler()
+            start_e.bind("<FocusOut>", h)
+            start_e.bind("<Return>", h)
+            end_e.bind("<FocusOut>", h)
+            end_e.bind("<Return>", h)
 
             scope_text = f"框選區域" if task.crop_box else "全畫面"
             status_color = {"待處理": "#9aa0a6", "翻譯中": "#2196f3", "已完成": "#4caf50", "失敗": "#f44336"}.get(task.status, "#9aa0a6")
@@ -2741,6 +3606,28 @@ class App(ctk.CTk):
             ctk.CTkButton(btn_frame, text="刪除", width=50, height=26, font=FONT_SMALL,
                           fg_color="#b23b3b", hover_color="#8a2e2e",
                           command=lambda tid=task.id: self._delete_task(tid)).pack(side="left")
+
+    def _on_task_time_edit(self, task: SubtitleTask, start_str: str, end_str: str, start_e, end_e, dur_lbl):
+        st = srt_utils.flexible_ts_to_sec(start_str)
+        et = srt_utils.flexible_ts_to_sec(end_str)
+        if st is not None and et is not None and et > st:
+            task.start_sec = st
+            task.end_sec = et
+            dur_lbl.configure(text=f"({task.duration:.2f}s)")
+            if hasattr(self, "_render_ocr_output_textbox"):
+                self._render_ocr_output_textbox()
+            if getattr(self, "_selected_ocr_exec_task", None) == task and hasattr(self, "_render_ocr_exec_preview"):
+                self._render_ocr_exec_preview()
+        else:
+            start_e.delete(0, "end")
+            start_e.insert(0, task.start_ts)
+            end_e.delete(0, "end")
+            end_e.insert(0, task.end_ts)
+
+        if hasattr(self, "_render_ocr_exec_tasks"):
+            self._render_ocr_exec_tasks()
+        if hasattr(self, "_render_ocr_output_textbox"):
+            self._render_ocr_output_textbox()
 
     # ------------------------------------------------------------------ #
     #  SRT Selection Helpers
@@ -2884,14 +3771,14 @@ class App(ctk.CTk):
 
         self._render_keybindings_table()
 
-        # Section 3: Default Storage and Material Folders (v2.05)
+        # Section 3: Default Storage and Material Folders (v2.05 & v2.06)
         sec3_frame = ctk.CTkFrame(scroll)
         sec3_frame.pack(fill="x", pady=(0, 14))
 
         ctk.CTkLabel(sec3_frame, text="預設素材庫與生成資料夾設定", font=FONT_SUBTITLE, anchor="w").pack(
             fill="x", padx=12, pady=(10, 4)
         )
-        ctk.CTkLabel(sec3_frame, text="自訂截圖素材庫與 AI 生成圖片的預設儲存路徑，留空則使用程式目錄下的 \\captured 與 \\generated。",
+        ctk.CTkLabel(sec3_frame, text="自訂字幕素材庫 (OCR)、截圖素材庫與 AI 生成圖片的預設儲存路徑，留空則使用程式目錄下的 \\ocr2srt, \\captured 與 \\generated。",
                      font=FONT_SMALL, text_color=("gray40", "#9aa0a6"), anchor="w").pack(
             fill="x", padx=12, pady=(0, 8)
         )
@@ -2899,19 +3786,26 @@ class App(ctk.CTk):
         f_grid = ctk.CTkFrame(sec3_frame, fg_color="transparent")
         f_grid.pack(fill="x", padx=12, pady=(0, 8))
 
-        ctk.CTkLabel(f_grid, text="預設截圖素材庫：", font=FONT_BODY, width=130, anchor="w").grid(row=0, column=0, padx=(0, 4), pady=4, sticky="w")
+        ctk.CTkLabel(f_grid, text="預設字幕素材庫 (OCR)：", font=FONT_BODY, width=170, anchor="w").grid(row=0, column=0, padx=(0, 4), pady=4, sticky="w")
+        self._s_ocr_dir_var = ctk.StringVar(value=self._settings.get("storage_folders", {}).get("default_ocr_dir", ""))
+        self._s_ocr_dir_entry = ctk.CTkEntry(f_grid, textvariable=self._s_ocr_dir_var, placeholder_text="預設: \\ocr2srt", font=FONT_SMALL)
+        self._s_ocr_dir_entry.grid(row=0, column=1, padx=(0, 6), pady=4, sticky="ew")
+        ctk.CTkButton(f_grid, text="📂 瀏覽...", width=75, height=26, font=FONT_SMALL,
+                      command=self._browse_default_ocr_dir).grid(row=0, column=2, padx=(0, 4), pady=4)
+
+        ctk.CTkLabel(f_grid, text="預設截圖素材庫 (P2P)：", font=FONT_BODY, width=170, anchor="w").grid(row=1, column=0, padx=(0, 4), pady=4, sticky="w")
         self._s_cap_dir_var = ctk.StringVar(value=self._settings.get("storage_folders", {}).get("default_captured_dir", ""))
         self._s_cap_dir_entry = ctk.CTkEntry(f_grid, textvariable=self._s_cap_dir_var, placeholder_text="預設: \\captured", font=FONT_SMALL)
-        self._s_cap_dir_entry.grid(row=0, column=1, padx=(0, 6), pady=4, sticky="ew")
+        self._s_cap_dir_entry.grid(row=1, column=1, padx=(0, 6), pady=4, sticky="ew")
         ctk.CTkButton(f_grid, text="📂 瀏覽...", width=75, height=26, font=FONT_SMALL,
-                      command=self._browse_default_captured_dir).grid(row=0, column=2, padx=(0, 4), pady=4)
+                      command=self._browse_default_captured_dir).grid(row=1, column=2, padx=(0, 4), pady=4)
 
-        ctk.CTkLabel(f_grid, text="預設 AI 生成庫：", font=FONT_BODY, width=130, anchor="w").grid(row=1, column=0, padx=(0, 4), pady=4, sticky="w")
+        ctk.CTkLabel(f_grid, text="預設 AI 生成庫：", font=FONT_BODY, width=170, anchor="w").grid(row=2, column=0, padx=(0, 4), pady=4, sticky="w")
         self._s_gen_dir_var = ctk.StringVar(value=self._settings.get("storage_folders", {}).get("default_generated_dir", ""))
         self._s_gen_dir_entry = ctk.CTkEntry(f_grid, textvariable=self._s_gen_dir_var, placeholder_text="預設: \\generated", font=FONT_SMALL)
-        self._s_gen_dir_entry.grid(row=1, column=1, padx=(0, 6), pady=4, sticky="ew")
+        self._s_gen_dir_entry.grid(row=2, column=1, padx=(0, 6), pady=4, sticky="ew")
         ctk.CTkButton(f_grid, text="📂 瀏覽...", width=75, height=26, font=FONT_SMALL,
-                      command=self._browse_default_generated_dir).grid(row=1, column=2, padx=(0, 4), pady=4)
+                      command=self._browse_default_generated_dir).grid(row=2, column=2, padx=(0, 4), pady=4)
 
         f_grid.grid_columnconfigure(1, weight=1)
 
@@ -2926,6 +3820,11 @@ class App(ctk.CTk):
                                                   text_color=("#0a7d2c", "#5ec97a"), anchor="w")
         self._storage_status_label.pack(side="left", padx=(12, 0))
 
+    def _browse_default_ocr_dir(self):
+        chosen = filedialog.askdirectory(title="選擇預設字幕素材庫 (OCR) 資料夾")
+        if chosen:
+            self._s_ocr_dir_var.set(chosen)
+
     def _browse_default_captured_dir(self):
         chosen = filedialog.askdirectory(title="選擇預設截圖素材庫資料夾")
         if chosen:
@@ -2937,14 +3836,17 @@ class App(ctk.CTk):
             self._s_gen_dir_var.set(chosen)
 
     def _save_storage_folder_settings(self):
+        ocr_val = self._s_ocr_dir_var.get().strip() if hasattr(self, "_s_ocr_dir_var") else ""
         cap_val = self._s_cap_dir_var.get().strip()
         gen_val = self._s_gen_dir_var.get().strip()
         sf = self._settings.setdefault("storage_folders", {})
+        sf["default_ocr_dir"] = ocr_val
         sf["default_captured_dir"] = cap_val
         sf["default_generated_dir"] = gen_val
         config.save_settings(self._settings)
-        self._current_input_dir = config.resolve_captured_dir(self._settings)
-        self._current_output_dir = config.resolve_generated_dir(self._settings)
+        self._current_ocr_dir = config.resolve_ocr_dir(self._settings)
+        self._current_input_dir = str(config.resolve_captured_dir(self._settings))
+        self._current_output_dir = str(config.resolve_generated_dir(self._settings))
         if hasattr(self, "_populate_p2p_input_dir_menu"):
             self._populate_p2p_input_dir_menu()
         if hasattr(self, "_populate_p2p_output_dir_menu"):
@@ -2957,6 +3859,8 @@ class App(ctk.CTk):
             self._storage_status_label.configure(text="✅ 資料夾設定已儲存並生效")
 
     def _reset_storage_folder_settings(self):
+        if hasattr(self, "_s_ocr_dir_var"):
+            self._s_ocr_dir_var.set("")
         self._s_cap_dir_var.set("")
         self._s_gen_dir_var.set("")
         self._save_storage_folder_settings()
@@ -3966,26 +4870,55 @@ class App(ctk.CTk):
         if self._busy:
             return
         if not self._tasks:
-            messagebox.showwarning("無任務", "請先在「影片與字幕任務」中設置至少一組畫面轉字幕任務。")
+            messagebox.showwarning("無任務", "請先在「影片截圖視窗」設置至少一組畫面轉字幕任務。")
             return
 
         config.reload_env()
         self._settings = config.load_settings()
 
-        provider = config.get_default_provider()
+        # Resolve provider from dropdown or fallback
+        selected_prov_name = self._ocr_exec_prov_var.get() if hasattr(self, "_ocr_exec_prov_var") else None
+        provider = None
+        if selected_prov_name:
+            for p in config.get_providers():
+                if p.get("name") == selected_prov_name:
+                    provider = p
+                    break
         if not provider or not provider.get("api_key"):
-            provider = self._form_to_provider()
+            provider = config.get_default_provider() or self._form_to_provider()
         if not provider or not provider.get("api_url"):
             messagebox.showwarning("API 未設定", "請先在「API 設定」填入網址與金鑰。")
             return
 
-        model_name = provider.get("selected_model") or (provider.get("models")[0] if provider.get("models") else "")
+        # Resolve model from dropdown or provider default
+        selected_model_name = self._ocr_exec_model_var.get() if hasattr(self, "_ocr_exec_model_var") else None
+        if selected_model_name and selected_model_name not in ("", "default", "（無模型）"):
+            model_name = selected_model_name
+        else:
+            model_name = provider.get("selected_model") or (provider.get("models")[0] if provider.get("models") else "")
         if not model_name:
-            messagebox.showwarning("模型未設定", "請先在「API 設定」中新增並選擇模型。")
+            messagebox.showwarning("模型未設定", "請先在下拉選單或「API 設定」中選擇模型。")
             return
 
-        # 解析適用的 Prompt 方案 (專用優先，無則回退預設公版)
-        prompt_prof, prompt_desc = config.resolve_prompt(provider.get("name", ""), model_name, self._settings)
+        # Resolve prompt profile from dropdown or fallback
+        selected_prompt_name = self._ocr_exec_prompt_var.get() if hasattr(self, "_ocr_exec_prompt_var") else None
+        prompt_prof = None
+        prompt_desc = ""
+        if selected_prompt_name:
+            prompt_prof = config.get_prompt_profile_by_name(selected_prompt_name, self._settings)
+            if prompt_prof:
+                prompt_desc = f"[{prompt_prof.get('name')}]"
+        if not prompt_prof:
+            prompt_prof, prompt_desc = config.resolve_prompt(provider.get("name", ""), model_name, self._settings)
+
+        # Persist user choices
+        if selected_prov_name:
+            config.patch_setting("selected_ocr_provider", selected_prov_name)
+        if model_name:
+            config.patch_setting("selected_ocr_model", model_name)
+        if prompt_prof and prompt_prof.get("id"):
+            config.patch_setting("selected_ocr_prompt_id", prompt_prof["id"])
+
         cfg = ProviderCfg.from_dict(provider)
         sys_prompt = prompt_prof.get("system_prompt") or config.DEFAULT_SYSTEM_PROMPT
         usr_prompt = prompt_prof.get("user_prompt") or config.DEFAULT_USER_PROMPT
@@ -3994,12 +4927,16 @@ class App(ctk.CTk):
 
         self._refresh_run_tab_summary()
 
-        self._log.delete("1.0", "end")
-        for w in self._preview_scroll.winfo_children():
-            w.destroy()
+        if hasattr(self, "_log"):
+            self._log.delete("1.0", "end")
+        if hasattr(self, "_preview_scroll"):
+            for w in self._preview_scroll.winfo_children():
+                w.destroy()
         self._progress.set(0)
         self._insert_btn.configure(state="disabled")
         self._set_busy(True)
+        if hasattr(self, "_ocr_exec_status_label"):
+            self._ocr_exec_status_label.configure(text=f"🔄 正在使用 {provider.get('name')} ｜ {model_name} 批次翻譯中...")
 
         def work():
             total = len(self._tasks)
@@ -4015,6 +4952,7 @@ class App(ctk.CTk):
                 try:
                     text = translate_image(cfg, task.crop_img, sys_prompt, usr_prompt, lang, max_side)
                     task.translation = text
+                    task.raw_translation = text
                     task.status = "已完成"
                 except LLMError as exc:
                     task.status = "失敗"
@@ -4032,67 +4970,91 @@ class App(ctk.CTk):
                 preview = text.replace("\n", " ⏎ ") if text else "（無文字）"
                 self._log_line(f"    ✅ {preview}")
                 self.after(0, self._render_tasks_list)
+                self.after(0, self._render_ocr_output_textbox)
                 self.after(0, lambda t=task, txt=text: self._add_preview(f"{t.start_ts} → {t.end_ts}", txt))
                 self._progress.set(i / total)
 
             self._log_line("全部任務 OCR 翻譯完成。")
             self.after(0, lambda: self._insert_btn.configure(state="normal"))
+            if hasattr(self, "_ocr_exec_status_label"):
+                self.after(0, lambda: self._ocr_exec_status_label.configure(
+                    text=f"✅ 翻譯完成！共 {total} 組任務。可在下方對話框修改文字後儲存為 SRT。"
+                ))
             self._set_busy(False)
 
         threading.Thread(target=work, daemon=True).start()
 
     def _add_preview(self, ts_range: str, text: str):
-        frame = ctk.CTkFrame(self._preview_scroll, fg_color=("gray86", "gray17"))
-        frame.pack(fill="x", pady=2)
-        ctk.CTkLabel(frame, text=ts_range, font=FONT_MONO, width=220, anchor="w").pack(side="left", padx=8, pady=4)
-        ctk.CTkLabel(frame, text=text.replace("\n", " / "), font=FONT_BODY,
-                     anchor="w", wraplength=640).pack(side="left", fill="x", expand=True)
+        if hasattr(self, "_preview_scroll"):
+            frame = ctk.CTkFrame(self._preview_scroll, fg_color=("gray86", "gray17"))
+            frame.pack(fill="x", pady=2)
+            ctk.CTkLabel(frame, text=ts_range, font=FONT_MONO, width=220, anchor="w").pack(side="left", padx=8, pady=4)
+            ctk.CTkLabel(frame, text=text.replace("\n", " / "), font=FONT_BODY,
+                         anchor="w", wraplength=640).pack(side="left", fill="x", expand=True)
 
     def _insert_and_save(self):
+        if hasattr(self, "_sync_textbox_to_tasks"):
+            self._sync_textbox_to_tasks()
         valid_tasks = [t for t in self._tasks if t.translation.strip()]
         if not valid_tasks:
-            messagebox.showinfo("無翻譯內容", "尚無已完成翻譯的任務。")
+            messagebox.showinfo("無翻譯內容", "尚無已完成翻譯的任務。請先執行翻譯或於對話框輸入文字。")
             return
 
-        mode = self._mode_var.get()
-        # Build translations tuples: (start_sec, text, duration)
+        mode = self._mode_var.get() if hasattr(self, "_mode_var") else "insert"
         trans = [(t.start_sec, t.translation, t.duration) for t in valid_tasks]
 
         if self._srt_entries:
-            # Splicing into existing SRT entries
             entries = srt_utils.insert_translations(
                 list(self._srt_entries), trans,
                 mode=mode, duration_mode="per_subtitle"
             )
         else:
-            # Generate brand new SRT directly from video tasks
             entries = srt_utils.insert_translations(
                 [], trans,
                 mode="insert", duration_mode="per_subtitle"
             )
 
-        # Output filename suggestion
-        if self._srt_path:
-            orig = Path(self._srt_path)
-            default_name = orig.stem + "_translated.srt"
-            initialdir = str(orig.parent)
-        elif self._video_path:
-            orig = Path(self._video_path)
-            default_name = orig.stem + "_translated.srt"
-            initialdir = str(orig.parent)
-        else:
-            default_name = "subtitles_translated.srt"
-            initialdir = os.getcwd()
+        # Check save mode: overwrite vs save_as
+        save_mode = getattr(self, "_ocr_save_mode_var", None)
+        mode_val = save_mode.get() if save_mode else self._settings.get("srt_save_mode", "save_as")
 
-        out = filedialog.asksaveasfilename(
-            defaultextension=".srt",
-            initialdir=initialdir,
-            initialfile=default_name,
-            filetypes=[("SRT 字幕", "*.srt")],
-            title="另存 SRT 新檔",
-        )
+        out = None
+        if mode_val == "overwrite":
+            if self._srt_path and Path(self._srt_path).exists():
+                out = self._srt_path
+            else:
+                messagebox.showinfo("提示", "目前尚未載入現有 SRT 檔案，將為您另存新檔。")
+
         if not out:
-            return
+            suffix = getattr(self, "_ocr_suffix_var", None)
+            s_val = suffix.get().strip() if suffix else "_translated"
+            if s_val and not s_val.startswith(("_", "-", ".")):
+                s_val = "_" + s_val
+            if s_val.endswith(".srt"):
+                s_val = s_val[:-4]
+            config.patch_setting("custom_srt_suffix", s_val)
+
+            if self._srt_path:
+                orig = Path(self._srt_path)
+                default_name = f"{orig.stem}{s_val}.srt"
+                initialdir = str(orig.parent)
+            elif self._video_path:
+                orig = Path(self._video_path)
+                default_name = f"{orig.stem}{s_val}.srt"
+                initialdir = str(orig.parent)
+            else:
+                default_name = f"subtitles{s_val}.srt"
+                initialdir = os.getcwd()
+
+            out = filedialog.asksaveasfilename(
+                defaultextension=".srt",
+                initialdir=initialdir,
+                initialfile=default_name,
+                filetypes=[("SRT 字幕", "*.srt")],
+                title="另存 SRT 新檔",
+            )
+            if not out:
+                return
 
         try:
             srt_utils.write_srt(out, entries)
@@ -4112,12 +5074,14 @@ class App(ctk.CTk):
             self._vlc_player.set_subtitle_file(out)
         self._populate_sub_treeview()
         self._update_sub_status_label()
+        if hasattr(self, "_update_ocr_save_preview"):
+            self._update_ocr_save_preview()
 
-        messagebox.showinfo(
-            "匯出完成",
-            f"已成功儲存 SRT 字幕：\n{out}\n共包含 {len(entries)} 條字幕。"
-        )
-        self._log_line(f"已另存：{out}（共 {len(entries)} 條字幕）")
+        msg = f"已成功儲存 SRT 字幕：\n{out}\n共包含 {len(entries)} 條字幕。"
+        messagebox.showinfo("匯出完成", msg)
+        self._log_line(f"已儲存：{out}（共 {len(entries)} 條字幕）")
+        if hasattr(self, "_ocr_exec_status_label"):
+            self._ocr_exec_status_label.configure(text=f"💾 已儲存：{Path(out).name}（共 {len(entries)} 條字幕）")
 
     # ================================================================== #
     #  v2.01 Pic-to-Pic (P2P) AI Image-to-Image Generation Subsystem
@@ -4181,17 +5145,40 @@ class App(ctk.CTk):
                       command=self._open_current_input_folder).pack(side="left", padx=(0, 4))
         ctk.CTkButton(top_btns, text="📋 拷貝至輸出庫", width=110, height=26, font=FONT_SMALL,
                       fg_color="#2e7d32", hover_color="#1b5e20",
-                      command=self._copy_selected_input_to_output).pack(side="left")
+                      command=self._copy_selected_input_to_output).pack(side="left", padx=(0, 4))
+        self._p2p_history_toggle_btn = ctk.CTkButton(
+            top_btns, text="📦 歷史素材", width=85, height=26, font=FONT_SMALL,
+            command=self._toggle_p2p_history_mode
+        )
+        self._p2p_history_toggle_btn.pack(side="left")
 
-        sel_btns = ctk.CTkFrame(left_col, fg_color="transparent")
-        sel_btns.pack(fill="x", padx=10, pady=(0, 4))
-        ctk.CTkButton(sel_btns, text="☑ 全選", width=55, height=24, font=FONT_SMALL,
+        # Selection Toolbar Container
+        self._p2p_sel_container = ctk.CTkFrame(left_col, fg_color="transparent")
+        self._p2p_sel_container.pack(fill="x", padx=10, pady=(0, 4))
+
+        # Normal Gallery Selection Toolbar
+        self._p2p_normal_sel_btns = ctk.CTkFrame(self._p2p_sel_container, fg_color="transparent")
+        self._p2p_normal_sel_btns.pack(fill="x")
+        ctk.CTkButton(self._p2p_normal_sel_btns, text="☑ 全選", width=55, height=24, font=FONT_SMALL,
                       command=self._select_all_captured).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(sel_btns, text="☐ 全不選", width=65, height=24, font=FONT_SMALL,
+        ctk.CTkButton(self._p2p_normal_sel_btns, text="☐ 全不選", width=65, height=24, font=FONT_SMALL,
                       command=self._deselect_all_captured).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(sel_btns, text="🗑️ 刪除", width=70, height=24, font=FONT_SMALL,
+        ctk.CTkButton(self._p2p_normal_sel_btns, text="🗑️ 刪除", width=70, height=24, font=FONT_SMALL,
                       fg_color="#b23b3b", hover_color="#8a2e2e",
                       command=self._delete_selected_captured).pack(side="right")
+
+        # History Gallery Selection Toolbar (hidden by default)
+        self._p2p_history_sel_btns = ctk.CTkFrame(self._p2p_sel_container, fg_color="transparent")
+        ctk.CTkButton(self._p2p_history_sel_btns, text="☑ 全選", width=55, height=24, font=FONT_SMALL,
+                      command=self._select_all_p2p_drop).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(self._p2p_history_sel_btns, text="☐ 全不選", width=65, height=24, font=FONT_SMALL,
+                      command=self._deselect_all_p2p_drop).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(self._p2p_history_sel_btns, text="↩️ 復原至素材庫", width=110, height=24, font=FONT_SMALL,
+                      fg_color="#2e7d32", hover_color="#1b5e20",
+                      command=self._restore_selected_p2p_drop).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(self._p2p_history_sel_btns, text="🧹 清空暫存", width=85, height=24, font=FONT_SMALL,
+                      fg_color="#b23b3b", hover_color="#8a2e2e",
+                      command=self._clear_p2p_drop).pack(side="right")
 
         self._p2p_gallery_count_label = ctk.CTkLabel(
             left_col, text="共 0 張 ｜ 已勾選 0 張", font=FONT_SMALL,
@@ -4606,6 +5593,14 @@ class App(ctk.CTk):
         self._selected_output_paths.clear()
         self._refresh_p2p_output_gallery()
 
+    def _open_current_ocr_folder(self):
+        d = Path(self._current_ocr_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(d))
+        except Exception as exc:
+            messagebox.showerror("開啟失敗", f"無法開啟目錄：{exc}")
+
     def _open_captured_folder(self):
         self._open_current_input_folder()
 
@@ -4737,13 +5732,12 @@ class App(ctk.CTk):
             messagebox.showinfo("提示", "請先勾選欲刪除的截圖。")
             return
         count = len(self._selected_captured_paths)
-        if not messagebox.askyesno("確認刪除", f"確定要從硬碟刪除這 {count} 張截圖嗎？此操作無法復原。"):
+        if not messagebox.askyesno("確認移至暫存", f"確定要將這 {count} 張截圖移至歷史暫存 (.drop) 嗎？"):
             return
+        cap_drop_dir = config.resolve_captured_drop_dir(self._settings)
         for p_str in list(self._selected_captured_paths):
             try:
-                p = Path(p_str)
-                if p.is_file():
-                    p.unlink()
+                capture_manager.safe_move_to_drop(p_str, cap_drop_dir)
             except Exception:
                 pass
         self._selected_captured_paths.clear()
@@ -4751,6 +5745,160 @@ class App(ctk.CTk):
         self._active_edit_img = None
         self._original_active_img = None
         self._refresh_p2p_gallery()
+
+    def _toggle_p2p_history_mode(self):
+        self._p2p_history_mode = not self._p2p_history_mode
+        self._selected_captured_paths.clear()
+        self._selected_p2p_drop_paths.clear()
+        if self._p2p_history_mode:
+            self._p2p_history_toggle_btn.configure(text="📋 返回素材庫")
+            if hasattr(self, "_p2p_normal_sel_btns"):
+                self._p2p_normal_sel_btns.pack_forget()
+            if hasattr(self, "_p2p_history_sel_btns"):
+                self._p2p_history_sel_btns.pack(fill="x")
+            self._refresh_p2p_drop_gallery()
+        else:
+            self._p2p_history_toggle_btn.configure(text="📦 歷史素材")
+            if hasattr(self, "_p2p_history_sel_btns"):
+                self._p2p_history_sel_btns.pack_forget()
+            if hasattr(self, "_p2p_normal_sel_btns"):
+                self._p2p_normal_sel_btns.pack(fill="x")
+            self._refresh_p2p_gallery()
+
+    def _refresh_p2p_drop_gallery(self):
+        if not hasattr(self, "_p2p_gallery_scroll"):
+            return
+        for w in self._p2p_gallery_scroll.winfo_children():
+            w.destroy()
+        self._p2p_drop_checkboxes.clear()
+
+        cap_drop_dir = config.resolve_captured_drop_dir(self._settings)
+        drop_images = capture_manager.list_images_in_dir(cap_drop_dir)
+        total = len(drop_images)
+        sel_count = len(self._selected_p2p_drop_paths)
+
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(
+                text=f"歷史素材 (.drop) (共 {total} 張 ｜ 已勾選 {sel_count} 張)"
+            )
+
+        if not drop_images:
+            empty_lbl = ctk.CTkLabel(
+                self._p2p_gallery_scroll,
+                text="歷史素材暫存資料夾 (.drop) 目前沒有截圖檔案。\n從素材庫刪除的截圖將自動保存在此。",
+                font=FONT_SMALL, text_color=("gray40", "#9aa0a6")
+            )
+            empty_lbl.pack(pady=20)
+            return
+
+        for item in drop_images:
+            p_str = str(item["path"])
+            row_frame = ctk.CTkFrame(self._p2p_gallery_scroll, fg_color=("gray85", "gray20"))
+            row_frame.pack(fill="x", pady=2, padx=2)
+
+            cb = ctk.CTkCheckBox(
+                row_frame, text="", width=24, checkbox_width=20, checkbox_height=20,
+                command=lambda p=p_str: self._on_p2p_drop_cb_toggle(p)
+            )
+            cb.pack(side="left", padx=(6, 2))
+            if p_str in self._selected_p2p_drop_paths:
+                cb.set(True)
+            self._p2p_drop_checkboxes[p_str] = cb
+
+            c = tk.Canvas(row_frame, width=54, height=36, bg="#1a1a1a", highlightthickness=0)
+            c.pack(side="left", padx=4, pady=2)
+            try:
+                im = Image.open(item["path"]).convert("RGB")
+                im.thumbnail((54, 36), Image.Resampling.BILINEAR)
+                th_tk = ImageTk.PhotoImage(im)
+                c.create_image(27, 18, anchor="center", image=th_tk)
+                c.image = th_tk
+            except Exception:
+                pass
+
+            info_box = ctk.CTkFrame(row_frame, fg_color="transparent")
+            info_box.pack(side="left", fill="both", expand=True, padx=4)
+
+            name_lbl = ctk.CTkLabel(info_box, text=item["name"], font=FONT_SMALL, anchor="w")
+            name_lbl.pack(fill="x")
+            dim_lbl = ctk.CTkLabel(
+                info_box, text=f"{item['size']//1024} KB | {item['date_str']}",
+                font=("Microsoft JhengHei", 9), text_color=("gray40", "#9aa0a6"), anchor="w"
+            )
+            dim_lbl.pack(fill="x")
+
+            ctk.CTkButton(
+                row_frame, text="復原", width=50, height=24, font=FONT_SMALL,
+                fg_color="#2e7d32", hover_color="#1b5e20",
+                command=lambda p=p_str: self._restore_single_p2p_drop(p)
+            ).pack(side="right", padx=6)
+
+    def _on_p2p_drop_cb_toggle(self, p_str: str):
+        if p_str in self._selected_p2p_drop_paths:
+            self._selected_p2p_drop_paths.remove(p_str)
+        else:
+            self._selected_p2p_drop_paths.add(p_str)
+        cap_drop_dir = config.resolve_captured_drop_dir(self._settings)
+        items = capture_manager.list_images_in_dir(cap_drop_dir)
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(
+                text=f"歷史素材 (.drop) (共 {len(items)} 張 ｜ 已勾選 {len(self._selected_p2p_drop_paths)} 張)"
+            )
+
+    def _select_all_p2p_drop(self):
+        cap_drop_dir = config.resolve_captured_drop_dir(self._settings)
+        items = capture_manager.list_images_in_dir(cap_drop_dir)
+        for it in items:
+            self._selected_p2p_drop_paths.add(str(it["path"]))
+        for cb in self._p2p_drop_checkboxes.values():
+            cb.set(True)
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(
+                text=f"歷史素材 (.drop) (共 {len(items)} 張 ｜ 已勾選 {len(self._selected_p2p_drop_paths)} 張)"
+            )
+
+    def _deselect_all_p2p_drop(self):
+        self._selected_p2p_drop_paths.clear()
+        for cb in self._p2p_drop_checkboxes.values():
+            cb.set(False)
+        cap_drop_dir = config.resolve_captured_drop_dir(self._settings)
+        items = capture_manager.list_images_in_dir(cap_drop_dir)
+        if hasattr(self, "_p2p_gallery_count_label"):
+            self._p2p_gallery_count_label.configure(
+                text=f"歷史素材 (.drop) (共 {len(items)} 張 ｜ 已勾選 0 張)"
+            )
+
+    def _restore_single_p2p_drop(self, p_str: str):
+        self._restore_p2p_drop_items([p_str])
+
+    def _restore_selected_p2p_drop(self):
+        if not self._selected_p2p_drop_paths:
+            messagebox.showinfo("提示", "請先勾選欲復原的截圖。")
+            return
+        self._restore_p2p_drop_items(list(self._selected_p2p_drop_paths))
+
+    def _restore_p2p_drop_items(self, paths: list[str]):
+        count = 0
+        for p_str in paths:
+            restored = capture_manager.safe_restore_from_drop(p_str, self._current_input_dir)
+            if restored:
+                count += 1
+        self._selected_p2p_drop_paths.clear()
+        self._toggle_p2p_history_mode()
+        messagebox.showinfo("復原成功", f"已成功復原 {count} 張截圖至截圖素材庫！")
+
+    def _clear_p2p_drop(self):
+        cap_drop_dir = config.resolve_captured_drop_dir(self._settings)
+        drop_images = capture_manager.list_images_in_dir(cap_drop_dir)
+        if not drop_images:
+            messagebox.showinfo("提示", "目前沒有歷史素材暫存檔可清空。")
+            return
+        if not messagebox.askyesno("清空確認", f"確定要永久清空所有 {len(drop_images)} 張暫存截圖嗎？此動作無法復原。"):
+            return
+        count = capture_manager.clear_drop_dir(cap_drop_dir)
+        self._selected_p2p_drop_paths.clear()
+        self._refresh_p2p_drop_gallery()
+        messagebox.showinfo("清空完成", f"已永久刪除 {count} 張暫存截圖。")
 
     def _copy_selected_input_to_output(self):
         if not self._selected_captured_paths:

@@ -26,6 +26,33 @@ def ts_to_sec(ts: str) -> float:
     return int(h) * 3600 + int(mi) * 60 + int(s) + int(ms) / 1000.0
 
 
+def flexible_ts_to_sec(ts: str) -> float | None:
+    """Parse flexible timestamp string ('HH:MM:SS,mmm', 'HH:MM:SS.mmm', 'MM:SS.mmm', 'MM:SS', or seconds float) into float seconds."""
+    if not ts or not isinstance(ts, str):
+        return None
+    s = ts.strip()
+    if not s:
+        return None
+    try:
+        return ts_to_sec(s)
+    except Exception:
+        pass
+    m = re.match(r"^(\d{1,2}):(\d{2})[,.](\d{1,3})$", s)
+    if m:
+        mi, sec, ms = m.groups()
+        ms_val = int(ms.ljust(3, "0")[:3])
+        return int(mi) * 60 + int(sec) + ms_val / 1000.0
+    m2 = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if m2:
+        mi, sec = m2.groups()
+        return float(int(mi) * 60 + int(sec))
+    try:
+        val = float(s)
+        return max(0.0, val)
+    except Exception:
+        return None
+
+
 def sec_to_ts(sec: float) -> str:
     """seconds → 'HH:MM:SS,mmm' (SRT style with a comma)."""
     sec = max(0.0, float(sec))
