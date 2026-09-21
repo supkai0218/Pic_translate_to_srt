@@ -1877,8 +1877,11 @@ class App(ctk.CTk):
         paned.add(right_col, minsize=460, stretch="always")
 
         # === LEFT COLUMN: Task List & Preview Canvas ===
-        t_hdr = ctk.CTkFrame(left_col, fg_color="transparent")
-        t_hdr.pack(fill="x", padx=8, pady=(6, 2))
+        left_top_box = ctk.CTkFrame(left_col, fg_color="transparent")
+        left_top_box.pack(fill="x", padx=8, pady=(6, 2))
+
+        t_hdr = ctk.CTkFrame(left_top_box, fg_color="transparent")
+        t_hdr.pack(fill="x")
         self._ocr_exec_task_count_label = ctk.CTkLabel(
             t_hdr, text="待翻譯任務 (共 0 組)", font=FONT_BODY, anchor="w"
         )
@@ -1897,11 +1900,8 @@ class App(ctk.CTk):
         )
         self._ocr_action_btn.pack(side="right")
 
-        # History Toolbar Container (placed between header and scroll frame)
-        self._ocr_toolbar_container = ctk.CTkFrame(left_col, fg_color="transparent")
-        self._ocr_toolbar_container.pack(fill="x", padx=8, pady=(0, 2))
-
-        self._ocr_history_toolbar = ctk.CTkFrame(self._ocr_toolbar_container, fg_color="transparent")
+        # History Toolbar (child of left_top_box, hidden until in history mode)
+        self._ocr_history_toolbar = ctk.CTkFrame(left_top_box, fg_color="transparent")
         ctk.CTkButton(
             self._ocr_history_toolbar, text="☑ 全選", width=55, height=24, font=FONT_SMALL,
             command=self._select_all_ocr_drop
@@ -2266,7 +2266,7 @@ class App(ctk.CTk):
         if self._ocr_history_mode:
             self._ocr_history_toggle_btn.configure(text="📋 返回任務列表")
             self._ocr_action_btn.configure(text="🧹 清空暫存")
-            self._ocr_history_toolbar.pack(fill="x")
+            self._ocr_history_toolbar.pack(fill="x", pady=(4, 0))
             self._render_ocr_drop_list()
         else:
             self._ocr_history_toggle_btn.configure(text="📦 讀取歷史截圖")
