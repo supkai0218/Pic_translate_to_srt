@@ -157,7 +157,7 @@ class App(ctk.CTk):
         autoplay: bool = False,
     ):
         super().__init__()
-        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.06)")
+        self.title("影片畫面 OCR 翻譯 & AI 圖生圖工作站 (v2.07)")
         self.minsize(980, 680)
 
         self._settings = config.load_settings()
@@ -258,6 +258,8 @@ class App(ctk.CTk):
         self._captured_images: list[dict] = []
         self._selected_captured_paths: set[str] = set()
         self._active_edit_path: Optional[str] = None
+        self._active_p2p_image_path: Optional[str] = None
+        self._p2p_delete_orig_on_save_var: Optional[ctk.BooleanVar] = None
         self._active_edit_img: Optional[Image.Image] = None
         self._original_active_img: Optional[Image.Image] = None
         self._edit_rotation: int = 0
@@ -5212,6 +5214,14 @@ class App(ctk.CTk):
                       fg_color="#2e7d32", hover_color="#1b5e20",
                       command=self._save_p2p_edited_as_new).pack(side="left")
 
+        # v2.07: 另存新素材後刪除原檔之勾選選項
+        self._p2p_delete_orig_on_save_var = ctk.BooleanVar(value=False)
+        self._p2p_delete_orig_on_save_cb = ctk.CTkCheckBox(
+            edit_bar2, text="另存新素材後刪除原檔", variable=self._p2p_delete_orig_on_save_var,
+            font=FONT_SMALL
+        )
+        self._p2p_delete_orig_on_save_cb.pack(side="left", padx=(10, 0))
+
         self._p2p_edit_info_label = ctk.CTkLabel(
             mid_col, text="請從左側點選一張圖片進入微調編輯", font=FONT_SMALL,
             text_color=("gray40", "#9aa0a6"), anchor="w"
@@ -5921,10 +5931,12 @@ class App(ctk.CTk):
 
     def _set_active_p2p_image(self, p_str: str):
         self._active_edit_path = p_str
+        self._active_p2p_image_path = p_str
         self._edit_rotation = 0
         self._edit_flip_h = False
         try:
-            self._original_active_img = Image.open(p_str).convert("RGB")
+            with Image.open(p_str) as raw_img:
+                self._original_active_img = raw_img.convert("RGB").copy()
             self._active_edit_img = self._original_active_img.copy()
         except Exception as exc:
             messagebox.showerror("讀取失敗", f"無法載入圖片：{exc}")
@@ -6087,12 +6099,20 @@ class App(ctk.CTk):
     #  P2P Image Editing Pipeline (Rotate & Flip)
     # ------------------------------------------------------------------ #
     def _rotate_p2p_image(self, deg: int):
+        if len(self._selected_captured_paths) > 1:
+            deg_map = {90: "順轉 90°", 180: "180° 旋轉", 270: "逆轉 90°"}
+            action = deg_map.get(deg, f"旋轉 {deg}°")
+            self._batch_edit_p2p_images(rot_deg=deg, flip_h=False, action_name=action)
+            return
         if not self._original_active_img:
             return
         self._edit_rotation = (self._edit_rotation + deg) % 360
         self._apply_edits_and_render()
 
     def _flip_p2p_image(self):
+        if len(self._selected_captured_paths) > 1:
+            self._batch_edit_p2p_images(rot_deg=0, flip_h=True, action_name="水平翻轉")
+            return
         if not self._original_active_img:
             return
         self._edit_flip_h = not self._edit_flip_h
@@ -6114,19 +6134,105 @@ class App(ctk.CTk):
         self._active_edit_img = img
         self._render_active_p2p_canvas()
 
+    def _batch_edit_p2p_images(self, rot_deg: int = 0, flip_h: bool = False, action_name: str = ""):
+        """v2.07: Batch edit selected images and save as new materials."""
+        selected = [p for p in self._selected_captured_paths if Path(p).is_file()]
+        if not selected:
+            messagebox.showinfo("提示", "未選取任何有效圖片。")
+            return
+
+        count = len(selected)
+        delete_orig = getattr(self, "_p2p_delete_orig_on_save_var", None) and self._p2p_delete_orig_on_save_var.get()
+        del_warn = "\n\n⚠️ 已勾選「另存新素材後刪除原檔」，原檔案處理完成後將自動移至 .drop 歷史暫存！" if delete_orig else ""
+
+        if not messagebox.askyesno(
+            "確認批次編輯",
+            f"目前已選取 {count} 張圖片。\n是否確認進行批次「{action_name}」並另存為新素材？{del_warn}"
+        ):
+            return
+
+        cap_drop_dir = config.resolve_captured_drop_dir(self._settings)
+        new_saved_paths = []
+        success_count = 0
+        fail_count = 0
+
+        for p_str in selected:
+            try:
+                with Image.open(p_str) as raw_img:
+                    im = raw_img.convert("RGB").copy()
+
+                if rot_deg:
+                    im = capture_manager.rotate_image(im, rot_deg)
+                if flip_h:
+                    im = capture_manager.flip_image(im, horizontal=True)
+
+                saved_p = capture_manager.save_edited_image(
+                    img=im,
+                    original_path=p_str,
+                    target_dir=self._current_input_dir,
+                )
+                new_saved_paths.append(str(saved_p))
+                success_count += 1
+
+                if delete_orig:
+                    capture_manager.safe_move_to_drop(p_str, cap_drop_dir)
+            except Exception as e:
+                print(f"[Batch Edit Error] {p_str}: {e}")
+                fail_count += 1
+
+        self._selected_captured_paths.clear()
+        for np in new_saved_paths:
+            self._selected_captured_paths.add(np)
+
+        self._refresh_p2p_gallery()
+
+        if new_saved_paths:
+            self._set_active_p2p_image(new_saved_paths[0])
+
+        msg = f"批次「{action_name}」已完成！\n成功另存 {success_count} 張新素材。"
+        if delete_orig:
+            msg += f"\n原圖 {success_count} 張已自動移至 .drop 歷史暫存。"
+        if fail_count > 0:
+            msg += f"\n處理失敗: {fail_count} 張。"
+
+        messagebox.showinfo("批次編輯完成", msg)
+
     def _save_p2p_edited_as_new(self):
+        if len(self._selected_captured_paths) > 1:
+            action_desc = []
+            if self._edit_rotation != 0:
+                deg_map = {90: "順轉 90°", 180: "180° 旋轉", 270: "逆轉 90°"}
+                action_desc.append(deg_map.get(self._edit_rotation, f"旋轉 {self._edit_rotation}°"))
+            if self._edit_flip_h:
+                action_desc.append("水平翻轉")
+            action = " ＋ ".join(action_desc) if action_desc else "另存副本"
+            self._batch_edit_p2p_images(
+                rot_deg=self._edit_rotation,
+                flip_h=self._edit_flip_h,
+                action_name=action
+            )
+            return
+
         if not self._active_edit_img:
             messagebox.showinfo("提示", "目前沒有正在編輯的圖片。")
             return
-        orig_p = getattr(self, "_active_p2p_image_path", "")
+        orig_p = self._active_edit_path or getattr(self, "_active_p2p_image_path", "") or ""
         saved_p = capture_manager.save_edited_image(
             img=self._active_edit_img,
             original_path=orig_p,
             target_dir=self._current_input_dir,
         )
+        delete_orig = getattr(self, "_p2p_delete_orig_on_save_var", None) and self._p2p_delete_orig_on_save_var.get()
+        if delete_orig and orig_p and Path(orig_p).is_file():
+            cap_drop_dir = config.resolve_captured_drop_dir(self._settings)
+            capture_manager.safe_move_to_drop(orig_p, cap_drop_dir)
+            self._selected_captured_paths.discard(orig_p)
+
+        self._selected_captured_paths.add(str(saved_p))
         self._refresh_p2p_gallery()
         self._set_active_p2p_image(str(saved_p))
-        messagebox.showinfo("儲存成功", f"編輯後的圖片已另存為：\n{saved_p.name}")
+        del_note = "\n(原圖已移至 .drop 歷史暫存)" if delete_orig else ""
+        messagebox.showinfo("儲存成功", f"編輯後的圖片已另存為：\n{saved_p.name}{del_note}")
 
     def _toggle_p2p_advanced_params(self):
         if not hasattr(self, "_p2p_adv_frame"):

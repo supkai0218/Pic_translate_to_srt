@@ -195,7 +195,7 @@ def save_edited_image(
     original_path: str | Path = "",
     target_dir: Optional[Path | str] = None,
 ) -> Path:
-    """Save rotated or flipped image into target directory (default get_captured_dir()) with '{original_stem}_edit.jpg'.
+    """Save rotated or flipped image into target directory (default get_captured_dir()) with '{original_stem}_edit_{counter}.jpg'.
 
     Prevents repetitive chain suffixes like '_edit_edit_edit' by normalizing to clean stem.
     """
@@ -213,13 +213,11 @@ def save_edited_image(
     else:
         safe_stem = "captured"
 
-    base_name = f"{safe_stem}_edit"
-    target = cap_dir / f"{base_name}.jpg"
-
     counter = 1
+    target = cap_dir / f"{safe_stem}_edit_{counter}.jpg"
     while target.exists():
-        target = cap_dir / f"{base_name}_{counter}.jpg"
         counter += 1
+        target = cap_dir / f"{safe_stem}_edit_{counter}.jpg"
 
     if img.mode not in ("RGB", "L"):
         save_img = img.convert("RGB")
